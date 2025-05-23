@@ -376,14 +376,14 @@ def generate_daily_report(date: Optional[str] = None):
     report = {
         'date': date,
         'trades': 0,
-        'orders': 0,
+        'today_orders': 0,
         'errors': 0,
         'strategies': {},
         'summary': {}
     }
     
     # 각 카테고리별 로그 분석
-    for category in ['trade', 'order', 'error', 'strategy']:
+    for category in ['trade', 'today_orders', 'error', 'strategy']:
         category_dir = log_dir / category
         if category_dir.exists():
             log_files = list(category_dir.glob('*.log'))
@@ -393,8 +393,8 @@ def generate_daily_report(date: Optional[str] = None):
                     lines = f.readlines()
                     if category == 'trade':
                         report['trades'] = len([l for l in lines if '거래 실행' in l])
-                    elif category == 'order':
-                        report['orders'] = len([l for l in lines if '주문' in l])
+                    elif category == 'today_orders':
+                        report['today_orders'] = len([l for l in lines if '주문' in l])
                     elif category == 'error':
                         report['errors'] = len([l for l in lines if 'ERROR' in l])
     
