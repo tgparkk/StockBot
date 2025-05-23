@@ -1,0 +1,21 @@
+{
+  "current": {
+    "token": "dummy_token_for_testing_1234567890",
+    "issue_time": 1748008451.974679,
+    "issue_time_str": "2025-05-23 22:54:11",
+    "expire_time": 1748094851.974679,
+    "expire_time_str": "2025-05-24 22:54:11",
+    "status": "SUCCESS",
+    "updated_at": "2025-05-23 22:54:11"
+  },
+  "history": [
+    {
+      "token": "dummy_token...",
+      "issue_time_str": "2025-05-23 22:54:11",
+      "expire_time_str": "2025-05-24 22:54:11",
+      "status": "SUCCESS",
+      "error_message": null,
+      "recorded_at": "2025-05-23 22:54:11"
+    }
+  ]
+}
