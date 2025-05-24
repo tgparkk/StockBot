@@ -115,6 +115,10 @@ class StockBotMain:
         self.trading_signals: asyncio.Queue = asyncio.Queue()
         self.signal_lock = threading.RLock()
 
+        # 11. 🆕 전역 실시간 데이터 캐시 (웹소켓 우선, REST API fallback)
+        self.realtime_cache: Dict[str, Dict] = {}  # {종목코드: {price, timestamp, source}}
+        self.cache_lock = threading.RLock()
+
         # 신호 핸들러 등록
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -263,12 +267,22 @@ class StockBotMain:
 
     def _update_buy_position(self, stock_code: str, qty: int, price: int):
         """매수 포지션 업데이트 (메모리 + DB 동기화)"""
+        # 대기 주문에서 전략 정보 찾기
+        strategy_type = "unknown"
+        for order_info in self.pending_orders.values():
+            if order_info.get('stock_code') == stock_code and order_info.get('order_type') == '매수':
+                strategy_type = order_info.get('strategy_type', 'unknown')
+                break
+
         # 메모리 포지션 업데이트
         if stock_code not in self.positions:
             self.positions[stock_code] = {
                 'quantity': 0,
                 'avg_price': 0,
-                'total_amount': 0
+                'total_amount': 0,
+                'strategy_type': strategy_type,  # 전략 정보 추가
+                'entry_time': datetime.now(),    # 진입 시간 추가
+                'max_profit_rate': 0.0          # 최대 수익률 추적 (trailing stop용)
             }
 
         position = self.positions[stock_code]
@@ -279,7 +293,10 @@ class StockBotMain:
         self.positions[stock_code] = {
             'quantity': new_quantity,
             'avg_price': new_avg_price,
-            'total_amount': new_total_amount
+            'total_amount': new_total_amount,
+            'strategy_type': strategy_type,
+            'entry_time': position.get('entry_time', datetime.now()),
+            'max_profit_rate': position.get('max_profit_rate', 0.0)
         }
 
         # 첫 매수인 경우 DB에 포지션 생성
@@ -292,7 +309,7 @@ class StockBotMain:
                 'avg_buy_price': price,
                 'total_buy_amount': qty * price,
                 'time_slot': current_slot.name if current_slot else "unknown",
-                'strategy_type': "unknown",  # 나중에 추가 정보로 업데이트
+                'strategy_type': strategy_type,
             }
             db_manager.create_position(position_data)
         else:
@@ -304,7 +321,7 @@ class StockBotMain:
             }
             db_manager.update_position(stock_code, update_data)
 
-        logger.info(f"📈 매수 완료: {stock_code} 보유량 {new_quantity}주 (평단: {new_avg_price:,}원)")
+        logger.info(f"📈 매수 완료: {stock_code} 보유량 {new_quantity}주 (평단: {new_avg_price:,}원, 전략: {strategy_type})")
 
     def _update_sell_position(self, stock_code: str, qty: int, price: int):
         """매도 포지션 업데이트 (메모리 + DB 동기화)"""
@@ -441,35 +458,44 @@ class StockBotMain:
                 # 락 해제 후 포지션 체크 (블로킹 최소화)
                 for stock_code, position in positions_to_check:
                     try:
-                        # 현재가 조회 (캐시된 데이터 우선 사용)
-                        current_data = self.data_manager.get_latest_data(stock_code)
-                        if not current_data or 'current_price' not in current_data:
+                        # 🚀 새로운 통합 가격 조회 메서드 사용 (웹소켓 우선, fallback 자동)
+                        price_result = self.get_cached_price_with_fallback(stock_code)
+
+                        if not price_result['success']:
                             logger.debug(f"현재가 데이터 없음: {stock_code}")
                             continue
 
-                        current_price = current_data['current_price']['current_price']
+                        current_price = price_result['price']
+                        data_source = price_result['source']
                         avg_price = position['avg_price']
                         quantity = position['quantity']
 
                         # 안전장치: 가격이 0이면 스킵
-                        if current_price <= 0 or avg_price <= 0:
+                        if avg_price <= 0:
                             continue
 
                         profit_rate = (current_price - avg_price) / avg_price
 
-                        # 손절 우선 처리 (손실 제한)
-                        if profit_rate <= self.stop_loss_threshold:
-                            logger.warning(f"🔻 손절 신호: {stock_code} {profit_rate*100:.1f}%")
-                            await self._execute_sell_order(stock_code, quantity, current_price, "손절")
+                        # 최대 수익률 업데이트 (trailing stop용)
+                        if profit_rate > position.get('max_profit_rate', 0.0):
+                            with self.position_lock:
+                                if stock_code in self.positions:
+                                    self.positions[stock_code]['max_profit_rate'] = profit_rate
 
-                        # 익절 처리
-                        elif profit_rate >= self.take_profit_threshold:
-                            logger.info(f"📈 익절 신호: {stock_code} {profit_rate*100:.1f}%")
-                            await self._execute_sell_order(stock_code, quantity, current_price, "익절")
+                        # 전략별 매도 조건 적용
+                        sell_signal = self._check_strategy_sell_conditions(
+                            stock_code, position, current_price, profit_rate
+                        )
+
+                        if sell_signal:
+                            await self._execute_sell_order(
+                                stock_code, quantity, current_price, sell_signal['reason']
+                            )
 
                         # 현재 상태 로깅 (5분마다)
                         elif len(positions_to_check) <= 3:  # 포지션 적을 때만
-                            logger.debug(f"📊 {stock_code}: {profit_rate*100:+.1f}% ({current_price:,}원)")
+                            strategy_type = position.get('strategy_type', 'unknown')
+                            logger.debug(f"📊 {stock_code}({strategy_type}): {profit_rate*100:+.1f}% ({current_price:,}원) [from {data_source}]")
 
                     except Exception as e:
                         logger.error(f"포지션 체크 오류 ({stock_code}): {e}")
@@ -748,8 +774,6 @@ class StockBotMain:
         except Exception as e:
             logger.error(f"거래 신호 실행 오류: {e}")
 
-
-
     def can_open_new_position(self) -> bool:
         """새 포지션 오픈 가능 여부 체크"""
         try:
@@ -819,6 +843,9 @@ class StockBotMain:
         scheduler_status = self.strategy_scheduler.get_status()
         data_status = self.data_manager.get_system_status()
 
+        # 🆕 active_stocks와 selected_stocks 동기화 상태 확인
+        sync_status = self._check_stock_sync_status()
+
         return {
             'bot_running': True,
             'positions_count': len(self.positions),
@@ -826,8 +853,46 @@ class StockBotMain:
             'order_history_count': len(self.order_history),
             'scheduler': scheduler_status,
             'data_manager': data_status,
-            'websocket_connected': getattr(self.websocket_manager, 'is_connected', lambda: True)() if callable(getattr(self.websocket_manager, 'is_connected', None)) else True
+            'websocket_connected': getattr(self.websocket_manager, 'is_connected', lambda: True)() if callable(getattr(self.websocket_manager, 'is_connected', None)) else True,
+            'stock_sync': sync_status,  # 🆕 동기화 상태 추가
+            'realtime_cache_size': len(self.realtime_cache)  # 🆕 실시간 캐시 크기
         }
+
+    def _check_stock_sync_status(self) -> Dict:
+        """🆕 active_stocks와 selected_stocks 동기화 상태 확인"""
+        try:
+            # strategy_scheduler의 active_stocks에서 모든 종목 수집
+            scheduler_stocks = set()
+            for strategy_stocks in self.strategy_scheduler.active_stocks.values():
+                scheduler_stocks.update(strategy_stocks)
+
+            # main의 selected_stocks에서 현재 시간대 종목 수집
+            current_selected = set(self.selected_stocks.get(self.current_time_slot or '', []))
+
+            # 동기화 상태 분석
+            sync_status = {
+                'scheduler_stocks_count': len(scheduler_stocks),
+                'selected_stocks_count': len(current_selected),
+                'is_synced': scheduler_stocks == current_selected,
+                'missing_in_selected': list(scheduler_stocks - current_selected),
+                'extra_in_selected': list(current_selected - scheduler_stocks),
+                'current_time_slot': self.current_time_slot,
+                'last_sync_time': datetime.now().strftime('%H:%M:%S')
+            }
+
+            if not sync_status['is_synced']:
+                logger.warning(f"⚠️ 종목 동기화 불일치 감지: scheduler={len(scheduler_stocks)}, selected={len(current_selected)}")
+
+            return sync_status
+
+        except Exception as e:
+            logger.error(f"동기화 상태 체크 오류: {e}")
+            return {
+                'scheduler_stocks_count': 0,
+                'selected_stocks_count': 0,
+                'is_synced': False,
+                'error': str(e)
+            }
 
     async def cleanup(self):
         """정리 작업 - 안전한 종료"""
@@ -854,13 +919,57 @@ class StockBotMain:
 
     def _signal_handler(self, signum, frame):
         """시그널 핸들러 - 안전한 종료"""
-        logger.info(f"종료 신호 수신: {signum}")
-        # 별도 태스크로 cleanup 실행
-        asyncio.create_task(self.cleanup())
+        logger.info(f"🛑 종료 신호 수신: {signum}")
 
-    async def shutdown(self):
-        """안전한 종료 - cleanup으로 통합"""
-        await self.cleanup()
+        # 이미 종료 중이면 강제 종료
+        if hasattr(self, '_shutting_down') and self._shutting_down:
+            logger.warning("⚠️ 이미 종료 중 - 강제 종료")
+            import sys
+            sys.exit(1)
+
+        self._shutting_down = True
+
+        try:
+            # 현재 이벤트 루프가 실행 중인지 확인
+            loop = asyncio.get_running_loop()
+            if loop and not loop.is_closed():
+                # 이벤트 루프가 실행 중이면 cleanup task 생성
+                task = loop.create_task(self._safe_cleanup_and_exit())
+            else:
+                # 이벤트 루프가 없으면 직접 종료
+                import sys
+                logger.warning("⚠️ 이벤트 루프 없음 - 직접 종료")
+                sys.exit(0)
+        except RuntimeError:
+            # 이벤트 루프가 없는 경우 (아마 메인 스레드가 아님)
+            logger.warning("⚠️ RuntimeError - 스레드에서 직접 종료")
+            import sys
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"❌ signal handler 오류: {e}")
+            import sys
+            sys.exit(1)
+
+    async def _safe_cleanup_and_exit(self):
+        """안전한 cleanup 후 종료"""
+        try:
+            logger.info("🧹 안전한 종료 시작...")
+
+            # cleanup 실행
+            await self.cleanup()
+
+            logger.info("✅ cleanup 완료 - 프로그램 종료")
+
+            # 짧은 대기 후 종료 (로그 출력 보장)
+            await asyncio.sleep(0.5)
+
+        except Exception as e:
+            logger.error(f"❌ cleanup 중 오류: {e}")
+        finally:
+            # 최종 종료
+            import sys
+            logger.info("🛑 프로그램 종료")
+            sys.exit(0)
 
     def handle_time_slot_change(self, new_time_slot: str, new_stocks: List[str]):
         """
@@ -872,6 +981,10 @@ class StockBotMain:
         """
         try:
             logger.info(f"⏰ 시간대 변경: {self.current_time_slot} → {new_time_slot}")
+
+            # 🆕 selected_stocks 업데이트 (strategy_scheduler의 active_stocks와 동기화)
+            self.selected_stocks[new_time_slot] = new_stocks.copy()
+            logger.info(f"📋 {new_time_slot} 종목 선정: {len(new_stocks)}개")
 
             # 현재 보유 포지션 종목들 확인
             holding_stocks = set(self.positions.keys())
@@ -894,12 +1007,24 @@ class StockBotMain:
                         callback=self._create_position_protection_callback(stock_code)
                     )
 
+            # 🆕 새로운 종목들의 실시간 캐시 준비 (웹소켓 구독으로 데이터 들어올 준비)
+            new_monitoring_stocks = set(new_stocks) - holding_stocks
+            if new_monitoring_stocks:
+                logger.info(f"📈 신규 모니터링: {list(new_monitoring_stocks)}")
+                # 실시간 캐시 초기화 (웹소켓 데이터 대기 상태)
+                for stock_code in new_monitoring_stocks:
+                    with self.cache_lock:
+                        # 아직 가격 정보는 없지만 캐시 슬롯 준비
+                        self.realtime_cache[stock_code] = {
+                            'price': 0,
+                            'timestamp': datetime.now(),
+                            'source': 'websocket_ready',
+                            'status': 'waiting_for_data'
+                        }
+
             # 이전 시간대 정보 저장
             self.previous_time_slot = self.current_time_slot
             self.current_time_slot = new_time_slot
-
-            # 새로운 시간대 종목 저장
-            self.selected_stocks[new_time_slot] = new_stocks.copy()
 
             # 포지션이 없는 이전 시간대 종목들은 BACKGROUND로 전환
             previous_only_stocks = previous_selected - bought_stocks
@@ -907,11 +1032,6 @@ class StockBotMain:
                 logger.info(f"📉 백그라운드 전환: {list(previous_only_stocks)}")
                 for stock_code in previous_only_stocks:
                     self.data_manager.upgrade_priority(stock_code, DataPriority.BACKGROUND)
-
-            # 새로운 종목들 중 아직 모니터링하지 않는 종목들만 추가
-            new_monitoring_stocks = set(new_stocks) - holding_stocks
-            if new_monitoring_stocks:
-                logger.info(f"📈 신규 모니터링: {list(new_monitoring_stocks)}")
 
             # 종목 변경 알림 (텔레그램 - 비동기)
             if self.telegram_bot and self.telegram_bot.is_running():
@@ -929,12 +1049,22 @@ class StockBotMain:
         """포지션 보호용 콜백 함수 생성"""
         def callback(data: Dict, source: str):
             try:
+                # 🆕 실시간 데이터 캐시 업데이트 (전역 사용 가능)
+                current_price = data.get('current_price', {}).get('current_price', 0)
+                if current_price > 0:
+                    with self.cache_lock:
+                        self.realtime_cache[stock_code] = {
+                            'price': current_price,
+                            'timestamp': datetime.now(),
+                            'source': source,
+                            'full_data': data
+                        }
+
                 # 포지션 보호 - 더 엄격한 손절/익절 적용
-                if stock_code in self.positions:
-                    current_price = data.get('current_price', {}).get('current_price', 0)
+                if stock_code in self.positions and current_price > 0:
                     position = self.positions[stock_code]
 
-                    if current_price > 0 and position['avg_price'] > 0:
+                    if position['avg_price'] > 0:
                         profit_rate = (current_price - position['avg_price']) / position['avg_price']
 
                         # 시간대 변경 후 더 보수적인 손절/익절 (설정값 사용)
@@ -1054,6 +1184,220 @@ class StockBotMain:
             self.protection_take_profit = 0.02  # +2%
             self.position_check_interval = 3
             self.no_position_wait_time = 10
+
+    def _check_strategy_sell_conditions(self, stock_code: str, position: Dict,
+                                       current_price: int, profit_rate: float) -> Optional[Dict]:
+        """전략별 매도 조건 체크"""
+        strategy_type = position.get('strategy_type', 'unknown')
+        entry_time = position.get('entry_time', datetime.now())
+        max_profit_rate = position.get('max_profit_rate', 0.0)
+        holding_minutes = (datetime.now() - entry_time).total_seconds() / 60
+
+        # 전략별 매도 조건
+        if strategy_type == 'gap_trading' or 'gap_trading' in strategy_type:
+            return self._check_gap_trading_sell(profit_rate, holding_minutes, max_profit_rate)
+
+        elif strategy_type == 'volume_breakout' or 'volume_breakout' in strategy_type:
+            return self._check_volume_breakout_sell(profit_rate, holding_minutes, max_profit_rate)
+
+        elif strategy_type == 'momentum' or 'momentum' in strategy_type:
+            return self._check_momentum_sell(profit_rate, holding_minutes, max_profit_rate)
+
+        elif strategy_type in ['stop_loss', 'take_profit']:
+            # 손절/익절로 매수한 경우 (재진입) - 더 보수적
+            return self._check_conservative_sell(profit_rate, holding_minutes)
+
+        else:
+            # 기본 전략 (기존 로직)
+            return self._check_default_sell(profit_rate)
+
+    def _check_gap_trading_sell(self, profit_rate: float, holding_minutes: float,
+                               max_profit_rate: float) -> Optional[Dict]:
+        """갭 트레이딩 매도 조건 - 빠른 진입/탈출"""
+        # 설정값 로드
+        stop_loss = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'stop_loss_percent', -2.0), -2.0) / 100
+        take_profit = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'take_profit_percent', 3.0), 3.0) / 100
+        time_exit_min = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'time_exit_minutes', 30), 30)
+        time_exit_profit = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'time_exit_profit_percent', 1.5), 1.5) / 100
+        trailing_trigger = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'trailing_stop_trigger', 2.0), 2.0) / 100
+        trailing_stop = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'trailing_stop_percent', 1.5), 1.5) / 100
+
+        # 1. 타이트한 손절
+        if profit_rate <= stop_loss:
+            return {'reason': '갭_손절', 'type': 'stop_loss'}
+
+        # 2. 빠른 익절
+        if profit_rate >= take_profit:
+            return {'reason': '갭_익절', 'type': 'take_profit'}
+
+        # 3. 시간 기반 매도
+        if holding_minutes >= time_exit_min and profit_rate >= time_exit_profit:
+            return {'reason': '갭_시간익절', 'type': 'time_based'}
+
+        # 4. Trailing stop
+        if max_profit_rate >= trailing_trigger and profit_rate <= max_profit_rate - trailing_stop:
+            return {'reason': '갭_트레일링', 'type': 'trailing_stop'}
+
+        return None
+
+    def _check_volume_breakout_sell(self, profit_rate: float, holding_minutes: float,
+                                   max_profit_rate: float) -> Optional[Dict]:
+        """볼륨 브레이크아웃 매도 조건 - 모멘텀 활용"""
+        # 설정값 로드
+        stop_loss = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'stop_loss_percent', -2.5), -2.5) / 100
+        take_profit = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'take_profit_percent', 4.0), 4.0) / 100
+        momentum_exit_min = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'momentum_exit_minutes', 60), 60)
+        momentum_exit_profit = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'momentum_exit_profit_percent', 2.0), 2.0) / 100
+        trailing_trigger = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'trailing_stop_trigger', 3.0), 3.0) / 100
+        trailing_stop = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'trailing_stop_percent', 2.0), 2.0) / 100
+
+        # 1. 표준 손절
+        if profit_rate <= stop_loss:
+            return {'reason': '볼륨_손절', 'type': 'stop_loss'}
+
+        # 2. 적극적 익절
+        if profit_rate >= take_profit:
+            return {'reason': '볼륨_익절', 'type': 'take_profit'}
+
+        # 3. 모멘텀 유지 체크
+        if holding_minutes >= momentum_exit_min and profit_rate >= momentum_exit_profit:
+            return {'reason': '볼륨_모멘텀익절', 'type': 'momentum_based'}
+
+        # 4. Trailing stop
+        if max_profit_rate >= trailing_trigger and profit_rate <= max_profit_rate - trailing_stop:
+            return {'reason': '볼륨_트레일링', 'type': 'trailing_stop'}
+
+        return None
+
+    def _check_momentum_sell(self, profit_rate: float, holding_minutes: float,
+                           max_profit_rate: float) -> Optional[Dict]:
+        """모멘텀 매도 조건 - 트렌드 지속 기대"""
+        # 설정값 로드
+        stop_loss = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'stop_loss_percent', -3.5), -3.5) / 100
+        take_profit = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'take_profit_percent', 6.0), 6.0) / 100
+        long_term_min = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'long_term_exit_minutes', 120), 120)
+        long_term_profit = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'long_term_exit_profit_percent', 3.0), 3.0) / 100
+        trailing_trigger = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'trailing_stop_trigger', 4.0), 4.0) / 100
+        trailing_stop = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'trailing_stop_percent', 2.5), 2.5) / 100
+
+        # 1. 관대한 손절
+        if profit_rate <= stop_loss:
+            return {'reason': '모멘텀_손절', 'type': 'stop_loss'}
+
+        # 2. 높은 익절
+        if profit_rate >= take_profit:
+            return {'reason': '모멘텀_익절', 'type': 'take_profit'}
+
+        # 3. 장기 보유 전략
+        if holding_minutes >= long_term_min and profit_rate >= long_term_profit:
+            return {'reason': '모멘텀_장기익절', 'type': 'long_term'}
+
+        # 4. Trailing stop
+        if max_profit_rate >= trailing_trigger and profit_rate <= max_profit_rate - trailing_stop:
+            return {'reason': '모멘텀_트레일링', 'type': 'trailing_stop'}
+
+        return None
+
+    def _check_conservative_sell(self, profit_rate: float, holding_minutes: float) -> Optional[Dict]:
+        """보수적 매도 조건 - 손절/익절 재진입"""
+        # 설정값 로드
+        stop_loss = self._safe_float(self.config_loader.get_config_value('conservative_sell', 'stop_loss_percent', -1.5), -1.5) / 100
+        take_profit = self._safe_float(self.config_loader.get_config_value('conservative_sell', 'take_profit_percent', 2.0), 2.0) / 100
+
+        # 1. 엄격한 손절
+        if profit_rate <= stop_loss:
+            return {'reason': '보수_손절', 'type': 'stop_loss'}
+
+        # 2. 빠른 익절
+        if profit_rate >= take_profit:
+            return {'reason': '보수_익절', 'type': 'take_profit'}
+
+        return None
+
+    def _check_default_sell(self, profit_rate: float) -> Optional[Dict]:
+        """기본 매도 조건 - 기존 로직"""
+        # 설정값 로드 (기본값으로 기존 threshold 사용)
+        stop_loss = self._safe_float(self.config_loader.get_config_value('default_sell', 'stop_loss_percent', self.stop_loss_threshold * 100), self.stop_loss_threshold * 100) / 100
+        take_profit = self._safe_float(self.config_loader.get_config_value('default_sell', 'take_profit_percent', self.take_profit_threshold * 100), self.take_profit_threshold * 100) / 100
+
+        if profit_rate <= stop_loss:
+            return {'reason': '기본_손절', 'type': 'stop_loss'}
+
+        if profit_rate >= take_profit:
+            return {'reason': '기본_익절', 'type': 'take_profit'}
+
+        return None
+
+    def update_realtime_cache(self, stock_code: str, current_price: int, source: str = "unknown"):
+        """🆕 실시간 데이터 캐시 업데이트 (어디서든 호출 가능)"""
+        if current_price > 0:
+            with self.cache_lock:
+                self.realtime_cache[stock_code] = {
+                    'price': current_price,
+                    'timestamp': datetime.now(),
+                    'source': source
+                }
+
+    def get_realtime_price(self, stock_code: str, max_age_seconds: int = 10) -> Optional[Dict]:
+        """🆕 실시간 캐시에서 현재가 조회 (fallback 없음)"""
+        with self.cache_lock:
+            cached_data = self.realtime_cache.get(stock_code)
+            if cached_data:
+                cache_age = (datetime.now() - cached_data['timestamp']).total_seconds()
+                if cache_age <= max_age_seconds:
+                    return {
+                        'price': cached_data['price'],
+                        'age_seconds': cache_age,
+                        'source': cached_data['source']
+                    }
+        return None
+
+    def get_cached_price_with_fallback(self, stock_code: str) -> Dict:
+        """🆕 캐시 우선, fallback 포함 현재가 조회"""
+        # 1. 실시간 캐시 시도
+        realtime_data = self.get_realtime_price(stock_code, max_age_seconds=10)
+        if realtime_data:
+            return {
+                'price': realtime_data['price'],
+                'source': f"websocket({realtime_data['age_seconds']:.1f}s)",
+                'success': True
+            }
+
+        # 2. HybridDataManager 시도
+        try:
+            current_data = self.data_manager.get_latest_data(stock_code)
+            if current_data and 'current_price' in current_data:
+                price = current_data['current_price']['current_price']
+                if price > 0:
+                    return {
+                        'price': price,
+                        'source': "hybrid_manager",
+                        'success': True
+                    }
+        except Exception as e:
+            logger.debug(f"HybridDataManager 조회 실패: {e}")
+
+        # 3. 직접 REST API 호출 (최후 수단)
+        try:
+            price_data = self.trading_api.get_current_price(stock_code)
+            if price_data and 'current_price' in price_data:
+                price = price_data['current_price']
+                if price > 0:
+                    # 성공하면 실시간 캐시에도 저장
+                    self.update_realtime_cache(stock_code, price, "rest_api_direct")
+                    return {
+                        'price': price,
+                        'source': "rest_api_direct",
+                        'success': True
+                    }
+        except Exception as e:
+            logger.debug(f"직접 REST API 조회 실패: {e}")
+
+        return {
+            'price': 0,
+            'source': "failed",
+            'success': False
+        }
 
 if __name__ == "__main__":
     import signal
