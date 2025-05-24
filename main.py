@@ -111,9 +111,30 @@ class StockBotMain:
             'profit_rate': 0,
         }
 
-        # 10. 거래 신호 큐 (strategy_scheduler → monitor_positions)
-        self.trading_signals: asyncio.Queue = asyncio.Queue()
-        self.signal_lock = threading.RLock()
+        # 10. 🚀 고성능 거래 신호 시스템 (기존 trading_signals 대체)
+        # self.trading_signals: asyncio.Queue = asyncio.Queue()  # 제거됨 (순차 처리)
+        # self.signal_lock = threading.RLock()                   # 제거됨 (불필요)
+
+        # 🚀 신규: 고성능 신호 처리 시스템
+        # 우선순위 큐로 업그레이드 (signal_strength 기반)
+        from queue import PriorityQueue
+        import heapq
+        self.priority_signals = asyncio.PriorityQueue()  # 우선순위 기반 신호 큐
+        self.signal_batch_processor = None  # 배치 처리 태스크
+        self.signal_processing_active = True  # 신호 처리 활성화 플래그
+
+        # 병렬 처리 설정
+        self.max_concurrent_orders = 5  # 동시 주문 처리 수 (API 부하 고려)
+        self.signal_processing_semaphore = asyncio.Semaphore(self.max_concurrent_orders)
+
+        # 신호 처리 성능 추적
+        self.signal_stats = {
+            'total_received': 0,
+            'total_processed': 0,
+            'concurrent_peak': 0,
+            'average_processing_time': 0.0,  # float로 명시적 초기화
+            'last_batch_size': 0
+        }
 
         # 11. 🆕 전역 실시간 데이터 캐시 (웹소켓 우선, REST API fallback)
         self.realtime_cache: Dict[str, Dict] = {}  # {종목코드: {price, timestamp, source}}
@@ -429,16 +450,15 @@ class StockBotMain:
             return None
 
     async def monitor_positions(self):
-        """포지션 모니터링 + 전체 거래 실행 - 통합 거래 관리"""
-        logger.info("🔍 포지션 모니터링 + 거래 실행 시작")
+        """포지션 모니터링 - 손절/익절 전담 (신호 처리는 별도 태스크로 분리)"""
+        logger.info("🔍 포지션 모니터링 시작 (신호 처리 분리됨)")
         last_check_time = {}  # 종목별 마지막 체크 시간
 
         while True:
             try:
-                # 1. 먼저 대기 중인 거래 신호 처리
-                await self._process_pending_signals()
+                # 🚀 신호 처리는 전용 태스크에서 처리하므로 제거됨
+                # 포지션 모니터링에만 집중
 
-                # 2. 기존 포지션 모니터링 (손절/익절)
                 if not self.positions:
                     await asyncio.sleep(float(self.no_position_wait_time))  # 설정값 사용
                     continue
@@ -672,36 +692,161 @@ class StockBotMain:
     async def add_trading_signal(self, signal: Dict):
         """거래 신호를 큐에 추가 (strategy_scheduler에서 호출)"""
         try:
-            await self.trading_signals.put(signal)
-            logger.debug(f"📡 거래 신호 추가: {signal.get('stock_code')} {signal.get('action')}")
+            # 🚀 우선순위 계산 (낮을수록 높은 우선순위)
+            priority = self._calculate_signal_priority(signal)
+            timestamp = datetime.now().timestamp()
+
+            # 우선순위 큐에 추가 (priority, timestamp, signal)
+            await self.priority_signals.put((priority, timestamp, signal))
+
+            # 통계 업데이트
+            self.signal_stats['total_received'] += 1
+
+            logger.debug(f"📡 우선순위 거래 신호 추가: {signal.get('stock_code')} (우선순위: {priority:.2f})")
+
         except Exception as e:
             logger.error(f"거래 신호 추가 오류: {e}")
 
-    async def _process_pending_signals(self):
-        """대기 중인 거래 신호 처리 (monitor_positions에서 호출)"""
+    def _calculate_signal_priority(self, signal: Dict) -> float:
+        """
+        신호 우선순위 계산 (낮을수록 높은 우선순위)
+
+        기준:
+        - 신호 강도가 높을수록 우선순위 높음
+        - 전략별 가중치 적용
+        - 급등/급락 상황에서 더 높은 우선순위
+        """
         try:
-            # 큐에 있는 모든 신호를 한 번에 처리 (비블로킹)
-            processed_signals = 0
-            max_signals_per_cycle = 10  # 한 번에 처리할 최대 신호 수
+            signal_strength = signal.get('strength', 0.5)
+            strategy_type = signal.get('strategy_type', 'unknown')
+            action = signal.get('action', 'BUY')
 
-            while not self.trading_signals.empty() and processed_signals < max_signals_per_cycle:
-                try:
-                    signal = self.trading_signals.get_nowait()
-                    await self._execute_trading_signal(signal)
-                    processed_signals += 1
-                except asyncio.QueueEmpty:
+            # 기본 우선순위 (신호 강도 기반)
+            base_priority = 1.0 - signal_strength  # 0.0 ~ 1.0 (낮을수록 높은 우선순위)
+
+            # 전략별 가중치
+            strategy_weights = {
+                'gap_trading': 0.8,      # 갭 트레이딩 최우선
+                'volume_breakout': 0.9,  # 볼륨 브레이크아웃 높은 우선순위
+                'momentum': 1.0,         # 모멘텀 기본
+                'signal_': 0.95,         # 실시간 신호 높은 우선순위
+                'stop_loss': 0.1,        # 손절 최고 우선순위
+                'take_profit': 0.2       # 익절 두 번째 우선순위
+            }
+
+            strategy_weight = 1.0
+            for strategy, weight in strategy_weights.items():
+                if strategy in strategy_type:
+                    strategy_weight = weight
                     break
-                except Exception as e:
-                    logger.error(f"신호 처리 오류: {e}")
 
-            if processed_signals > 0:
-                logger.debug(f"🔄 거래 신호 처리 완료: {processed_signals}개")
+            # 매도 신호는 더 높은 우선순위
+            action_weight = 0.8 if action == 'SELL' else 1.0
+
+            # 최종 우선순위 계산
+            final_priority = base_priority * strategy_weight * action_weight
+
+            return max(0.01, min(1.0, final_priority))  # 0.01 ~ 1.0 범위로 제한
 
         except Exception as e:
-            logger.error(f"신호 처리 전체 오류: {e}")
+            logger.error(f"우선순위 계산 오류: {e}")
+            return 0.5  # 기본값
 
-    async def _execute_trading_signal(self, signal: Dict):
-        """개별 거래 신호 실행"""
+    async def _process_pending_signals(self):
+        """🚀 고성능 병렬 신호 처리 시스템 - 기존 순차 처리를 완전 대체"""
+        try:
+            batch_signals = []
+            start_time = datetime.now()
+
+            # 1. 배치 수집 (최대 20개 또는 100ms 내)
+            batch_timeout = 0.1  # 100ms
+            max_batch_size = 20
+
+            while len(batch_signals) < max_batch_size:
+                try:
+                    # 우선순위 큐에서 신호 수집 (타임아웃 포함)
+                    priority, timestamp, signal = await asyncio.wait_for(
+                        self.priority_signals.get(),
+                        timeout=batch_timeout if batch_signals else None
+                    )
+                    batch_signals.append((priority, timestamp, signal))
+
+                    # 첫 신호 후에는 짧은 타임아웃 적용
+                    if len(batch_signals) == 1:
+                        batch_timeout = 0.05  # 50ms
+
+                except asyncio.TimeoutError:
+                    break  # 타임아웃 시 현재 배치로 처리
+                except asyncio.QueueEmpty:
+                    break
+
+            if not batch_signals:
+                return
+
+            # 2. 배치 크기 통계 업데이트
+            self.signal_stats['last_batch_size'] = len(batch_signals)
+            logger.debug(f"🔄 신호 배치 처리: {len(batch_signals)}개")
+
+            # 3. 우선순위 정렬 (이미 우선순위 큐에서 나왔지만 안전장치)
+            batch_signals.sort(key=lambda x: x[0])  # 우선순위 기준 정렬
+
+            # 4. 🚀 병렬 처리 (동시 실행)
+            semaphore_tasks = []
+            for priority, timestamp, signal in batch_signals:
+                task = asyncio.create_task(
+                    self._execute_trading_signal_with_semaphore(signal, priority)
+                )
+                semaphore_tasks.append(task)
+
+            # 모든 신호 동시 실행 (세마포어로 제한)
+            results = await asyncio.gather(*semaphore_tasks, return_exceptions=True)
+
+            # 5. 결과 분석
+            success_count = sum(1 for r in results if r is not False and not isinstance(r, Exception))
+            error_count = sum(1 for r in results if isinstance(r, Exception))
+
+            # 6. 성능 통계 업데이트
+            processing_time = (datetime.now() - start_time).total_seconds()
+            self.signal_stats['total_processed'] += success_count
+            self.signal_stats['average_processing_time'] = (
+                self.signal_stats['average_processing_time'] * 0.8 +
+                processing_time * 0.2
+            )
+
+            if len(batch_signals) > 0:
+                logger.info(
+                    f"⚡ 병렬 신호 처리 완료: {success_count}/{len(batch_signals)}개 성공 "
+                    f"({processing_time*1000:.0f}ms, 평균 {self.signal_stats['average_processing_time']*1000:.0f}ms)"
+                )
+
+            if error_count > 0:
+                logger.warning(f"⚠️ 신호 처리 오류: {error_count}개")
+
+        except Exception as e:
+            logger.error(f"배치 신호 처리 전체 오류: {e}")
+
+    async def _execute_trading_signal_with_semaphore(self, signal: Dict, priority: float):
+        """세마포어를 사용한 제한된 병렬 신호 실행"""
+        async with self.signal_processing_semaphore:  # 동시 실행 수 제한
+            try:
+                start_time = datetime.now()
+                result = await self._execute_trading_signal_optimized(signal, priority)
+
+                # 처리 시간 추적
+                processing_time = (datetime.now() - start_time).total_seconds()
+                if processing_time > 0.5:  # 500ms 이상 소요 시 경고
+                    logger.warning(
+                        f"⚠️ 느린 신호 처리: {signal.get('stock_code')} {processing_time*1000:.0f}ms"
+                    )
+
+                return result
+
+            except Exception as e:
+                logger.error(f"세마포어 신호 실행 오류: {e}")
+                return False
+
+    async def _execute_trading_signal_optimized(self, signal: Dict, priority: float):
+        """🚀 최적화된 개별 거래 신호 실행 - 성능 개선 버전"""
         try:
             stock_code = signal.get('stock_code')
             action = signal.get('action')
@@ -709,49 +854,77 @@ class StockBotMain:
             reason = signal.get('reason', 'unknown')
             strategy_type = signal.get('strategy_type', 'signal')
 
-            # 필수 필드 검증
+            # 필수 필드 검증 (빠른 실패)
             if not stock_code or not action:
                 logger.warning(f"⚠️ 신호 필수 필드 누락: stock_code={stock_code}, action={action}")
-                return
+                return False
 
             if action == 'BUY':
-                # 새 포지션 오픈 가능 여부 체크
+                # 🚀 성능 최적화: 동시성 체크를 먼저 수행 (빠른 실패)
                 if not self.can_open_new_position():
-                    logger.info(f"⚠️ 신규 포지션 오픈 불가: {stock_code}")
-                    return
+                    logger.debug(f"⚠️ 신규 포지션 오픈 불가: {stock_code}")
+                    return False
 
-                # 동적 포지션 사이징 계산
-                position_info = self.calculate_position_size(
-                    signal=signal,
-                    stock_code=stock_code,
-                    current_price=price
-                )
+                # 🚀 캐시된 잔고 사용 (실시간 조회 대신)
+                cached_balance = getattr(self, '_cached_balance', {'available_cash': 0})
+                min_investment = 100000  # 10만원 최소 투자
+
+                if cached_balance['available_cash'] < min_investment:
+                    logger.debug(f"⚠️ 가용 현금 부족: {stock_code}")
+                    return False
+
+                # 🚀 비동기 포지션 사이징 (블로킹 최소화)
+                try:
+                    position_info = await asyncio.get_event_loop().run_in_executor(
+                        None,  # ThreadPoolExecutor 사용
+                        self.calculate_position_size,
+                        signal, stock_code, price
+                    )
+                except Exception as e:
+                    logger.error(f"포지션 사이징 오류 ({stock_code}): {e}")
+                    return False
 
                 quantity = position_info['quantity']
                 investment_amount = position_info['investment_amount']
 
                 if quantity > 0:
-                    await self.execute_strategy_order(
+                    # 🚀 우선순위 정보 포함하여 주문 실행
+                    order_no = await self.execute_strategy_order(
                         stock_code=stock_code,
                         order_type="BUY",
                         quantity=quantity,
                         price=price,
                         strategy_type=strategy_type
                     )
-                    logger.info(
-                        f"📈 매수 신호 실행: {stock_code} {quantity}주 @ {price:,}원 "
-                        f"(투자금액: {investment_amount:,}원, {reason})"
-                    )
+
+                    if order_no:
+                        # 주문 정보에 우선순위 추가
+                        if order_no in self.pending_orders:
+                            self.pending_orders[order_no]['priority'] = priority
+                            self.pending_orders[order_no]['signal_reason'] = reason
+
+                        logger.info(
+                            f"📈 우선순위 매수 실행: {stock_code} {quantity}주 @ {price:,}원 "
+                            f"(우선순위: {priority:.2f}, 투자: {investment_amount:,}원, {reason})"
+                        )
+                        return True
+                    else:
+                        logger.warning(f"❌ 매수 주문 실패: {stock_code}")
+                        return False
                 else:
-                    logger.info(f"⚠️ 매수 수량 없음: {stock_code} (계산된 수량: {quantity})")
+                    logger.debug(f"⚠️ 매수 수량 없음: {stock_code} (계산된 수량: {quantity})")
+                    return False
 
             elif action == 'SELL':
-                # 보유 수량 확인 후 매도
-                position = self.positions.get(stock_code, {})
+                # 🚀 빠른 포지션 조회 (락 최소화)
+                with self.position_lock:
+                    position = self.positions.get(stock_code, {}).copy()
+
                 quantity = position.get('quantity', 0)
 
                 if quantity > 0:
-                    await self.execute_strategy_order(
+                    # 🚀 우선순위 정보 포함하여 매도 실행
+                    order_no = await self.execute_strategy_order(
                         stock_code=stock_code,
                         order_type="SELL",
                         quantity=quantity,
@@ -759,20 +932,36 @@ class StockBotMain:
                         strategy_type=strategy_type
                     )
 
-                    # 예상 손익 계산
-                    avg_price = position.get('avg_price', price)
-                    expected_profit = (price - avg_price) * quantity
-                    expected_profit_rate = (expected_profit / (avg_price * quantity)) * 100 if avg_price > 0 else 0
+                    if order_no:
+                        # 주문 정보에 우선순위 추가
+                        if order_no in self.pending_orders:
+                            self.pending_orders[order_no]['priority'] = priority
+                            self.pending_orders[order_no]['signal_reason'] = reason
 
-                    logger.info(
-                        f"📉 매도 신호 실행: {stock_code} {quantity}주 @ {price:,}원 "
-                        f"(예상손익: {expected_profit:+,}원 {expected_profit_rate:+.1f}%, {reason})"
-                    )
+                        # 예상 손익 계산 (비동기)
+                        avg_price = position.get('avg_price', price)
+                        expected_profit = (price - avg_price) * quantity
+                        expected_profit_rate = (expected_profit / (avg_price * quantity)) * 100 if avg_price > 0 else 0
+
+                        logger.info(
+                            f"📉 우선순위 매도 실행: {stock_code} {quantity}주 @ {price:,}원 "
+                            f"(우선순위: {priority:.2f}, 예상손익: {expected_profit:+,}원 {expected_profit_rate:+.1f}%, {reason})"
+                        )
+                        return True
+                    else:
+                        logger.warning(f"❌ 매도 주문 실패: {stock_code}")
+                        return False
                 else:
-                    logger.warning(f"⚠️ 매도할 포지션 없음: {stock_code}")
+                    logger.debug(f"⚠️ 매도할 포지션 없음: {stock_code}")
+                    return False
+
+            else:
+                logger.warning(f"⚠️ 알 수 없는 액션: {action}")
+                return False
 
         except Exception as e:
-            logger.error(f"거래 신호 실행 오류: {e}")
+            logger.error(f"최적화된 거래 신호 실행 오류 ({signal.get('stock_code')}): {e}")
+            return False
 
     def can_open_new_position(self) -> bool:
         """새 포지션 오픈 가능 여부 체크"""
@@ -797,16 +986,37 @@ class StockBotMain:
             logger.error(f"포지션 오픈 가능 여부 체크 오류: {e}")
             return False
 
+    async def start_dedicated_signal_processor(self):
+        """🚀 전용 신호 처리 루프 - 높은 우선순위로 실행"""
+        logger.info("⚡ 전용 신호 처리 태스크 시작")
+
+        while self.signal_processing_active:
+            try:
+                # 신호가 있을 때만 처리 (블로킹 대기)
+                if not self.priority_signals.empty():
+                    await self._process_pending_signals()
+                else:
+                    # 신호가 없으면 짧게 대기 (10ms)
+                    await asyncio.sleep(0.01)
+
+            except Exception as e:
+                logger.error(f"전용 신호 처리 루프 오류: {e}")
+                await asyncio.sleep(0.1)  # 오류 시 100ms 대기
+
     async def run(self):
         """메인 실행 루프 - 비동기 태스크 관리"""
         try:
             # 초기화
             await self.initialize()
 
-            # 핵심 태스크들 생성
+            # 🚀 핵심 태스크들 생성 (신호 처리 태스크 추가)
             scheduler_task = asyncio.create_task(
                 self.strategy_scheduler.start_scheduler(),
                 name="strategy_scheduler"
+            )
+            signal_processor_task = asyncio.create_task(
+                self.start_dedicated_signal_processor(),
+                name="signal_processor"
             )
             monitor_task = asyncio.create_task(
                 self.monitor_positions(),
@@ -817,17 +1027,19 @@ class StockBotMain:
                 name="websocket_listener"
             )
 
-            logger.info("🎮 StockBot 운영 시작 - 3개 핵심 태스크 실행")
+            logger.info("🎮 StockBot 운영 시작 - 4개 핵심 태스크 실행")
             logger.info("   📅 전략 스케줄러 (종목 탐색 + 시간대별 전략)")
+            logger.info("   ⚡ 전용 신호 처리기 (고성능 병렬 처리)")
             logger.info("   🔍 포지션 모니터링 (손절/익절)")
             logger.info("   📡 WebSocket 리스너 (실시간 체결통보)")
             logger.info("   💰 잔고 갱신 (매수/매도 시마다 자동)")
 
             # 모든 핵심 태스크 동시 실행 및 관리
             await asyncio.gather(
-                scheduler_task,  # 전략 스케줄러 (가장 중요!)
-                monitor_task,    # 포지션 모니터링
-                listen_task,     # WebSocket 수신
+                scheduler_task,       # 전략 스케줄러 (가장 중요!)
+                signal_processor_task, # 🚀 전용 신호 처리기 (새로 추가!)
+                monitor_task,         # 포지션 모니터링
+                listen_task,          # WebSocket 수신
                 return_exceptions=False  # 하나라도 실패하면 전체 중단
             )
 
@@ -898,6 +1110,10 @@ class StockBotMain:
         """정리 작업 - 안전한 종료"""
         logger.info("🧹 시스템 정리 중...")
 
+        # 🚀 신호 처리 시스템 중지
+        self.signal_processing_active = False
+        logger.info("⚡ 신호 처리 시스템 중지")
+
         # 전략 스케줄러 중지
         self.strategy_scheduler.stop_scheduler()
 
@@ -914,6 +1130,14 @@ class StockBotMain:
 
         # 데이터베이스 연결 종료
         db_manager.close_database()
+
+        # 🚀 신호 처리 성능 통계 출력
+        logger.info(
+            f"📊 신호 처리 통계: "
+            f"수신 {self.signal_stats['total_received']}개, "
+            f"처리 {self.signal_stats['total_processed']}개, "
+            f"평균 처리시간 {self.signal_stats['average_processing_time']*1000:.0f}ms"
+        )
 
         logger.info("✅ 시스템 정리 완료")
 
