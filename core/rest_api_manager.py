@@ -341,10 +341,10 @@ class KISRestAPIManager:
                 with open(TOKEN_FILE_PATH, 'w') as f:
                     json.dump(token_info, f, indent=2)
 
-                logger.log_system(f"토큰 정보를 파일에 저장했습니다: {TOKEN_FILE_PATH}")
+                logger.info(f"토큰 정보를 파일에 저장했습니다: {TOKEN_FILE_PATH}")
 
             except Exception as e:
-                logger.log_error(e, "토큰 정보를 파일에 저장하는 중 오류 발생")
+                logger.error(f"토큰 정보를 파일에 저장하는 중 오류 발생: {e}")
 
     def _ensure_token_valid(self) -> None:
         """토큰 유효성 확인 및 갱신 (스레드 안전)"""
