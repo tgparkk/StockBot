@@ -888,6 +888,10 @@ class StrategyScheduler:
                 if not bot_instance:
                     return
 
+                # 🚀 타입 힌트 추가 - IDE가 StockBotMain의 속성들을 인식하도록
+                from typing import cast
+                bot_instance = cast('StockBotMain', bot_instance)
+
                 # 실시간 데이터에서 필요한 정보 추출
                 current_price_data = data.get('current_price', {})
                 if not current_price_data:
@@ -897,7 +901,7 @@ class StrategyScheduler:
                 if current_price <= 0:
                     return
 
-                # 포지션 확인
+                # 포지션 확인 (이제 IDE가 positions 속성을 인식함)
                 has_position = stock_code in bot_instance.positions
 
                 # 전략별 신호 생성 및 처리
@@ -909,9 +913,20 @@ class StrategyScheduler:
                     # 신호를 main의 거래 큐에 전송 (주문 실행은 monitor_positions에서)
                     signal['stock_code'] = stock_code
                     signal['strategy_type'] = f"signal_{strategy_name}"
-                    asyncio.create_task(
-                        bot_instance.add_trading_signal(signal)
-                    )
+
+                    # 🚀 비동기 호출 문제 해결: 스레드 안전 방식으로 신호 전송
+                    try:
+                        # 현재 실행 중인 이벤트 루프가 있으면 사용
+                        loop = asyncio.get_running_loop()
+                        # 콜백이 다른 스레드에서 실행될 수 있으므로 thread-safe하게 처리
+                        loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(bot_instance.add_trading_signal(signal))
+                        )
+                    except RuntimeError:
+                        # 이벤트 루프가 없거나 다른 스레드인 경우 로깅만
+                        logger.warning(f"⚠️ 이벤트 루프 없음 - 신호 전송 실패: {stock_code} {signal.get('action')}")
+                    except Exception as e:
+                        logger.error(f"신호 전송 오류 ({stock_code}): {e}")
 
             except Exception as e:
                 logger.error(f"{strategy_name} 콜백 오류: {e}")
