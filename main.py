@@ -123,6 +123,11 @@ class StockBotMain:
         self.signal_batch_processor = None  # 배치 처리 태스크
         self.signal_processing_active = True  # 신호 처리 활성화 플래그
 
+        # 🚀 중복 신호 방지 시스템
+        self.recent_signals: Dict[str, Dict] = {}  # {종목코드: {마지막_액션, 타임스탬프, 전략}}
+        self.signal_dedup_lock = threading.RLock()  # 중복 체크용 락
+        self.signal_cooldown_seconds = 5  # 같은 종목 신호 간 최소 간격 (초)
+
         # 병렬 처리 설정
         self.max_concurrent_orders = 5  # 동시 주문 처리 수 (API 부하 고려)
         self.signal_processing_semaphore = asyncio.Semaphore(self.max_concurrent_orders)
@@ -131,6 +136,7 @@ class StockBotMain:
         self.signal_stats = {
             'total_received': 0,
             'total_processed': 0,
+            'total_filtered': 0,  # 중복 제거된 신호 수
             'concurrent_peak': 0,
             'average_processing_time': 0.0,  # float로 명시적 초기화
             'last_batch_size': 0
@@ -139,6 +145,10 @@ class StockBotMain:
         # 11. 🆕 전역 실시간 데이터 캐시 (웹소켓 우선, REST API fallback)
         self.realtime_cache: Dict[str, Dict] = {}  # {종목코드: {price, timestamp, source}}
         self.cache_lock = threading.RLock()
+
+        # 🆕 12. 미체결 주문 관리 시스템
+        self.pending_order_adjustments: Dict[str, int] = {}  # {order_no: 조정_횟수}
+        self.pending_order_lock = threading.RLock()
 
         # 신호 핸들러 등록
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -154,9 +164,10 @@ class StockBotMain:
         # 장외시간 체크
         from datetime import datetime
         import pytz
+        from core.rest_api_manager import KISRestAPIManager
         kst = pytz.timezone('Asia/Seoul')
         now = datetime.now(kst)
-        is_market_open = self._is_market_open(now)
+        is_market_open = KISRestAPIManager.is_market_open(now)
 
         if not is_market_open:
             logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 제한된 모드로 실행됩니다")
@@ -191,26 +202,6 @@ class StockBotMain:
             logger.info("🤖 텔레그램 봇 시작")
 
         logger.info("✅ StockBot 초기화 완료")
-
-    def _is_market_open(self, current_time: datetime) -> bool:
-        """
-        장 시간 여부 확인
-
-        Args:
-            current_time: 확인할 시간 (timezone aware)
-
-        Returns:
-            장 시간 여부
-        """
-        # 평일 여부 확인 (0=월요일, 6=일요일)
-        if current_time.weekday() >= 5:  # 토요일(5), 일요일(6)
-            return False
-
-        # 장 시간 확인 (09:00 ~ 15:30)
-        market_open = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
-        market_close = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
-
-        return market_open <= current_time <= market_close
 
     async def _setup_execution_notification(self):
         """체결통보 설정 - 핵심! 자동 포지션 관리"""
@@ -597,6 +588,7 @@ class StockBotMain:
             max_positions = self._safe_int(self.config_loader.get_config_value('trading', 'max_positions', 10), 10)
             position_size_pct = self._safe_float(self.config_loader.get_config_value('trading', 'position_size_pct', 5.0), 5.0)
             daily_risk_limit = self._safe_int(self.config_loader.get_config_value('trading', 'daily_risk_limit', 1000000), 1000000)
+            max_cash_usage_pct = self._safe_float(self.config_loader.get_config_value('trading', 'max_cash_usage_pct', 80.0), 80.0)
 
             # 1. 종목당 최대 투자 금액 계산 (총 자산의 %)
             max_investment_per_stock = int(balance['total_assets'] * (position_size_pct / 100))
@@ -638,7 +630,7 @@ class StockBotMain:
             )
 
             # 6. 가용 현금 한도 체크
-            target_investment = min(target_investment, balance['available_cash'] * 0.8)  # 가용 현금의 80%까지만
+            target_investment = min(target_investment, balance['available_cash'] * (max_cash_usage_pct / 100))
 
             # 7. 일일 리스크 한도 체크
             target_investment = min(target_investment, daily_risk_limit // max_positions)
@@ -690,9 +682,60 @@ class StockBotMain:
             logger.error(f"잔고 캐시 업데이트 오류: {e}")
 
     async def add_trading_signal(self, signal: Dict):
-        """거래 신호를 큐에 추가 (strategy_scheduler에서 호출)"""
+        """거래 신호를 큐에 추가 (strategy_scheduler에서 호출) - 중복 제거 포함"""
         try:
-            # 🚀 우선순위 계산 (낮을수록 높은 우선순위)
+            stock_code = signal.get('stock_code')
+            action = signal.get('action')
+            strategy_type = signal.get('strategy_type', 'unknown')
+
+            if not stock_code or not action:
+                logger.warning(f"⚠️ 신호 필수 필드 누락: {stock_code}, {action}")
+                return
+
+            # 🚀 중복 신호 검사 및 필터링
+            current_time = datetime.now().timestamp()
+            should_process = True
+
+            with self.signal_dedup_lock:
+                if stock_code in self.recent_signals:
+                    last_signal = self.recent_signals[stock_code]
+                    time_diff = current_time - last_signal['timestamp']
+
+                    # 1. 같은 액션의 중복 체크 (쿨다운 적용)
+                    if (last_signal['action'] == action and
+                        time_diff < self.signal_cooldown_seconds):
+                        logger.debug(f"🚫 중복 신호 필터링: {stock_code} {action} (쿨다운 {time_diff:.1f}s)")
+                        should_process = False
+
+                    # 2. 상충 신호 체크 (매수↔매도)
+                    elif (last_signal['action'] != action and
+                          time_diff < 2.0):  # 2초 이내 상충 신호 방지
+                        # 우선순위 비교 (매도 > 매수, 포지션보호 > 전략신호)
+                        current_priority = self._calculate_signal_priority(signal)
+                        last_priority = last_signal.get('priority', 0.5)
+
+                        if current_priority >= last_priority:  # 우선순위가 낮거나 같으면 무시
+                            logger.warning(f"⚠️ 상충 신호 필터링: {stock_code} {action} vs {last_signal['action']} (우선순위 낮음)")
+                            should_process = False
+                        else:
+                            logger.info(f"🔄 상충 신호 우선순위 교체: {stock_code} {action} 우선 처리")
+
+                # 3. 신호 정보 업데이트 (처리 여부와 상관없이)
+                if should_process:
+                    priority = self._calculate_signal_priority(signal)
+                    self.recent_signals[stock_code] = {
+                        'action': action,
+                        'timestamp': current_time,
+                        'strategy_type': strategy_type,
+                        'priority': priority
+                    }
+
+            if not should_process:
+                # 필터링 통계 업데이트
+                self.signal_stats['total_filtered'] += 1
+                return
+
+            # 🚀 중복이 아닌 경우 우선순위 큐에 추가
             priority = self._calculate_signal_priority(signal)
             timestamp = datetime.now().timestamp()
 
@@ -702,7 +745,7 @@ class StockBotMain:
             # 통계 업데이트
             self.signal_stats['total_received'] += 1
 
-            logger.debug(f"📡 우선순위 거래 신호 추가: {signal.get('stock_code')} (우선순위: {priority:.2f})")
+            logger.debug(f"📡 우선순위 거래 신호 추가: {signal.get('stock_code')} {action} (우선순위: {priority:.2f})")
 
         except Exception as e:
             logger.error(f"거래 신호 추가 오류: {e}")
@@ -865,95 +908,68 @@ class StockBotMain:
                     logger.debug(f"⚠️ 신규 포지션 오픈 불가: {stock_code}")
                     return False
 
-                # 🚀 캐시된 잔고 사용 (실시간 조회 대신)
-                cached_balance = getattr(self, '_cached_balance', {'available_cash': 0})
-                min_investment = 100000  # 10만원 최소 투자
+                # 포지션 사이징 계산
+                sizing_result = self.calculate_position_size(signal, stock_code, price)
+                quantity = sizing_result['quantity']
 
-                if cached_balance['available_cash'] < min_investment:
-                    logger.debug(f"⚠️ 가용 현금 부족: {stock_code}")
+                if quantity <= 0:
+                    logger.debug(f"⚠️ 매수 수량 부족: {stock_code}")
                     return False
 
-                # 🚀 비동기 포지션 사이징 (블로킹 최소화)
-                try:
-                    position_info = await asyncio.get_event_loop().run_in_executor(
-                        None,  # ThreadPoolExecutor 사용
-                        self.calculate_position_size,
-                        signal, stock_code, price
-                    )
-                except Exception as e:
-                    logger.error(f"포지션 사이징 오류 ({stock_code}): {e}")
-                    return False
+                # 매수 주문 실행
+                order_no = await self.execute_strategy_order(
+                    stock_code=stock_code,
+                    order_type="BUY",
+                    quantity=quantity,
+                    price=price,
+                    strategy_type=strategy_type
+                )
 
-                quantity = position_info['quantity']
-                investment_amount = position_info['investment_amount']
-
-                if quantity > 0:
-                    # 🚀 우선순위 정보 포함하여 주문 실행
-                    order_no = await self.execute_strategy_order(
-                        stock_code=stock_code,
-                        order_type="BUY",
-                        quantity=quantity,
-                        price=price,
-                        strategy_type=strategy_type
-                    )
-
-                    if order_no:
-                        # 주문 정보에 우선순위 추가
-                        if order_no in self.pending_orders:
-                            self.pending_orders[order_no]['priority'] = priority
-                            self.pending_orders[order_no]['signal_reason'] = reason
-
-                        logger.info(
-                            f"📈 우선순위 매수 실행: {stock_code} {quantity}주 @ {price:,}원 "
-                            f"(우선순위: {priority:.2f}, 투자: {investment_amount:,}원, {reason})"
-                        )
-                        return True
-                    else:
-                        logger.warning(f"❌ 매수 주문 실패: {stock_code}")
-                        return False
+                success = order_no is not None
+                if success:
+                    logger.info(f"✅ 매수 신호 처리 성공: {stock_code} {quantity}주 @ {price:,}원 ({reason})")
                 else:
-                    logger.debug(f"⚠️ 매수 수량 없음: {stock_code} (계산된 수량: {quantity})")
-                    return False
+                    logger.warning(f"❌ 매수 신호 처리 실패: {stock_code}")
+
+                return success
 
             elif action == 'SELL':
-                # 🚀 빠른 포지션 조회 (락 최소화)
-                with self.position_lock:
-                    position = self.positions.get(stock_code, {}).copy()
+                # 🚀 매도 처리 (전략 신호 + 포지션 보호 신호 통합)
 
-                quantity = position.get('quantity', 0)
-
-                if quantity > 0:
-                    # 🚀 우선순위 정보 포함하여 매도 실행
-                    order_no = await self.execute_strategy_order(
-                        stock_code=stock_code,
-                        order_type="SELL",
-                        quantity=quantity,
-                        price=price,
-                        strategy_type=strategy_type
-                    )
-
-                    if order_no:
-                        # 주문 정보에 우선순위 추가
-                        if order_no in self.pending_orders:
-                            self.pending_orders[order_no]['priority'] = priority
-                            self.pending_orders[order_no]['signal_reason'] = reason
-
-                        # 예상 손익 계산 (비동기)
-                        avg_price = position.get('avg_price', price)
-                        expected_profit = (price - avg_price) * quantity
-                        expected_profit_rate = (expected_profit / (avg_price * quantity)) * 100 if avg_price > 0 else 0
-
-                        logger.info(
-                            f"📉 우선순위 매도 실행: {stock_code} {quantity}주 @ {price:,}원 "
-                            f"(우선순위: {priority:.2f}, 예상손익: {expected_profit:+,}원 {expected_profit_rate:+.1f}%, {reason})"
-                        )
-                        return True
-                    else:
-                        logger.warning(f"❌ 매도 주문 실패: {stock_code}")
+                # 포지션 보호 신호의 경우 수량이 이미 지정됨
+                if signal.get('source') == 'position_monitoring':
+                    quantity = signal.get('quantity', 0)
+                    if quantity <= 0:
+                        logger.warning(f"⚠️ 포지션 보호 신호 수량 오류: {stock_code}")
                         return False
                 else:
-                    logger.debug(f"⚠️ 매도할 포지션 없음: {stock_code}")
-                    return False
+                    # 일반 전략 신호의 경우 현재 보유 수량 확인
+                    position = self.positions.get(stock_code)
+                    if not position:
+                        logger.debug(f"⚠️ 매도할 포지션 없음: {stock_code}")
+                        return False
+                    quantity = position['quantity']
+
+                # 매도 주문 실행
+                order_no = await self.execute_strategy_order(
+                    stock_code=stock_code,
+                    order_type="SELL",
+                    quantity=quantity,
+                    price=price,
+                    strategy_type=strategy_type
+                )
+
+                success = order_no is not None
+                if success:
+                    logger.info(f"✅ 매도 신호 처리 성공: {stock_code} {quantity}주 @ {price:,}원 ({reason})")
+
+                    # 포지션 보호 신호인 경우 특별 로깅
+                    if signal.get('source') == 'position_monitoring':
+                        logger.info(f"🛡️ 포지션 보호 실행: {reason}")
+                else:
+                    logger.warning(f"❌ 매도 신호 처리 실패: {stock_code}")
+
+                return success
 
             else:
                 logger.warning(f"⚠️ 알 수 없는 액션: {action}")
@@ -1009,44 +1025,32 @@ class StockBotMain:
             # 초기화
             await self.initialize()
 
-            # 🚀 핵심 태스크들 생성 (신호 처리 태스크 추가)
-            scheduler_task = asyncio.create_task(
-                self.strategy_scheduler.start_scheduler(),
-                name="strategy_scheduler"
-            )
-            signal_processor_task = asyncio.create_task(
-                self.start_dedicated_signal_processor(),
-                name="signal_processor"
-            )
-            monitor_task = asyncio.create_task(
-                self.monitor_positions(),
-                name="position_monitor"
-            )
-            listen_task = asyncio.create_task(
-                self.websocket_manager.start_listening(),
-                name="websocket_listener"
-            )
+            # 🚀 핵심 태스크들 생성 (통합된 신호 처리 시스템)
+            scheduler_task = asyncio.create_task(self.strategy_scheduler.start_scheduler())
 
-            logger.info("🎮 StockBot 운영 시작 - 4개 핵심 태스크 실행")
-            logger.info("   📅 전략 스케줄러 (종목 탐색 + 시간대별 전략)")
-            logger.info("   ⚡ 전용 신호 처리기 (고성능 병렬 처리)")
-            logger.info("   🔍 포지션 모니터링 (손절/익절)")
-            logger.info("   📡 WebSocket 리스너 (실시간 체결통보)")
-            logger.info("   💰 잔고 갱신 (매수/매도 시마다 자동)")
+            # 🚀 전용 신호 처리 태스크 (모든 거래 신호를 통합 처리)
+            signal_processor_task = asyncio.create_task(self.start_dedicated_signal_processor())
 
-            # 모든 핵심 태스크 동시 실행 및 관리
+            # 🚀 포지션 모니터링을 신호로 변환하는 태스크 (기존 monitor_positions 대체)
+            position_monitoring_task = asyncio.create_task(self.start_position_monitoring_signals())
+
+            # 🕐 미체결 주문 모니터링 태스크
+            pending_order_monitoring_task = asyncio.create_task(self.start_pending_order_monitoring())
+
+            logger.info("🚀 통합 거래 시스템 시작 - 모든 거래 결정이 하나의 큐로 통합됨")
+
+            # 모든 태스크가 완료될 때까지 대기
             await asyncio.gather(
-                scheduler_task,       # 전략 스케줄러 (가장 중요!)
-                signal_processor_task, # 🚀 전용 신호 처리기 (새로 추가!)
-                monitor_task,         # 포지션 모니터링
-                listen_task,          # WebSocket 수신
-                return_exceptions=False  # 하나라도 실패하면 전체 중단
+                scheduler_task,
+                signal_processor_task,
+                position_monitoring_task,
+                pending_order_monitoring_task,
+                return_exceptions=True
             )
 
-        except KeyboardInterrupt:
-            logger.info("👋 사용자 종료 요청")
         except Exception as e:
-            logger.error(f"❌ 시스템 오류: {e}")
+            logger.error(f"메인 실행 루프 오류: {e}")
+            raise
         finally:
             await self.cleanup()
 
@@ -1136,6 +1140,7 @@ class StockBotMain:
             f"📊 신호 처리 통계: "
             f"수신 {self.signal_stats['total_received']}개, "
             f"처리 {self.signal_stats['total_processed']}개, "
+            f"필터링 {self.signal_stats['total_filtered']}개, "
             f"평균 처리시간 {self.signal_stats['average_processing_time']*1000:.0f}ms"
         )
 
@@ -1622,6 +1627,388 @@ class StockBotMain:
             'source': "failed",
             'success': False
         }
+
+    async def start_position_monitoring_signals(self):
+        """🚀 포지션 모니터링을 신호로 변환하는 새로운 시스템"""
+        logger.info("🛡️ 통합 포지션 모니터링 시작 (신호 기반)")
+        last_check_time = {}
+
+        while self.signal_processing_active:
+            try:
+                if not self.positions:
+                    await asyncio.sleep(float(self.no_position_wait_time))
+                    continue
+
+                current_time = datetime.now()
+                positions_to_check = []
+
+                # 스레드 안전하게 포지션 복사
+                with self.position_lock:
+                    for stock_code, position in list(self.positions.items()):
+                        # 종목별로 최소 5초 간격 체크
+                        last_time = last_check_time.get(stock_code, current_time)
+                        if (current_time - last_time).total_seconds() >= 5:
+                            positions_to_check.append((stock_code, position.copy()))
+                            last_check_time[stock_code] = current_time
+
+                # 포지션별 모니터링 신호 생성
+                for stock_code, position in positions_to_check:
+                    try:
+                        # 현재가 조회
+                        price_result = self.get_cached_price_with_fallback(stock_code)
+                        if not price_result['success']:
+                            continue
+
+                        current_price = price_result['price']
+                        avg_price = position['avg_price']
+
+                        if avg_price <= 0:
+                            continue
+
+                        profit_rate = (current_price - avg_price) / avg_price
+
+                        # 최대 수익률 업데이트
+                        if profit_rate > position.get('max_profit_rate', 0.0):
+                            with self.position_lock:
+                                if stock_code in self.positions:
+                                    self.positions[stock_code]['max_profit_rate'] = profit_rate
+
+                        # 🚀 매도 조건을 신호로 변환
+                        sell_signal = self._check_strategy_sell_conditions(
+                            stock_code, position, current_price, profit_rate
+                        )
+
+                        if sell_signal:
+                            # 포지션 보호 신호를 우선순위 큐에 추가
+                            protection_signal = {
+                                'action': 'SELL',
+                                'stock_code': stock_code,
+                                'price': current_price,
+                                'reason': sell_signal['reason'],
+                                'strategy_type': 'position_protection',
+                                'strength': 0.9,  # 높은 강도 (보호 목적)
+                                'quantity': position['quantity'],
+                                'source': 'position_monitoring'
+                            }
+
+                            # 우선순위 큐에 추가 (기존 매수/매도 신호와 동일한 방식)
+                            await self.add_trading_signal(protection_signal)
+
+                            logger.info(f"🛡️ 포지션 보호 신호 생성: {stock_code} - {sell_signal['reason']}")
+
+                    except Exception as e:
+                        logger.error(f"포지션 모니터링 오류 ({stock_code}): {e}")
+
+                # 적응적 대기 시간
+                position_count = len(self.positions)
+                if position_count == 0:
+                    sleep_time = float(self.no_position_wait_time)
+                elif position_count <= 5:
+                    sleep_time = float(self.position_check_interval)
+                else:
+                    sleep_time = max(2.0, float(self.position_check_interval) - 1.0)
+
+                await asyncio.sleep(sleep_time)
+
+            except Exception as e:
+                logger.error(f"포지션 모니터링 전체 오류: {e}")
+                await asyncio.sleep(10)
+
+    async def start_pending_order_monitoring(self):
+        """🕐 미체결 주문 모니터링 시스템"""
+        logger.info("🕐 미체결 주문 모니터링 시작")
+
+        # 설정값 로드
+        timeout_seconds = self._safe_int(self.config_loader.get_config_value('trading', 'pending_order_timeout', 300), 300)
+        check_interval = self._safe_int(self.config_loader.get_config_value('trading', 'pending_order_check_interval', 30), 30)
+        buy_timeout_action = str(self.config_loader.get_config_value('trading', 'buy_timeout_action', 'price_adjust'))
+        sell_timeout_action = str(self.config_loader.get_config_value('trading', 'sell_timeout_action', 'market_order'))
+        price_adjust_percent = self._safe_float(self.config_loader.get_config_value('trading', 'price_adjust_percent', 0.5), 0.5)
+        max_adjustments = self._safe_int(self.config_loader.get_config_value('trading', 'max_price_adjustments', 3), 3)
+        force_market_time = self._safe_int(self.config_loader.get_config_value('trading', 'market_order_force_time', 600), 600)
+
+        while self.signal_processing_active:
+            try:
+                current_time = datetime.now()
+                timeout_orders = []
+
+                # 스레드 안전하게 미체결 주문 복사
+                with self.pending_order_lock:
+                    for order_no, order_info in list(self.pending_orders.items()):
+                        order_time = order_info.get('timestamp', current_time)
+                        elapsed_seconds = (current_time - order_time).total_seconds()
+
+                        # 타임아웃된 주문 찾기
+                        if elapsed_seconds >= timeout_seconds:
+                            timeout_orders.append((order_no, order_info.copy(), elapsed_seconds))
+
+                # 타임아웃된 주문 처리
+                for order_no, order_info, elapsed_seconds in timeout_orders:
+                    try:
+                        await self._handle_timeout_order(
+                            order_no, order_info, elapsed_seconds,
+                            buy_timeout_action, sell_timeout_action,
+                            price_adjust_percent, max_adjustments, force_market_time
+                        )
+                    except Exception as e:
+                        logger.error(f"타임아웃 주문 처리 오류 ({order_no}): {e}")
+
+                await asyncio.sleep(check_interval)
+
+            except Exception as e:
+                logger.error(f"미체결 주문 모니터링 오류: {e}")
+                await asyncio.sleep(60)  # 오류 시 1분 대기
+
+    async def _handle_timeout_order(self, order_no: str, order_info: Dict, elapsed_seconds: float,
+                                   buy_timeout_action: str, sell_timeout_action: str,
+                                   price_adjust_percent: float, max_adjustments: int,
+                                   force_market_time: float):
+        """타임아웃된 주문 처리"""
+        try:
+            stock_code = order_info.get('stock_code', '')
+            order_type = order_info.get('order_type', '')  # '매수' or '매도'
+            original_price = order_info.get('price', 0)
+            quantity = order_info.get('quantity', 0)
+            strategy_type = order_info.get('strategy_type', 'unknown')
+
+            logger.warning(f"⏰ 미체결 주문 타임아웃: {stock_code} {order_type} {elapsed_seconds:.0f}초 경과")
+
+            # 현재 주문 상태 확인 (실제 API 호출)
+            order_status = await self._check_order_status(order_no)
+
+            if order_status == 'filled':
+                # 이미 체결됨 - pending_orders에서만 제거
+                logger.info(f"✅ 주문 이미 체결됨: {order_no}")
+                with self.pending_order_lock:
+                    if order_no in self.pending_orders:
+                        del self.pending_orders[order_no]
+                return
+
+            if order_status == 'cancelled':
+                # 이미 취소됨 - pending_orders에서만 제거
+                logger.info(f"❌ 주문 이미 취소됨: {order_no}")
+                with self.pending_order_lock:
+                    if order_no in self.pending_orders:
+                        del self.pending_orders[order_no]
+                    if order_no in self.pending_order_adjustments:
+                        del self.pending_order_adjustments[order_no]
+                return
+
+            # 시장가 강제 전환 시간 체크
+            if elapsed_seconds >= force_market_time:
+                logger.warning(f"🚨 강제 시장가 전환: {stock_code} {order_type}")
+                await self._convert_to_market_order(order_no, order_info)
+                return
+
+            # 조정 횟수 확인
+            adjustment_count = self.pending_order_adjustments.get(order_no, 0)
+            if adjustment_count >= max_adjustments:
+                logger.warning(f"⚠️ 최대 조정 횟수 초과: {stock_code} {order_type}")
+                # 매도는 시장가, 매수는 취소
+                if order_type == '매도':
+                    await self._convert_to_market_order(order_no, order_info)
+                else:
+                    await self._cancel_order(order_no, order_info)
+                return
+
+            # 액션별 처리
+            action = sell_timeout_action if order_type == '매도' else buy_timeout_action
+
+            if action == 'cancel':
+                await self._cancel_order(order_no, order_info)
+            elif action == 'market_order':
+                await self._convert_to_market_order(order_no, order_info)
+            elif action == 'price_adjust':
+                await self._adjust_order_price(order_no, order_info, price_adjust_percent)
+            else:
+                logger.warning(f"⚠️ 알 수 없는 액션: {action}")
+                await self._cancel_order(order_no, order_info)
+
+        except Exception as e:
+            logger.error(f"타임아웃 주문 처리 전체 오류: {e}")
+
+    async def _check_order_status(self, order_no: str) -> str:
+        """주문 상태 확인"""
+        try:
+            # KIS API로 주문 상태 조회 (실제 구현은 trading_api에 따라 다름)
+            # 임시로 pending 반환 (실제로는 get_order_detail 등의 메서드 사용)
+            logger.debug(f"주문 상태 확인: {order_no}")
+            return 'pending'  # 기본값 (실제 API 구현 후 수정 필요)
+        except Exception as e:
+            logger.error(f"주문 상태 확인 오류: {e}")
+            return 'pending'
+
+    async def _cancel_order(self, order_no: str, order_info: Dict):
+        """주문 취소"""
+        try:
+            stock_code = order_info.get('stock_code', '')
+            order_type = order_info.get('order_type', '')
+
+            # KIS API로 주문 취소 (실제 구현은 trading_api에 따라 다름)
+            try:
+                # 실제 API 호출 (stock_code, quantity 파라미터 추가)
+                quantity = order_info.get('quantity', 0)
+                cancel_result = self.trading_api.cancel_order(
+                    order_no=order_no,
+                    stock_code=stock_code,
+                    quantity=quantity
+                )
+                logger.info(f"📋 주문 취소 시도: {stock_code} {order_type}")
+            except Exception as api_error:
+                logger.error(f"API 주문 취소 오류: {api_error}")
+                cancel_result = {'success': False}
+
+            if cancel_result and cancel_result.get('success', False):
+                logger.info(f"✅ 주문 취소 성공: {stock_code} {order_type}")
+
+                # pending_orders에서 제거
+                with self.pending_order_lock:
+                    if order_no in self.pending_orders:
+                        del self.pending_orders[order_no]
+                    if order_no in self.pending_order_adjustments:
+                        del self.pending_order_adjustments[order_no]
+
+                # 텔레그램 알림
+                if self.telegram_bot and self.telegram_bot.is_running():
+                    cancel_msg = f"🚫 <b>주문 취소</b>\n📊 {stock_code} {order_type}\n⏰ 타임아웃으로 인한 자동 취소"
+                    asyncio.create_task(self._send_telegram_notification_async(cancel_msg))
+            else:
+                logger.error(f"❌ 주문 취소 실패: {stock_code} {order_type}")
+
+        except Exception as e:
+            logger.error(f"주문 취소 오류: {e}")
+        return {'success': False}
+
+    async def _convert_to_market_order(self, order_no: str, order_info: Dict):
+        """시장가 주문으로 전환"""
+        try:
+            stock_code = order_info.get('stock_code', '')
+            order_type = order_info.get('order_type', '')
+            quantity = order_info.get('quantity', 0)
+            strategy_type = order_info.get('strategy_type', 'timeout_convert')
+
+            logger.info(f"🔄 시장가 전환: {stock_code} {order_type}")
+
+            # 기존 주문 취소
+            cancel_result = self.trading_api.cancel_order(
+                order_no=order_no,
+                stock_code=stock_code,
+                quantity=quantity
+            )
+            if not (cancel_result and cancel_result.get('success', False)):
+                logger.warning(f"⚠️ 기존 주문 취소 실패: {order_no}")
+                return
+
+            # 시장가 주문 실행
+            new_order_no = await self.execute_strategy_order(
+                stock_code=stock_code,
+                order_type="BUY" if order_type == '매수' else "SELL",
+                quantity=quantity,
+                price=0,  # 시장가
+                strategy_type=f"{strategy_type}_market_convert"
+            )
+
+            # 기존 주문 정보 정리
+            with self.pending_order_lock:
+                if order_no in self.pending_orders:
+                    del self.pending_orders[order_no]
+                if order_no in self.pending_order_adjustments:
+                    del self.pending_order_adjustments[order_no]
+
+            if new_order_no:
+                logger.info(f"✅ 시장가 전환 성공: {stock_code} {order_type} → {new_order_no}")
+
+                # 텔레그램 알림
+                if self.telegram_bot and self.telegram_bot.is_running():
+                    convert_msg = f"🔄 <b>시장가 전환</b>\n📊 {stock_code} {order_type}\n⚡ 미체결로 인한 시장가 전환"
+                    asyncio.create_task(self._send_telegram_notification_async(convert_msg))
+            else:
+                logger.error(f"❌ 시장가 전환 실패: {stock_code} {order_type}")
+
+        except Exception as e:
+            logger.error(f"시장가 전환 오류: {e}")
+
+    async def _adjust_order_price(self, order_no: str, order_info: Dict, adjust_percent: float):
+        """주문 가격 조정"""
+        try:
+            stock_code = order_info.get('stock_code', '')
+            order_type = order_info.get('order_type', '')
+            original_price = order_info.get('price', 0)
+            quantity = order_info.get('quantity', 0)
+            strategy_type = order_info.get('strategy_type', 'price_adjust')
+
+            # 현재가 조회
+            price_result = self.get_cached_price_with_fallback(stock_code)
+            if not price_result['success']:
+                logger.warning(f"⚠️ 현재가 조회 실패 - 시장가 전환: {stock_code}")
+                await self._convert_to_market_order(order_no, order_info)
+                return
+
+            current_price = price_result['price']
+
+            # 새로운 가격 계산
+            if order_type == '매수':
+                # 매수는 더 높은 가격으로 조정
+                new_price = int(current_price * (1 + adjust_percent / 100))
+            else:
+                # 매도는 더 낮은 가격으로 조정
+                new_price = int(current_price * (1 - adjust_percent / 100))
+
+            # 가격이 같으면 시장가로 전환
+            if new_price == original_price:
+                logger.info(f"🔄 가격 동일 - 시장가 전환: {stock_code}")
+                await self._convert_to_market_order(order_no, order_info)
+                return
+
+            logger.info(f"💰 가격 조정: {stock_code} {order_type} {original_price:,} → {new_price:,}원")
+
+            # 기존 주문 취소
+            cancel_result = self.trading_api.cancel_order(
+                order_no=order_no,
+                stock_code=stock_code,
+                quantity=quantity
+            )
+            if not (cancel_result and cancel_result.get('success', False)):
+                logger.warning(f"⚠️ 기존 주문 취소 실패: {order_no}")
+                return
+
+            # 새 가격으로 주문
+            new_order_no = await self.execute_strategy_order(
+                stock_code=stock_code,
+                order_type="BUY" if order_type == '매수' else "SELL",
+                quantity=quantity,
+                price=new_price,
+                strategy_type=f"{strategy_type}_price_adjusted"
+            )
+
+            # 조정 횟수 증가
+            with self.pending_order_lock:
+                if order_no in self.pending_orders:
+                    del self.pending_orders[order_no]
+
+                old_adjustments = self.pending_order_adjustments.get(order_no, 0)
+                if order_no in self.pending_order_adjustments:
+                    del self.pending_order_adjustments[order_no]
+
+                # 새 주문번호로 조정 횟수 이관
+                if new_order_no:
+                    self.pending_order_adjustments[new_order_no] = old_adjustments + 1
+
+            if new_order_no:
+                adjustment_count = self.pending_order_adjustments.get(new_order_no, 0)
+                logger.info(f"✅ 가격 조정 성공: {stock_code} {order_type} → {new_order_no} (조정 {adjustment_count}회)")
+
+                # 텔레그램 알림
+                if self.telegram_bot and self.telegram_bot.is_running():
+                    adjust_msg = (f"💰 <b>가격 조정</b>\n📊 {stock_code} {order_type}\n"
+                                f"💸 {original_price:,} → {new_price:,}원\n"
+                                f"🔄 조정 {adjustment_count}회차")
+                    asyncio.create_task(self._send_telegram_notification_async(adjust_msg))
+            else:
+                logger.error(f"❌ 가격 조정 실패: {stock_code} {order_type}")
+
+        except Exception as e:
+            logger.error(f"가격 조정 오류: {e}")
 
 if __name__ == "__main__":
     import signal
