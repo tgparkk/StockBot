@@ -26,6 +26,7 @@ schedule>=1.2.0
 # 비동기 처리
 asyncio>=3.4.0
 aiohttp>=3.8.0
+pycryptodome
 
 # 유틸리티
 requests>=2.31.0
