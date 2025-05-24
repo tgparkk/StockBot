@@ -5,7 +5,6 @@
 하드코딩된 종목 제거하고 REST API 동적 발굴 적용
 """
 import asyncio
-import configparser
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
@@ -14,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import pytz
 from utils.logger import setup_logger
+from utils.config_loader import ConfigLoader  # 🆕 ConfigLoader 사용
 from core.rest_api_manager import KISRestAPIManager
 from core.hybrid_data_manager import HybridDataManager, DataPriority
 
@@ -64,9 +64,8 @@ class StrategyScheduler:
         self.trading_api = trading_api
         self.data_manager = data_manager
 
-        # 설정 로드
-        self.config = configparser.ConfigParser()
-        self.config.read('config/settings.ini', encoding='utf-8')
+        # 🆕 ConfigLoader 사용 (configparser 대신)
+        self.config_loader = ConfigLoader('config/settings.ini')
 
         # 스케줄러 상태
         self.scheduler_running = False
@@ -75,7 +74,7 @@ class StrategyScheduler:
         self.current_phase = StrategyPhase.PREPARATION
         self.preparation_completed = False
 
-        # 시간대별 설정
+        # 시간대별 설정 로드 (ConfigLoader 기반)
         self.time_slots = self._load_time_slot_configs()
 
         # 종목 후보 관리 (스레드 안전)
@@ -94,53 +93,92 @@ class StrategyScheduler:
             thread_name_prefix="screening"
         )
 
-        logger.info("🕐 전략 스케줄러 초기화 완료")
+        logger.info("🕐 전략 스케줄러 초기화 완료 (ConfigLoader 기반)")
 
     def _load_time_slot_configs(self) -> Dict[str, TimeSlotConfig]:
-        """시간대별 설정 로드"""
+        """시간대별 설정 로드 - ConfigLoader 기반"""
         slots = {}
 
-        # 골든타임 (09:00-09:30)
-        slots['golden_time'] = TimeSlotConfig(
-            name='golden_time',
-            start_time=time(9, 0),
-            end_time=time(9, 30),
-            description='골든타임 - 갭 트레이딩 집중',
-            primary_strategies={'gap_trading': 0.7},
-            secondary_strategies={'volume_breakout': 0.3}
-        )
+        try:
+            # 🆕 ConfigLoader의 load_time_based_strategies() 사용
+            time_configs = self.config_loader.load_time_based_strategies()
 
-        # 주도주 시간 (09:30-11:30)
-        slots['morning_leaders'] = TimeSlotConfig(
-            name='morning_leaders',
-            start_time=time(9, 30),
-            end_time=time(11, 30),
-            description='주도주 시간 - 거래량 돌파',
-            primary_strategies={'volume_breakout': 0.6},
-            secondary_strategies={'momentum': 0.4}
-        )
+            # ConfigLoader 결과를 TimeSlotConfig 객체로 변환
+            for slot_name, config_data in time_configs.items():
+                slots[slot_name] = TimeSlotConfig(
+                    name=slot_name,
+                    start_time=config_data['start_time'],
+                    end_time=config_data['end_time'],
+                    description=config_data['description'],
+                    primary_strategies=config_data['primary_strategies'],
+                    secondary_strategies=config_data['secondary_strategies']
+                )
 
-        # 점심시간 (11:30-14:00)
-        slots['lunch_time'] = TimeSlotConfig(
-            name='lunch_time',
-            start_time=time(11, 30),
-            end_time=time(14, 0),
-            description='점심시간 - 안정적 모멘텀',
-            primary_strategies={'momentum': 0.5},
-            secondary_strategies={'gap_trading': 0.3, 'volume_breakout': 0.2}
-        )
+            logger.info("⚙️ 시간대별 설정 로드 완료 (ConfigLoader 기반)")
+            for slot_name, slot_config in slots.items():
+                logger.info(f"   📅 {slot_name}: {slot_config.start_time} - {slot_config.end_time}")
 
-        # 마감 추세 (14:00-15:20)
-        slots['closing_trend'] = TimeSlotConfig(
-            name='closing_trend',
-            start_time=time(14, 0),
-            end_time=time(15, 20),
-            description='마감 추세 - 모멘텀 강화',
-            primary_strategies={'momentum': 0.8},
-            secondary_strategies={'volume_breakout': 0.2}
-        )
+        except Exception as e:
+            logger.error(f"❌ 시간대별 설정 로드 실패: {e}")
+            # 기본값으로 fallback
+            slots = self._get_default_time_slots()
 
         return slots
+
+    def _load_time_slot_from_config(self, section_name: str, slot_name: str,
+                                   description: str, default_start: str, default_end: str) -> TimeSlotConfig:
+        """⚠️ 더 이상 사용하지 않음 - ConfigLoader.load_time_based_strategies() 사용"""
+        logger.warning("_load_time_slot_from_config는 더 이상 사용되지 않습니다.")
+        return self._get_default_slot_config(slot_name, description, default_start, default_end)
+
+    def _load_strategies_from_config(self, section_name: str, prefix: str) -> Dict[str, float]:
+        """⚠️ 더 이상 사용하지 않음 - ConfigLoader.load_time_based_strategies() 사용"""
+        logger.warning("_load_strategies_from_config는 더 이상 사용되지 않습니다.")
+        return {}
+
+    def _get_default_slot_config(self, slot_name: str, description: str,
+                                default_start: str, default_end: str) -> TimeSlotConfig:
+        """기본 시간대 설정 반환"""
+        start_time = datetime.strptime(default_start, '%H:%M').time()
+        end_time = datetime.strptime(default_end, '%H:%M').time()
+
+        # 기본 전략 설정
+        default_strategies = {
+            'golden_time': ({'gap_trading': 0.7}, {'volume_breakout': 0.3}),
+            'morning_leaders': ({'volume_breakout': 0.6}, {'momentum': 0.4}),
+            'lunch_time': ({'momentum': 0.5}, {'gap_trading': 0.3, 'volume_breakout': 0.2}),
+            'closing_trend': ({'momentum': 0.8}, {'volume_breakout': 0.2})
+        }
+
+        primary, secondary = default_strategies.get(slot_name, ({'gap_trading': 1.0}, {}))
+
+        return TimeSlotConfig(
+            name=slot_name,
+            start_time=start_time,
+            end_time=end_time,
+            description=description,
+            primary_strategies=primary,
+            secondary_strategies=secondary
+        )
+
+    def _get_default_time_slots(self) -> Dict[str, TimeSlotConfig]:
+        """기본 시간대 설정 (fallback용)"""
+        logger.warning("⚠️ 기본값으로 시간대 설정 생성")
+
+        return {
+            'golden_time': self._get_default_slot_config(
+                'golden_time', '골든타임 - 갭 트레이딩 집중', '09:00', '09:30'
+            ),
+            'morning_leaders': self._get_default_slot_config(
+                'morning_leaders', '주도주 시간 - 거래량 돌파', '09:30', '11:30'
+            ),
+            'lunch_time': self._get_default_slot_config(
+                'lunch_time', '점심시간 - 안정적 모멘텀', '11:30', '14:00'
+            ),
+            'closing_trend': self._get_default_slot_config(
+                'closing_trend', '마감 추세 - 모멘텀 강화', '14:00', '15:20'
+            )
+        }
 
     async def start_scheduler(self):
         """스케줄러 시작 - 초기화 + 메인 루프"""
@@ -221,12 +259,58 @@ class StrategyScheduler:
                     await asyncio.sleep(backoff_time)
 
     def _get_next_preparation_time(self) -> Optional[datetime]:
-        """다음 전략 준비 시간 계산"""
+        """다음 전략 준비 시간 계산 - ConfigLoader 기반"""
         now = datetime.now(KST)
         today = now.date()
 
-        # 시간대별 준비 시간 (시작 15분 전)
-        preparation_times = [
+        # 시간대별 준비 시간 (시작 15분 전) - 동적으로 계산
+        preparation_times = []
+
+        try:
+            for slot_name, slot_config in self.time_slots.items():
+                start_time = slot_config.start_time
+
+                # 준비 시간 = 시작 시간에서 15분 전
+                start_datetime = datetime.combine(today, start_time)
+                prep_datetime = start_datetime - timedelta(minutes=15)
+                preparation_times.append(prep_datetime)
+
+            # 시간순 정렬
+            preparation_times.sort()
+
+            logger.debug(f"📅 준비 시간 목록: {[pt.strftime('%H:%M') for pt in preparation_times]}")
+
+            # 한국 시간대 적용
+            preparation_times = [KST.localize(dt) for dt in preparation_times]
+
+            # 현재 시간 이후의 가장 가까운 준비 시간 찾기
+            for prep_time in preparation_times:
+                if prep_time > now:
+                    logger.info(f"⏰ 다음 준비 시간: {prep_time.strftime('%H:%M')}")
+                    return prep_time
+
+            # 오늘의 모든 준비 시간이 지났으면 다음 날 첫 번째 시간
+            if preparation_times:
+                tomorrow = today + timedelta(days=1)
+                next_day_first_time = preparation_times[0].time()
+                next_day_first = datetime.combine(tomorrow, next_day_first_time)
+                next_day_first_kst = KST.localize(next_day_first)
+                logger.info(f"⏰ 내일 첫 준비 시간: {next_day_first_kst.strftime('%Y-%m-%d %H:%M')}")
+                return next_day_first_kst
+
+        except Exception as e:
+            logger.error(f"❌ 준비 시간 계산 실패: {e}")
+            # fallback: 기본 시간 사용
+            return self._get_default_next_preparation_time(now, today)
+
+        return None
+
+    def _get_default_next_preparation_time(self, now: datetime, today) -> Optional[datetime]:
+        """기본 준비 시간 계산 (fallback용)"""
+        logger.warning("⚠️ 기본 준비 시간 사용")
+
+        # 기본 준비 시간들 (하드코딩된 백업)
+        default_preparation_times = [
             datetime.combine(today, time(8, 45)),   # 골든타임 준비 (08:45)
             datetime.combine(today, time(9, 15)),   # 주도주 시간 준비 (09:15)
             datetime.combine(today, time(11, 15)),  # 점심시간 준비 (11:15)
@@ -234,7 +318,7 @@ class StrategyScheduler:
         ]
 
         # 한국 시간대 적용
-        preparation_times = [KST.localize(dt) for dt in preparation_times]
+        preparation_times = [KST.localize(dt) for dt in default_preparation_times]
 
         # 현재 시간 이후의 가장 가까운 준비 시간 찾기
         for prep_time in preparation_times:
@@ -553,11 +637,11 @@ class StrategyScheduler:
         candidates = []
 
         try:
-            # 갭 조건 설정 (config에서 로드)
-            gap_config = self.config['gap_trading_config']
-            min_gap = float(gap_config.get('min_gap_percent', '3.0'))
-            max_gap = float(gap_config.get('max_gap_percent', '15.0'))
-            min_volume_ratio = float(gap_config.get('min_volume_ratio', '2.0'))
+            # 🆕 ConfigLoader의 load_strategy_config() 사용
+            gap_config = self.config_loader.load_strategy_config('gap_trading')
+            min_gap = float(gap_config.get('min_gap_percent', 3.0))
+            max_gap = float(gap_config.get('max_gap_percent', 15.0))
+            min_volume_ratio = float(gap_config.get('min_volume_ratio', 2.0))
 
             # REST API를 통한 동적 갭 트레이딩 후보 발굴
             gap_candidates = self.trading_api.discover_gap_trading_candidates(
@@ -590,10 +674,10 @@ class StrategyScheduler:
         candidates = []
 
         try:
-            # 거래량 조건 설정 (config에서 로드)
-            volume_config = self.config['volume_breakout_config']
-            min_volume_ratio = float(volume_config.get('min_volume_ratio', '3.0'))
-            min_price_change = float(volume_config.get('min_price_change', '1.0'))
+            # 🆕 ConfigLoader의 load_strategy_config() 사용
+            volume_config = self.config_loader.load_strategy_config('volume_breakout')
+            min_volume_ratio = float(volume_config.get('min_volume_ratio', 3.0))
+            min_price_change = float(volume_config.get('min_price_change', 1.0))
 
             # REST API를 통한 동적 거래량 돌파 후보 발굴
             volume_candidates = self.trading_api.discover_volume_breakout_candidates(
@@ -625,10 +709,10 @@ class StrategyScheduler:
         candidates = []
 
         try:
-            # 모멘텀 조건 설정 (config에서 로드)
-            momentum_config = self.config['momentum_config']
-            min_change_rate = float(momentum_config.get('min_momentum_percent', '1.5'))
-            min_volume_ratio = float(momentum_config.get('min_volume_ratio', '1.5'))
+            # 🆕 ConfigLoader의 load_strategy_config() 사용
+            momentum_config = self.config_loader.load_strategy_config('momentum')
+            min_change_rate = float(momentum_config.get('min_momentum_percent', 1.5))
+            min_volume_ratio = float(momentum_config.get('min_volume_ratio', 1.5))
 
             # REST API를 통한 동적 모멘텀 후보 발굴
             momentum_candidates = self.trading_api.discover_momentum_candidates(
@@ -677,7 +761,36 @@ class StrategyScheduler:
         self.preparation_completed = True
         self.current_phase = StrategyPhase.EXECUTION
 
+        # 🆕 main.py와 동기화 - selected_stocks 업데이트
+        await self._sync_with_main_bot()
+
         logger.info("✅ 전략 활성화 완료")
+
+    async def _sync_with_main_bot(self):
+        """🆕 main.py 봇 인스턴스와 동기화"""
+        bot_instance = getattr(self, '_bot_instance', None)
+        if not bot_instance or not self.current_slot:
+            return
+
+        try:
+            # active_stocks의 모든 종목들을 하나의 리스트로 합치기
+            all_active_stocks = []
+            for strategy_stocks in self.active_stocks.values():
+                all_active_stocks.extend(strategy_stocks)
+
+            # 중복 제거
+            unique_stocks = list(set(all_active_stocks))
+
+            # main.py의 handle_time_slot_change 호출
+            bot_instance.handle_time_slot_change(
+                new_time_slot=self.current_slot.name,
+                new_stocks=unique_stocks
+            )
+
+            logger.info(f"🔄 main.py 동기화 완료: {self.current_slot.name} - {len(unique_stocks)}개 종목")
+
+        except Exception as e:
+            logger.error(f"main.py 동기화 오류: {e}")
 
     async def _activate_strategy_candidates(self, strategy_name: str, candidates: List[StockCandidate],
                                          priority: DataPriority, weight: float):
