@@ -1981,7 +1981,7 @@ class KISRestAPIManager:
         # 현재 시간 확인 (한국 시간)
         kst = pytz.timezone('Asia/Seoul')
         now = datetime.now(kst)
-        is_market_hours = self._is_market_open(now)
+        is_market_hours = KISRestAPIManager.is_market_open(now)
 
         screening_results = {}
 
@@ -2050,9 +2050,10 @@ class KISRestAPIManager:
 
         return screening_results
 
-    def _is_market_open(self, current_time: datetime) -> bool:
+    @staticmethod
+    def is_market_open(current_time: datetime) -> bool:
         """
-        장 시간 여부 확인
+        장 시간 여부 확인 (공통 유틸리티)
 
         Args:
             current_time: 확인할 시간 (timezone aware)

@@ -17,7 +17,8 @@ from Crypto.Util.Padding import unpad
 from base64 import b64decode
 from dotenv import load_dotenv
 from utils.logger import setup_logger
-from core.rest_api_manager import KISRestAPIManager
+from .rest_api_manager import KISRestAPIManager
+import pytz
 
 # 환경변수 로드
 load_dotenv('config/.env')
@@ -717,12 +718,10 @@ class KISWebSocketManager:
         logger.info("실시간 데이터 수신 시작")
 
         # 장외시간 체크
-        from datetime import datetime
-        import pytz
         kst = pytz.timezone('Asia/Seoul')
         now = datetime.now(kst)
 
-        if not self._is_market_open(now):
+        if not KISRestAPIManager.is_market_open(now):
             logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 웹소켓 연결 유지만 합니다")
 
         try:
@@ -734,7 +733,7 @@ class KISWebSocketManager:
             self.is_connected = False
 
             # 장중이면 재연결 시도
-            if self._is_market_open(datetime.now(kst)):
+            if KISRestAPIManager.is_market_open(datetime.now(kst)):
                 logger.info("장중 재연결 시도...")
                 await self._reconnect()
         except Exception as e:
@@ -756,26 +755,6 @@ class KISWebSocketManager:
 
         logger.error(f"재연결 실패 - {max_attempts}회 시도 모두 실패")
         return False
-
-    def _is_market_open(self, current_time: datetime) -> bool:
-        """
-        장 시간 여부 확인
-
-        Args:
-            current_time: 확인할 시간 (timezone aware)
-
-        Returns:
-            장 시간 여부
-        """
-        # 평일 여부 확인 (0=월요일, 6=일요일)
-        if current_time.weekday() >= 5:  # 토요일(5), 일요일(6)
-            return False
-
-        # 장 시간 확인 (09:00 ~ 15:30)
-        market_open = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
-        market_close = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
-
-        return market_open <= current_time <= market_close
 
     # ===== 상태 조회 =====
 
