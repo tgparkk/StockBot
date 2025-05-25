@@ -14,6 +14,7 @@ from enum import Enum
 import pytz
 from utils.logger import setup_logger
 from utils.config_loader import ConfigLoader  # 🆕 ConfigLoader 사용
+from utils.korean_time import now_kst, now_kst_time
 from core.rest_api_manager import KISRestAPIManager
 from core.hybrid_data_manager import HybridDataManager, DataPriority
 
@@ -124,17 +125,6 @@ class StrategyScheduler:
             slots = self._get_default_time_slots()
 
         return slots
-
-    def _load_time_slot_from_config(self, section_name: str, slot_name: str,
-                                   description: str, default_start: str, default_end: str) -> TimeSlotConfig:
-        """⚠️ 더 이상 사용하지 않음 - ConfigLoader.load_time_based_strategies() 사용"""
-        logger.warning("_load_time_slot_from_config는 더 이상 사용되지 않습니다.")
-        return self._get_default_slot_config(slot_name, description, default_start, default_end)
-
-    def _load_strategies_from_config(self, section_name: str, prefix: str) -> Dict[str, float]:
-        """⚠️ 더 이상 사용하지 않음 - ConfigLoader.load_time_based_strategies() 사용"""
-        logger.warning("_load_strategies_from_config는 더 이상 사용되지 않습니다.")
-        return {}
 
     def _get_default_slot_config(self, slot_name: str, description: str,
                                 default_start: str, default_end: str) -> TimeSlotConfig:
@@ -337,29 +327,49 @@ class StrategyScheduler:
         return max(0, int(time_diff.total_seconds()))
 
     async def _start_background_screening(self):
-        """백그라운드 스크리닝 시작 - 동적 종목 발굴"""
+        """백그라운드 스크리닝 시작 - 프리 마켓 대응 강화"""
         self.screening_active = True
 
-        # 전체 시장 스크리닝을 별도 스레드에서 실행
+        # 🚀 단순화: 한 번만 스레드에서 실행 (중복 제거)
         loop = asyncio.get_event_loop()
         screening_future = loop.run_in_executor(
             self.screening_executor,
             self._background_screening_sync
         )
 
-        logger.info("📊 백그라운드 시장 스크리닝 시작 (동적 발굴)")
-
-        # 주기적 스크리닝 (5분마다)
-        asyncio.create_task(self._periodic_screening())
+        logger.info("�� 백그라운드 시장 스크리닝 시작 (프리 마켓 대응 강화)")
 
     def _background_screening_sync(self):
-        """백그라운드 스크리닝 (동기 버전)"""
+        """백그라운드 스크리닝 (동기 버전) - 프리 마켓 대응 강화"""
         try:
             while self.screening_active:
-                # 전체 시장 스크리닝
+                # 🆕 현재 시간 체크 (장외시간 대응)
+                from datetime import datetime
+                import pytz
+                kst = pytz.timezone('Asia/Seoul')
+                now = datetime.now(kst)
+                is_market_hours = self.trading_api.is_market_open(now)
+
+                if not is_market_hours:
+                    logger.info(f"🌙 장외시간 백그라운드 스크리닝 ({now.strftime('%H:%M')})")
+                    # 장외시간에는 프리 마켓 스크리닝으로 다음날 준비
+                    screening_results = self.trading_api.get_market_screening_candidates("all")
+
+                    if screening_results:
+                        # 🌟 프리 마켓 결과를 백그라운드 모니터링에 추가
+                        self._process_pre_market_screening(screening_results)
+                        logger.info("🌙 프리 마켓 스크리닝 백그라운드 처리 완료")
+
+                    # 장외시간에는 더 긴 간격 (30분)
+                    import time
+                    time.sleep(1800)  # 30분 대기
+                    continue
+
+                # 🚀 장중 일반 스크리닝 (기존 로직)
+                logger.info("📊 장중 백그라운드 스크리닝 실행")
                 screening_results = self.trading_api.get_market_screening_candidates("all")
 
-                # 백그라운드 종목들을 데이터 매니저에 추가
+                # 백그라운드 데이터 처리 (장중)
                 background_data = screening_results.get('background', [])
                 if isinstance(background_data, list):
                     background_dict = {
@@ -407,28 +417,151 @@ class StrategyScheduler:
 
                 logger.info(f"📊 백그라운드 스크리닝 완료 - 거래량:{len(volume_leaders)}, 등락률:{len(price_movers)}, 호가:{len(bid_ask_leaders)}")
 
-                # 5분 대기
+                # 5분 대기 (장중)
                 import time
                 time.sleep(300)
 
         except Exception as e:
             logger.error(f"백그라운드 스크리닝 오류: {e}")
 
-    async def _periodic_screening(self):
-        """주기적 스크리닝 (비동기)"""
-        while self.screening_active:
-            try:
-                await asyncio.sleep(300)  # 5분 대기
+    def _process_pre_market_screening(self, screening_results: Dict):
+        """🆕 프리 마켓 스크리닝 결과 처리"""
+        try:
+            processed_count = 0
 
-                # 새로운 스크리닝 실행
-                loop = asyncio.get_event_loop()
-                screening_future = loop.run_in_executor(
-                    self.screening_executor,
-                    self._background_screening_sync
-                )
+            # 1. 갭 트레이딩 후보들을 BACKGROUND 우선순위로 추가
+            gap_candidates = screening_results.get('gap_trading', [])
+            for candidate in gap_candidates[:8]:  # 상위 8개
+                stock_code = candidate.get('stock_code')
+                if stock_code:
+                    self.data_manager.add_stock_request(
+                        stock_code=stock_code,
+                        priority=DataPriority.BACKGROUND,
+                        strategy_name="pre_market_gap",
+                        callback=self._create_pre_market_callback(stock_code, "gap")
+                    )
+                    processed_count += 1
+
+            # 2. 볼륨 브레이크아웃 후보들
+            volume_candidates = screening_results.get('volume_breakout', [])
+            for candidate in volume_candidates[:8]:  # 상위 8개
+                stock_code = candidate.get('stock_code')
+                if stock_code:
+                    self.data_manager.add_stock_request(
+                        stock_code=stock_code,
+                        priority=DataPriority.BACKGROUND,
+                        strategy_name="pre_market_volume",
+                        callback=self._create_pre_market_callback(stock_code, "volume")
+                    )
+                    processed_count += 1
+
+            # 3. 모멘텀 후보들
+            momentum_candidates = screening_results.get('momentum', [])
+            for candidate in momentum_candidates[:6]:  # 상위 6개
+                stock_code = candidate.get('stock_code')
+                if stock_code:
+                    self.data_manager.add_stock_request(
+                        stock_code=stock_code,
+                        priority=DataPriority.BACKGROUND,
+                        strategy_name="pre_market_momentum",
+                        callback=self._create_pre_market_callback(stock_code, "momentum")
+                    )
+                    processed_count += 1
+
+            # 4. 백그라운드 종목들 (제한적으로)
+            background_data = screening_results.get('background', {})
+            if isinstance(background_data, dict):
+                all_background = []
+                all_background.extend(background_data.get('volume_leaders', [])[:5])
+                all_background.extend(background_data.get('price_movers', [])[:5])
+
+                for candidate in all_background:
+                    stock_code = candidate.get('stock_code')
+                    if stock_code:
+                        self.data_manager.add_stock_request(
+                            stock_code=stock_code,
+                            priority=DataPriority.BACKGROUND,
+                            strategy_name="pre_market_background",
+                            callback=self._create_pre_market_callback(stock_code, "background")
+                        )
+                        processed_count += 1
+
+            logger.info(f"🌙 프리 마켓 종목 처리 완료: {processed_count}개 백그라운드 모니터링 추가")
+
+        except Exception as e:
+            logger.error(f"프리 마켓 스크리닝 처리 오류: {e}")
+
+    def _create_pre_market_callback(self, stock_code: str, strategy_type: str):
+        """🆕 프리 마켓 전용 콜백 함수 생성"""
+        def callback(stock_code: str, data: Dict, source: str):
+            try:
+                # 장 시작 전에는 조용히 모니터링
+                # 장 시작 후에는 활성화
+                from datetime import datetime
+                import pytz
+                kst = pytz.timezone('Asia/Seoul')
+                now = datetime.now(kst)
+                is_market_hours = self.trading_api.is_market_open(now)
+
+                if not is_market_hours:
+                    # 장외시간에는 로깅만
+                    if 'current_price' in data:
+                        price_data = data['current_price']
+                        change_rate = price_data.get('change_rate', 0)
+                        logger.debug(f"🌙 프리마켓 모니터링: {stock_code} {change_rate:+.1f}% ({strategy_type})")
+                    return
+
+                # 🚀 장 시작 후에는 적극적 처리
+                if 'current_price' not in data:
+                    return
+
+                price_data = data['current_price']
+                change_rate = price_data.get('change_rate', 0)
+                volume = price_data.get('volume', 0)
+                current_price = price_data.get('current_price', 0)
+
+                # 프리마켓 예상이 맞았는지 확인
+                if strategy_type == "gap" and abs(change_rate) >= 3.0:
+                    logger.info(f"🎯 갭 예상 적중: {stock_code} {change_rate:+.1f}%")
+                    # HIGH 우선순위로 승격
+                    self.data_manager.upgrade_priority(stock_code, DataPriority.HIGH)
+
+                    # 강한 갭 신호 생성
+                    candidate = StockCandidate(
+                        stock_code=stock_code,
+                        strategy_type='gap_trading_confirmed',
+                        score=abs(change_rate) * 1.5,
+                        reason=f"프리마켓 갭 예상 적중 {change_rate:+.1f}%",
+                        discovered_at=now_kst(),
+                        data=data
+                    )
+                    self._add_discovered_candidate(candidate)
+
+                elif strategy_type == "volume" and volume > 0:
+                    # 볼륨 비교는 전일 대비로만 가능
+                    volume_score = min(10.0, volume / 1000000)  # 임시 점수
+                    if volume_score >= 3.0:
+                        logger.info(f"🚀 볼륨 예상 적중: {stock_code} 거래량 {volume:,}")
+                        self.data_manager.upgrade_priority(stock_code, DataPriority.MEDIUM)
+
+                elif strategy_type == "momentum" and change_rate > 2.0:
+                    logger.info(f"📈 모멘텀 예상 적중: {stock_code} {change_rate:+.1f}%")
+                    self.data_manager.upgrade_priority(stock_code, DataPriority.MEDIUM)
+
+                    candidate = StockCandidate(
+                        stock_code=stock_code,
+                        strategy_type='momentum_confirmed',
+                        score=change_rate + 2.0,
+                        reason=f"프리마켓 모멘텀 예상 적중",
+                        discovered_at=now_kst(),
+                        data=data
+                    )
+                    self._add_discovered_candidate(candidate)
 
             except Exception as e:
-                logger.error(f"주기적 스크리닝 오류: {e}")
+                logger.error(f"프리마켓 콜백 오류 ({stock_code}): {e}")
+
+        return callback
 
     def background_screening_callback(self, stock_code: str, data: Dict, source: str):
         """백그라운드 스크리닝 콜백"""
@@ -451,7 +584,7 @@ class StrategyScheduler:
                     strategy_type='emergency_volume',
                     score=volume_ratio / 3.0,
                     reason=f"거래량{volume_ratio:.1f}배 폭증",
-                    discovered_at=datetime.now(),
+                    discovered_at=now_kst(),
                     data=data
                 )
                 self._add_discovered_candidate(candidate)
@@ -467,7 +600,7 @@ class StrategyScheduler:
                     strategy_type='emergency_price',
                     score=abs(change_rate) / 2.0,
                     reason=f"급격한 변동{change_rate:+.1f}%",
-                    discovered_at=datetime.now(),
+                    discovered_at=now_kst(),
                     data=data
                 )
                 self._add_discovered_candidate(candidate)
@@ -657,7 +790,7 @@ class StrategyScheduler:
                     strategy_type='gap_trading',
                     score=gap_data['score'],
                     reason=f"갭{gap_data['gap_rate']:+.1f}% 거래량{gap_data['volume_ratio']:.1f}배",
-                    discovered_at=datetime.now(),
+                    discovered_at=now_kst(),
                     data=gap_data
                 )
                 candidates.append(candidate)
@@ -692,7 +825,7 @@ class StrategyScheduler:
                     strategy_type='volume_breakout',
                     score=volume_data['score'],
                     reason=f"거래량{volume_data['volume_ratio']:.1f}배 변동{volume_data['change_rate']:+.1f}%",
-                    discovered_at=datetime.now(),
+                    discovered_at=now_kst(),
                     data=volume_data
                 )
                 candidates.append(candidate)
@@ -727,7 +860,7 @@ class StrategyScheduler:
                     strategy_type='momentum',
                     score=momentum_data['score'],
                     reason=f"모멘텀{momentum_data['change_rate']:+.1f}% {momentum_data['trend_quality']}",
-                    discovered_at=datetime.now(),
+                    discovered_at=now_kst(),
                     data=momentum_data
                 )
                 candidates.append(candidate)
@@ -771,6 +904,9 @@ class StrategyScheduler:
         bot_instance = getattr(self, '_bot_instance', None)
         if not bot_instance or not self.current_slot:
             return
+
+        from typing import cast
+        bot_instance = cast('StockBotMain', bot_instance)
 
         try:
             # active_stocks의 모든 종목들을 하나의 리스트로 합치기
@@ -958,69 +1094,114 @@ class StrategyScheduler:
             return None
 
     def _check_buy_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
-        """매수 신호 확인"""
+        """매수 신호 확인 - 설정 파일 기반"""
         current_price_data = data.get('current_price', {})
         current_price = current_price_data.get('current_price', 0)
         change_rate = current_price_data.get('change_rate', 0)
         volume = current_price_data.get('volume', 0)
 
-        # 전략별 매수 조건 확인
+        # 전략별 매수 조건 확인 (설정 파일에서 로드)
         if strategy_name == 'gap_trading':
-            # 갭 상승 + 거래량 급증
-            if change_rate >= 3.0 and volume > 0:  # 3% 이상 상승
+            # 🚀 ConfigLoader에서 갭 트레이딩 설정 로드
+            gap_config = self.config_loader.load_strategy_config('gap_trading')
+            min_change_rate = float(gap_config.get('min_gap_percent', 3.0))
+            strength_divisor = float(gap_config.get('strength_divisor', 10.0))
+
+            if change_rate >= min_change_rate and volume > 0:
                 return {
                     'action': 'BUY',
                     'price': current_price,
                     'reason': f'갭 상승 {change_rate:.1f}% + 거래량 급증',
-                    'strength': min(change_rate / 10.0, 1.0)
+                    'strength': min(change_rate / strength_divisor, 1.0)
                 }
 
         elif strategy_name == 'volume_breakout':
-            # 거래량 돌파 + 가격 상승
-            if change_rate >= 2.0 and volume > 0:  # 2% 이상 상승
+            # 🚀 ConfigLoader에서 볼륨 브레이크아웃 설정 로드
+            volume_config = self.config_loader.load_strategy_config('volume_breakout')
+            min_change_rate = float(volume_config.get('min_price_change', 2.0))
+            strength_divisor = float(volume_config.get('strength_divisor', 8.0))
+
+            if change_rate >= min_change_rate and volume > 0:
                 return {
                     'action': 'BUY',
                     'price': current_price,
                     'reason': f'거래량 돌파 + {change_rate:.1f}% 상승',
-                    'strength': min(change_rate / 8.0, 1.0)
+                    'strength': min(change_rate / strength_divisor, 1.0)
                 }
 
         elif strategy_name == 'momentum':
-            # 모멘텀 지속 + 상승세
-            if change_rate >= 1.5 and volume > 0:  # 1.5% 이상 상승
+            # 🚀 ConfigLoader에서 모멘텀 설정 로드
+            momentum_config = self.config_loader.load_strategy_config('momentum')
+            min_change_rate = float(momentum_config.get('min_momentum_percent', 1.5))
+            strength_divisor = float(momentum_config.get('strength_divisor', 6.0))
+
+            if change_rate >= min_change_rate and volume > 0:
                 return {
                     'action': 'BUY',
                     'price': current_price,
                     'reason': f'모멘텀 지속 {change_rate:.1f}%',
-                    'strength': min(change_rate / 6.0, 1.0)
+                    'strength': min(change_rate / strength_divisor, 1.0)
                 }
 
         return None
 
     def _check_sell_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
-        """매도 신호 확인 (포지션 보유 시)"""
+        """매도 신호 확인 (포지션 보유 시) - 설정 파일 기반"""
         current_price_data = data.get('current_price', {})
         current_price = current_price_data.get('current_price', 0)
         change_rate = current_price_data.get('change_rate', 0)
 
+        # 🚀 기본 급락 신호 설정값 로드 (안전한 타입 변환)
+        general_sell_threshold = self._safe_float(self.config_loader.get_config_value('trading', 'emergency_sell_threshold', -2.0))
+        general_strength_divisor = self._safe_float(self.config_loader.get_config_value('trading', 'emergency_strength_divisor', 5.0))
+
         # 급락 시 매도 신호
-        if change_rate <= -2.0:  # 2% 이상 하락
+        if change_rate <= general_sell_threshold:
             return {
                 'action': 'SELL',
                 'price': current_price,
                 'reason': f'급락 신호 {change_rate:.1f}%',
-                'strength': min(abs(change_rate) / 5.0, 1.0)
+                'strength': min(abs(change_rate) / general_strength_divisor, 1.0)
             }
 
-        # 전략별 매도 조건
+                # 전략별 매도 조건 (설정 파일에서 로드)
         if strategy_name == 'gap_trading':
-            # 갭 상승 후 반전 신호
-            if change_rate <= -1.0:
+            # 🚀 갭 트레이딩 매도 설정 로드 (직접 get_config_value 사용)
+            reversal_threshold = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'reversal_threshold', -1.0))
+            reversal_strength = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'reversal_strength', 0.7))
+
+            if change_rate <= reversal_threshold:
                 return {
                     'action': 'SELL',
                     'price': current_price,
                     'reason': f'갭 반전 {change_rate:.1f}%',
-                    'strength': 0.7
+                    'strength': reversal_strength
+                }
+
+        elif strategy_name == 'volume_breakout':
+            # 🚀 볼륨 브레이크아웃 매도 설정 로드
+            reversal_threshold = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'reversal_threshold', -1.5))
+            reversal_strength = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'reversal_strength', 0.8))
+
+            if change_rate <= reversal_threshold:
+                return {
+                    'action': 'SELL',
+                    'price': current_price,
+                    'reason': f'볼륨 반전 {change_rate:.1f}%',
+                    'strength': reversal_strength
+                }
+
+        elif strategy_name == 'momentum':
+            # 🚀 모멘텀 매도 설정 로드
+            reversal_threshold = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'reversal_threshold', -2.5))
+            reversal_strength = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'reversal_strength', 0.6))
+
+            if change_rate <= reversal_threshold:
+                return {
+                    'action': 'SELL',
+                    'price': current_price,
+                    'reason': f'모멘텀 반전 {change_rate:.1f}%',
+                    'strength': reversal_strength
                 }
 
         return None
@@ -1035,7 +1216,7 @@ class StrategyScheduler:
             return
 
         # 현재 시간과 시간대 시작 시간 비교
-        now = datetime.now()
+        now = now_kst()
         current_time = now.time()
 
         # 시간대 시작 후 경과 시간 계산
@@ -1128,7 +1309,7 @@ class StrategyScheduler:
                         strategy_type='emergency_default',
                         score=50.0,
                         reason="비상 기본 전략",
-                        discovered_at=datetime.now()
+                        discovered_at=now_kst()
                     )
                     emergency_stocks.append(emergency_candidate)
 
@@ -1144,7 +1325,7 @@ class StrategyScheduler:
 
     async def _check_current_time_slot(self):
         """현재 시간대 확인"""
-        current_time = datetime.now().time()
+        current_time = now_kst_time()
         slot = self._get_time_slot_for_time(current_time)
 
         if slot:
@@ -1172,3 +1353,12 @@ class StrategyScheduler:
             'candidates_count': {strategy: len(candidates) for strategy, candidates in self.candidates.items()},
             'screening_active': self.screening_active
         }
+
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        """안전한 float 변환"""
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (ValueError, TypeError):
+            return default

@@ -26,7 +26,7 @@ class StrategyDataAdapter:
             MarketData 객체
         """
         if timestamp is None:
-            timestamp = datetime.now()
+            timestamp = now_kst()
 
         return MarketData(
             stock_code=kis_current.stck_shrn_iscd,
@@ -85,7 +85,7 @@ class StrategyDataAdapter:
 
         # 과거 데이터 (간단한 형태)
         historical_df = pd.DataFrame([{
-            'date': datetime.now(),
+            'date': now_kst(),
             'close': gap_data.prev_close,
             'volume': gap_data.current_price.acml_vol // gap_data.vol_ratio if gap_data.vol_ratio > 0 else gap_data.current_price.acml_vol
         }])

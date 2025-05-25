@@ -15,6 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from utils.logger import setup_logger
+from utils.korean_time import now_kst, KST
 
 # KIS 데이터 모델 import
 try:
@@ -93,6 +94,7 @@ class KISRestAPIManager:
         "api_balance": "/uapi/domestic-stock/v1/trading/inquire-balance",
         "api_account": "/uapi/domestic-stock/v1/trading/inquire-account-balance",
         "api_today_orders": "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+        "api_buy_possible": "/uapi/domestic-stock/v1/trading/inquire-psbl-order",  # 매수가능조회
         "api_price": "/uapi/domestic-stock/v1/quotations/inquire-price",
         "api_orderbook": "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",  # 호가 조회
 
@@ -190,7 +192,8 @@ class KISRestAPIManager:
                 expire_time = current_token.get('expire_time')
 
                 if expire_time:
-                    self.token_expires_at = datetime.fromtimestamp(expire_time)
+                    # 한국시간대로 토큰 만료 시간 설정 (timezone-aware)
+                    self.token_expires_at = datetime.fromtimestamp(expire_time, tz=KST)
                 else:
                     logger.warning("토큰 만료시간 정보가 없습니다.")
                     return False
@@ -225,7 +228,7 @@ class KISRestAPIManager:
                 return False
 
             # 현재 시간보다 5분 이상 여유가 있어야 유효
-            return datetime.now() < (self.token_expires_at - timedelta(minutes=5))
+            return now_kst() < (self.token_expires_at - timedelta(minutes=5))
 
     def _get_access_token(self) -> None:
         """액세스 토큰 발급 (스레드 안전)"""
@@ -264,7 +267,8 @@ class KISRestAPIManager:
                 issue_time = time.time()
                 expire_time = issue_time + expires_in - 300  # 5분 여유
 
-                self.token_expires_at = datetime.fromtimestamp(expire_time)
+                # 한국시간대로 토큰 만료 시간 설정 (timezone-aware)
+                self.token_expires_at = datetime.fromtimestamp(expire_time, tz=KST)
 
                 logger.info(f"토큰 발급 성공. 만료시간: {self.token_expires_at}")
 
@@ -308,7 +312,7 @@ class KISRestAPIManager:
                 else:
                     token_info = {'current': {}, 'history': []}
 
-                current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                current_time_str = now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
                 # 현재 토큰 정보 업데이트
                 if status == "SUCCESS" and token:
@@ -628,7 +632,7 @@ class KISRestAPIManager:
             "high": int(output.get('stck_hgpr', 0)),  # 고가
             "low": int(output.get('stck_lwpr', 0)),  # 저가
             "open": int(output.get('stck_oprc', 0)),  # 시가
-            "timestamp": datetime.now()
+            "timestamp": now_kst()
         }
 
     def get_orderbook(self, stock_code: str) -> Dict:
@@ -680,7 +684,7 @@ class KISRestAPIManager:
             "stock_code": stock_code,
             "asks": asks,
             "bids": bids,
-            "timestamp": datetime.now()
+            "timestamp": now_kst()
         }
 
     def buy_order(self, stock_code: str, quantity: int, price: int = 0) -> Dict:
@@ -889,28 +893,39 @@ class KISRestAPIManager:
             except (ValueError, TypeError):
                 return default
 
-                # 사용자가 요청한 핵심 필드들 우선 처리
+        # 계좌 요약 정보 파싱 (공식 API 문서 기준)
         account_summary = {
-            # 🎯 사용자 요청 핵심 필드 (공식 API 문서 기준)
-            "deposit_balance": safe_float(output2.get('dnca_tot_amt', 0)),  # 예수금총액 ⭐
-            "total_eval_amount": safe_float(output2.get('tot_evlu_amt', 0)),  # 총평가금액 ⭐
-            "securities_eval_amount": safe_float(output2.get('scts_evlu_amt', 0)),  # 유가증권평가금액 ⭐
-            "net_asset_amount": safe_float(output2.get('nass_amt', 0)),  # 순자산금액 ⭐
+            # 🎯 핵심 계좌 정보 (공식 API 문서 기준)
+            "dnca_tot_amt": safe_float(output2.get('dnca_tot_amt', 0)),  # 예수금총금액 ⭐
+            "nxdy_excc_amt": safe_float(output2.get('nxdy_excc_amt', 0)),  # 익일정산금액
+            "prvs_rcdl_excc_amt": safe_float(output2.get('prvs_rcdl_excc_amt', 0)),  # 가수도정산금액 (D+2 예수금)
+            "cma_evlu_amt": safe_float(output2.get('cma_evlu_amt', 0)),  # CMA평가금액
 
-            # 추가 유용한 필드들
-            "foreign_deposit": safe_float(output2.get('frcr_evlu_tota', 0)),  # 외화예수금평가액
-            "total_profit_loss": safe_float(output2.get('evlu_pfls_smtl_amt', 0)),  # 평가손익합계금액
-            "total_profit_rate": safe_float(output2.get('bfdy_tot_asst_evlu_amt', 0)),  # 전일대비평가손익율
-            "total_asset_amount": safe_float(output2.get('tot_asst_amt', 0)),  # 총자산금액
-            "purchase_amount_total": safe_float(output2.get('pchs_amt_smtl_amt', 0)),  # 매입금액합계금액
+            # 📈 매매 관련 정보
+            "bfdy_buy_amt": safe_float(output2.get('bfdy_buy_amt', 0)),  # 전일매수금액
+            "thdt_buy_amt": safe_float(output2.get('thdt_buy_amt', 0)),  # 금일매수금액
+            "bfdy_sll_amt": safe_float(output2.get('bfdy_sll_amt', 0)),  # 전일매도금액
+            "thdt_sll_amt": safe_float(output2.get('thdt_sll_amt', 0)),  # 금일매도금액
 
-            # 디버깅 정보 (문제 해결용)
-            "debug_info": {
-                "output2_type": str(type(output2_raw)),
-                "output2_length": len(output2_raw) if isinstance(output2_raw, list) else 1,
-                "output2_keys": list(output2.keys()) if isinstance(output2, dict) else [],
-                "output2_sample": output2 if output2 else "비어있음"
-            }
+            # 🧾 비용 정보
+            "bfdy_tlex_amt": safe_float(output2.get('bfdy_tlex_amt', 0)),  # 전일제비용금액
+            "thdt_tlex_amt": safe_float(output2.get('thdt_tlex_amt', 0)),  # 금일제비용금액
+
+            # 📊 평가 및 자산 정보
+            "scts_evlu_amt": safe_float(output2.get('scts_evlu_amt', 0)),  # 유가평가금액 ⭐
+            "tot_evlu_amt": safe_float(output2.get('tot_evlu_amt', 0)),  # 총평가금액 ⭐ (유가증권 평가금액 합계 + D+2 예수금)
+            "nass_amt": safe_float(output2.get('nass_amt', 0)),  # 순자산금액 ⭐
+
+            # 📈 합계 및 손익 정보
+            "pchs_amt_smtl_amt": safe_float(output2.get('pchs_amt_smtl_amt', 0)),  # 매입금액합계금액
+            "evlu_amt_smtl_amt": safe_float(output2.get('evlu_amt_smtl_amt', 0)),  # 평가금액합계금액 (유가증권 평가금액 합계)
+            "evlu_pfls_smtl_amt": safe_float(output2.get('evlu_pfls_smtl_amt', 0)),  # 평가손익합계금액
+            "tot_stln_slng_chgs": safe_float(output2.get('tot_stln_slng_chgs', 0)),  # 총대주매각대금
+
+            # 📊 자산 증감 정보
+            "bfdy_tot_asst_evlu_amt": safe_float(output2.get('bfdy_tot_asst_evlu_amt', 0)),  # 전일총자산평가금액
+            "asst_icdc_amt": safe_float(output2.get('asst_icdc_amt', 0)),  # 자산증감액
+            "asst_icdc_erng_rt": safe_float(output2.get('asst_icdc_erng_rt', 0)),  # 자산증감수익율 (데이터 미제공)
         }
 
         return {
@@ -963,8 +978,8 @@ class KISRestAPIManager:
         params = {
             "CANO": self.account_prefix,
             "ACNT_PRDT_CD": self.account_suffix,
-            "INQR_STRT_DT": datetime.now().strftime('%Y%m%d'),
-            "INQR_END_DT": datetime.now().strftime('%Y%m%d'),
+            "INQR_STRT_DT": now_kst().strftime('%Y%m%d'),
+            "INQR_END_DT": now_kst().strftime('%Y%m%d'),
             "SLL_BUY_DVSN_CD": "00",  # 00:전체, 01:매도, 02:매수
             "INQR_DVSN": "01",  # 01:역순
             "PDNO": "",
@@ -1004,6 +1019,100 @@ class KISRestAPIManager:
             })
 
         return today_orders
+
+    def get_buy_possible(self, stock_code: str, price: int = 0, order_type: str = "01",
+                        include_cma: bool = True, include_overseas: bool = False) -> Dict:
+        """
+        매수가능조회
+
+        Args:
+            stock_code: 종목코드 (6자리)
+            price: 주문단가 (시장가일 때는 0)
+            order_type: 주문구분 (00:지정가, 01:시장가, 02:조건부지정가 등)
+            include_cma: CMA평가금액포함여부 (기본값: True)
+            include_overseas: 해외포함여부 (기본값: False)
+
+        Returns:
+            매수가능조회 결과
+
+        Note:
+            - 미수 사용 X: nrcvb_buy_amt(미수없는매수금액), nrcvb_buy_qty(미수없는매수수량) 확인
+            - 미수 사용 O: max_buy_amt(최대매수금액), max_buy_qty(최대매수수량) 확인
+            - 종목 전량매수 시 가능수량 확인할 경우 반드시 ORD_DVSN:01(시장가)로 지정 필요
+        """
+        tr_id = "TTTC8908R"  # 실전투자용 (모의투자: VTTC8908R)
+
+        params = {
+            "CANO": self.account_prefix,                # 종합계좌번호 (8자리)
+            "ACNT_PRDT_CD": self.account_suffix,        # 계좌상품코드 (2자리)
+            "PDNO": stock_code,                         # 상품번호 (종목코드)
+            "ORD_UNPR": str(price) if price > 0 else "",  # 주문단가 (시장가일 때는 공란)
+            "ORD_DVSN": order_type,                     # 주문구분
+            "CMA_EVLU_AMT_ICLD_YN": "Y" if include_cma else "N",        # CMA평가금액포함여부
+            "OVRS_ICLD_YN": "Y" if include_overseas else "N"            # 해외포함여부
+        }
+
+        result = self._call_api(
+            endpoint=self.ENDPOINTS['api_buy_possible'],
+            method="GET",
+            params=params,
+            tr_id=tr_id
+        )
+
+        output = result.get('output', {})
+
+        # 안전한 숫자 변환 함수
+        def safe_int(value, default=0):
+            try:
+                return int(value) if value else default
+            except (ValueError, TypeError):
+                return default
+
+        def safe_float(value, default=0.0):
+            try:
+                return float(value) if value else default
+            except (ValueError, TypeError):
+                return default
+
+        return {
+            # 🎯 핵심 매수가능 정보
+            "stock_code": stock_code,
+            "order_price": price,
+            "order_type": order_type,
+
+            # 💰 매수가능금액 정보
+            "ord_psbl_cash": safe_int(output.get('ord_psbl_cash', 0)),          # 주문가능현금
+            "ord_psbl_sbst": safe_int(output.get('ord_psbl_sbst', 0)),          # 주문가능대용
+            "ruse_psbl_amt": safe_int(output.get('ruse_psbl_amt', 0)),          # 재사용가능금액
+            "fund_rpch_chgs": safe_int(output.get('fund_rpch_chgs', 0)),        # 펀드환매대금
+
+            # 🔢 매수가능수량 정보
+            "nrcvb_buy_amt": safe_int(output.get('nrcvb_buy_amt', 0)),          # 미수없는매수금액 ⭐
+            "nrcvb_buy_qty": safe_int(output.get('nrcvb_buy_qty', 0)),          # 미수없는매수수량 ⭐
+            "max_buy_amt": safe_int(output.get('max_buy_amt', 0)),              # 최대매수금액 ⭐
+            "max_buy_qty": safe_int(output.get('max_buy_qty', 0)),              # 최대매수수량 ⭐
+
+            # 📊 기타 정보
+            "psbl_qty_calc_unpr": safe_int(output.get('psbl_qty_calc_unpr', 0)),      # 가능수량계산단가
+            "cma_evlu_amt": safe_int(output.get('cma_evlu_amt', 0)),                  # CMA평가금액
+            "ovrs_re_use_amt_wcrc": safe_int(output.get('ovrs_re_use_amt_wcrc', 0)),  # 해외재사용금액원화
+            "ord_psbl_frcr_amt_wcrc": safe_int(output.get('ord_psbl_frcr_amt_wcrc', 0)),  # 주문가능외화금액원화
+
+            # 🎯 편의 정보 (계산된 값)
+            "can_buy_without_credit": safe_int(output.get('nrcvb_buy_qty', 0)),  # 미수 사용 안 할 때 매수가능수량
+            "can_buy_with_credit": safe_int(output.get('max_buy_qty', 0)),       # 미수 사용할 때 매수가능수량
+            "available_cash_without_credit": safe_int(output.get('nrcvb_buy_amt', 0)),  # 미수 없는 매수가능금액
+            "available_cash_with_credit": safe_int(output.get('max_buy_amt', 0)),       # 최대 매수가능금액
+
+            # 📝 권장사항 메모
+            "recommendation": {
+                "use_market_order": "종목 전량매수 시 가능수량 확인을 위해 시장가(01) 사용 권장",
+                "credit_usage": "미수 사용 여부에 따라 nrcvb_* 또는 max_* 필드 참조",
+                "check_fields": ["nrcvb_buy_qty", "max_buy_qty", "nrcvb_buy_amt", "max_buy_amt"]
+            },
+
+            "timestamp": now_kst()
+        }
 
     def get_daily_prices(self, stock_code: str, period_type: str = "D") -> List[Dict]:
         """
@@ -1124,8 +1233,8 @@ class KISRestAPIManager:
             "is_valid": self._is_token_valid(),
             "expires_at": self.token_expires_at.isoformat() if self.token_expires_at else None,
             "expires_in_minutes": (
-                int((self.token_expires_at - datetime.now()).total_seconds() / 60)
-                if self.token_expires_at and self.token_expires_at > datetime.now()
+                int((self.token_expires_at - now_kst()).total_seconds() / 60)
+                if self.token_expires_at and self.token_expires_at > now_kst()
                 else 0
             ),
             "token_preview": (
@@ -1562,12 +1671,17 @@ class KISRestAPIManager:
         tr_id = "FHPST01710000"  # 거래량순위 조회 TR ID (공식 스펙)
 
         params = {
-            "fid_cond_mrkt_div_code": market_div,      # 시장분류코드
-            "fid_cond_scr_div_code": "20171",          # 화면분류코드 (고정값)
-            "fid_div_cls_code": ranking_type,          # 순위구분
-            "fid_input_iscd": "0000",                  # 입력종목코드 (전체 조회시 0000)
-            "fid_trgt_cls_code": "0000000000",         # 대상분류코드 (10자리)
-            "fid_trgt_exls_cls_code": "000000",        # 대상제외분류코드 (6자리)
+            "FID_COND_MRKT_DIV_CODE": market_div,      # 시장분류코드
+            "FID_COND_SCR_DIV_CODE": "20171",          # 화면분류코드 (고정값)
+            "FID_INPUT_ISCD": "0000",                  # 입력종목코드 (전체 조회시 0000)
+            "FID_DIV_CLS_CODE": ranking_type,          # 순위구분
+            "FID_BLNG_CLS_CODE": "0",                  # 소속구분코드 (0: 평균거래량, 1:거래증가율, 2:평균거래회전율, 3:거래금액순, 4:평균거래금액회전율)
+            "FID_TRGT_CLS_CODE": "111111111",          # 대상분류코드 (9자리) - 증거금 30%~100%, 신용보증금 30%~60%
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",    # 대상제외분류코드 (10자리)
+            "FID_INPUT_PRICE_1": "",                   # 입력 가격1
+            "FID_INPUT_PRICE_2": "",                   # 입력 가격2
+            "FID_VOL_CNT": "",                         # 거래량 수
+            "FID_INPUT_DATE_1": ""                     # 입력 날짜1
         }
 
         try:
@@ -1621,12 +1735,20 @@ class KISRestAPIManager:
         tr_id = "FHPST01710000"  # 등락률순위 조회 TR ID (공식 스펙)
 
         params = {
-            "fid_cond_mrkt_div_code": market_div,      # 시장분류코드
-            "fid_cond_scr_div_code": "20171",          # 화면분류코드 (고정값)
-            "fid_div_cls_code": sort_type,             # 정렬구분
-            "fid_input_iscd": "0000",                  # 입력종목코드 (전체 조회시 0000)
-            "fid_trgt_cls_code": "0000000000",         # 대상분류코드 (10자리)
-            "fid_trgt_exls_cls_code": "000000",        # 대상제외분류코드 (6자리)
+            "fid_rsfl_rate2": "",                      # 등락 비율2 (입력값 없을때 전체)
+            "fid_cond_mrkt_div_code": "J",             # 조건 시장 분류 코드 (주식 J)
+            "fid_cond_scr_div_code": "20170",          # 조건 화면 분류 코드 (Unique key: 20170)
+            "fid_input_iscd": "0000",                  # 입력 종목코드 (0000:전체, 0001:코스피, 1001:코스닥)
+            "fid_rank_sort_cls_code": sort_type,       # 순위 정렬 구분 코드 (0:상승율순, 1:하락율순)
+            "fid_input_cnt_1": str(limit),             # 입력 수1 (0:전체, 누적일수 입력)
+            "fid_prc_cls_code": "0",                   # 가격 구분 코드 (0:전체)
+            "fid_input_price_1": "",                   # 입력 가격1 (입력값 없을때 전체)
+            "fid_input_price_2": "",                   # 입력 가격2 (입력값 없을때 전체)
+            "fid_vol_cnt": "",                         # 거래량 수 (입력값 없을때 전체)
+            "fid_trgt_cls_code": "0",                  # 대상 구분 코드 (0:전체)
+            "fid_trgt_exls_cls_code": "0",             # 대상 제외 구분 코드 (0:전체)
+            "fid_div_cls_code": "0",                   # 분류 구분 코드 (0:전체)
+            "fid_rsfl_rate1": ""                       # 등락 비율1 (입력값 없을때 전체)
         }
 
         try:
@@ -1682,13 +1804,16 @@ class KISRestAPIManager:
         tr_id = "FHPST01720000"  # 호가잔량순위 조회 TR ID (공식 스펙)
 
         params = {
-            "fid_cond_mrkt_div_code": market_div,      # 시장분류코드
-            "fid_cond_scr_div_code": "20171",          # 화면분류코드 (고정값)
-            "fid_div_cls_code": sort_type,             # 정렬구분
-            "fid_input_iscd": "0000",                  # 입력종목코드 (전체 조회시 0000)
-            "fid_rank_sort_cls_code": "0",             # 순위정렬구분 (0: 순매수잔량순, 1:순매도잔량순, 2:매수비율순, 3:매도비율순)
-            "fid_trgt_cls_code": "0",                  # 0:전체
-            "fid_trgt_exls_cls_code": "0",             # 0:전체
+            "fid_vol_cnt": "",                         # 거래량 수 (입력값 없을때 전체)
+            "fid_cond_mrkt_div_code": "J",             # 조건 시장 분류 코드 (주식 J)
+            "fid_cond_scr_div_code": "20172",          # 조건 화면 분류 코드 (Unique key: 20172)
+            "fid_input_iscd": "0000",                  # 입력 종목코드 (0000:전체, 0001:코스피, 1001:코스닥)
+            "fid_rank_sort_cls_code": sort_type,       # 순위 정렬 구분 코드 (0:순매수잔량순, 1:순매도잔량순, 2:매수비율순, 3:매도비율순)
+            "fid_div_cls_code": "0",                   # 분류 구분 코드 (0:전체)
+            "fid_trgt_cls_code": "0",                  # 대상 구분 코드 (0:전체)
+            "fid_trgt_exls_cls_code": "0",             # 대상 제외 구분 코드 (0:전체)
+            "fid_input_price_1": "",                   # 입력 가격1 (입력값 없을때 전체)
+            "fid_input_price_2": ""                    # 입력 가격2 (입력값 없을때 전체)
         }
 
         try:
@@ -1987,14 +2112,17 @@ class KISRestAPIManager:
 
         try:
             if not is_market_hours:
-                logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 제한된 데이터 수집")
+                logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 프리 마켓 스크리닝 모드")
+                # 🆕 장외시간에는 프리 마켓 스크리닝 실행
+                return self.pre_market_screening(strategy_type)
 
+            # 장중 일반 스크리닝
             if strategy_type in ["gap", "all"]:
                 logger.info("🔍 갭 트레이딩 후보 탐색 시작...")
                 try:
                     screening_results['gap_trading'] = self.discover_gap_trading_candidates()
                 except Exception as e:
-                    logger.warning(f"갭 트레이딩 탐색 실패 (장외시간?): {e}")
+                    logger.warning(f"갭 트레이딩 탐색 실패: {e}")
                     screening_results['gap_trading'] = []
 
             if strategy_type in ["volume", "all"]:
@@ -2002,7 +2130,7 @@ class KISRestAPIManager:
                 try:
                     screening_results['volume_breakout'] = self.discover_volume_breakout_candidates()
                 except Exception as e:
-                    logger.warning(f"거래량 돌파 탐색 실패 (장외시간?): {e}")
+                    logger.warning(f"거래량 돌파 탐색 실패: {e}")
                     screening_results['volume_breakout'] = []
 
             if strategy_type in ["momentum", "all"]:
@@ -2010,10 +2138,10 @@ class KISRestAPIManager:
                 try:
                     screening_results['momentum'] = self.discover_momentum_candidates()
                 except Exception as e:
-                    logger.warning(f"모멘텀 탐색 실패 (장외시간?): {e}")
+                    logger.warning(f"모멘텀 탐색 실패: {e}")
                     screening_results['momentum'] = []
 
-            # 백그라운드 스크리닝 (항상 실행, 장외시간에는 예외 처리)
+            # 백그라운드 스크리닝 (장중에만 완전 실행)
             logger.info("📊 백그라운드 시장 스크리닝 시작...")
             screening_results['background'] = {
                 'volume_leaders': [],
@@ -2040,15 +2168,14 @@ class KISRestAPIManager:
                                  sum(len(v) for v in candidates.values()) if isinstance(candidates, dict) else 0
                                  for candidates in screening_results.values())
 
-            if is_market_hours:
-                logger.info(f"✅ 시장 스크리닝 완료 - 총 {total_candidates}개 후보 발굴")
-            else:
-                logger.warning(f"⚠️ 장외시간 스크리닝 완료 - 총 {total_candidates}개 후보 발굴 (제한적)")
+            logger.info(f"✅ 시장 스크리닝 완료 - 총 {total_candidates}개 후보 발굴")
 
         except Exception as e:
             logger.error(f"시장 스크리닝 중 오류: {e}")
 
         return screening_results
+
+
 
     @staticmethod
     def is_market_open(current_time: datetime) -> bool:
@@ -2070,3 +2197,343 @@ class KISRestAPIManager:
         market_close = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
 
         return market_open <= current_time <= market_close
+
+    def get_top_market_cap_stocks(self, limit: int = 50) -> List[str]:
+        """
+        🆕 시가총액 상위 종목 동적 조회
+
+        Returns:
+            시가총액 상위 종목 코드 리스트
+        """
+        try:
+            # 시가총액 순위 조회 (코스피 + 코스닥)
+            # get_change_ranking은 등락률 API이므로, 여기서는 거래량 API를 사용하여 시총 상위 추정
+            kospi_leaders = self.get_volume_ranking(market_div="J", ranking_type="1", limit=limit//2)  # 거래량 상위 (시총 대형주)
+            # kosdaq_leaders = self.get_volume_ranking(market_div="Q", ranking_type="1", limit=limit//2)  # 거래량 상위 (시총 대형주)
+
+            top_stocks = []
+
+            # 코스피 상위 종목 추가
+            for stock in kospi_leaders:
+                if 'stock_code' in stock:
+                    top_stocks.append(stock['stock_code'])
+
+            # # 코스닥 상위 종목 추가
+            # for stock in kosdaq_leaders:
+            #     if 'stock_code' in stock:
+            #         top_stocks.append(stock['stock_code'])
+
+            logger.info(f"📊 시가총액 상위 종목 {len(top_stocks)}개 동적 조회 완료")
+            return top_stocks[:limit]
+
+        except Exception as e:
+            logger.warning(f"⚠️ 시가총액 상위 종목 조회 실패: {e}")
+
+            # 🚨 fallback: API 실패 시만 최소한의 안전 종목 사용
+            fallback_stocks = [
+                '005930', '000660', '035420',  # 삼성전자, SK하이닉스, 네이버 (절대 안전주)
+            ]
+            logger.warning(f"🛡️ Fallback 모드: {len(fallback_stocks)}개 최소 안전 종목 사용")
+            return fallback_stocks
+
+    def get_high_volume_stocks(self, limit: int = 30) -> List[str]:
+        """
+        🆕 거래량 상위 종목 동적 조회
+
+        Returns:
+            거래량 상위 종목 코드 리스트
+        """
+        try:
+            # 거래량 순위 조회
+            volume_leaders = self.get_volume_ranking(market_div="J", ranking_type="1", limit=limit)
+
+            high_volume_stocks = []
+            for stock in volume_leaders:
+                if 'stock_code' in stock and stock.get('volume', 0) > 100000:  # 최소 거래량 필터
+                    high_volume_stocks.append(stock['stock_code'])
+
+            logger.info(f"📈 고거래량 종목 {len(high_volume_stocks)}개 동적 조회 완료")
+            return high_volume_stocks
+
+        except Exception as e:
+            logger.warning(f"⚠️ 고거래량 종목 조회 실패: {e}")
+            return []
+
+    def get_momentum_stocks(self, limit: int = 20) -> List[str]:
+        """
+        🆕 모멘텀 상위 종목 동적 조회 (상승률 기준)
+
+        Returns:
+            상승률 상위 종목 코드 리스트
+        """
+        try:
+            # 상승률 순위 조회 (코스피)
+            kospi_movers = self.get_change_ranking(market_div="J", sort_type="1", limit=limit//2)
+            # 상승률 순위 조회 (코스닥)
+            #kosdaq_movers = self.get_change_ranking(market_div="Q", sort_type="1", limit=limit//2)
+
+            momentum_stocks = []
+
+            # 적정 상승률 필터링 (1% ~ 10% 사이)
+            for stock in kospi_movers: # + kosdaq_movers:
+                change_rate = stock.get('change_rate', 0)
+                if 1.0 <= abs(change_rate) <= 10.0:  # 적정 범위의 변동성
+                    momentum_stocks.append(stock['stock_code'])
+
+            logger.info(f"🚀 모멘텀 종목 {len(momentum_stocks)}개 동적 조회 완료")
+            return momentum_stocks[:limit]
+
+        except Exception as e:
+            logger.warning(f"⚠️ 모멘텀 종목 조회 실패: {e}")
+            return []
+
+    def pre_market_screening(self, strategy_type: str = "all") -> Dict[str, List[Dict]]:
+        """
+        🆕 프리 마켓 스크리닝 - 장외시간 다음날 준비용 종목 발굴 (동적 개선)
+
+        전일 종가 기준으로 다음날 주목할 만한 종목들을 미리 선별 (하드코딩 제거)
+        """
+        logger.info("🌙 동적 프리 마켓 스크리닝 시작 - 다음날 거래 준비")
+
+        screening_results = {
+            'gap_trading': [],
+            'volume_breakout': [],
+            'momentum': [],
+            'background': {
+                'volume_leaders': [],
+                'price_movers': [],
+                'bid_ask_leaders': []
+            }
+        }
+
+        try:
+            # 🚀 1. 동적 종목 풀 구성 (하드코딩 완전 제거)
+            logger.info("📊 동적 종목 풀 구성 중...")
+
+            # 시가총액 상위 종목 (안정성)
+            market_cap_stocks = self.get_top_market_cap_stocks(limit=25)
+            # 고거래량 종목 (유동성)
+            volume_stocks = self.get_high_volume_stocks(limit=15)
+            # 모멘텀 종목 (변동성)
+            momentum_stocks = self.get_momentum_stocks(limit=15)
+
+            # 중복 제거하여 전체 후보 풀 구성
+            all_candidate_stocks = list(set(market_cap_stocks + volume_stocks + momentum_stocks))
+
+            logger.info(f"🎯 동적 후보 풀: 시총 {len(market_cap_stocks)}개 + 거래량 {len(volume_stocks)}개 + 모멘텀 {len(momentum_stocks)}개 = 총 {len(all_candidate_stocks)}개")
+
+            if not all_candidate_stocks:
+                logger.warning("⚠️ 동적 종목 풀이 비어있음 - 스크리닝 중단")
+                return screening_results
+
+            # 2. 갭 트레이딩 후보 분석 (변동성 기준)
+            pre_market_gaps = []
+            gap_analysis_stocks = market_cap_stocks[:15]  # 안정적인 대형주 위주
+
+            for stock_code in gap_analysis_stocks:
+                try:
+                    historical_data = self.get_daily_prices(stock_code, period_type="D")
+                    if len(historical_data) >= 5:
+                        recent_prices = historical_data[-5:]
+
+                        # 변동성 계산
+                        daily_changes = []
+                        for i in range(1, len(recent_prices)):
+                            prev_close = recent_prices[i-1]['close_price']
+                            curr_close = recent_prices[i]['close_price']
+                            change_rate = (curr_close - prev_close) / prev_close * 100
+                            daily_changes.append(abs(change_rate))
+
+                        avg_volatility = sum(daily_changes) / len(daily_changes) if daily_changes else 0
+
+                        # 적정 변동성 범위 (1.5% ~ 5.0%)
+                        if 1.5 <= avg_volatility <= 5.0:
+                            latest_data = recent_prices[-1]
+                            gap_score = avg_volatility * 2
+
+                            # 최근 추세 반영
+                            recent_trend = (recent_prices[-1]['close_price'] - recent_prices[-3]['close_price']) / recent_prices[-3]['close_price'] * 100
+                            if abs(recent_trend) > 1.0:  # 최근 3일간 1% 이상 변화
+                                gap_score += abs(recent_trend) * 0.5
+
+                            pre_market_gaps.append({
+                                'stock_code': stock_code,
+                                'close_price': latest_data['close_price'],
+                                'volume': latest_data['volume'],
+                                'avg_volatility': round(avg_volatility, 2),
+                                'recent_trend': round(recent_trend, 2),
+                                'score': round(gap_score, 2),
+                                'criteria': 'dynamic_volatility_analysis',
+                                'expected_gap_direction': 'UP' if recent_trend > 0 else 'DOWN'
+                            })
+                except Exception as e:
+                    logger.debug(f"동적 갭 분석 실패 ({stock_code}): {e}")
+                    continue
+
+            pre_market_gaps.sort(key=lambda x: x['score'], reverse=True)
+            screening_results['gap_trading'] = pre_market_gaps[:8]  # 상위 8개
+
+            # 3. 볼륨 브레이크아웃 후보 (고거래량 + 안정성)
+            volume_candidates = []
+            volume_analysis_stocks = (market_cap_stocks[:10] + volume_stocks[:10])
+            unique_volume_stocks = list(set(volume_analysis_stocks))  # 중복 제거
+
+            for stock_code in unique_volume_stocks:
+                try:
+                    current_price_data = self.get_current_price(stock_code)
+                    if current_price_data:
+                        current_price = current_price_data.get('current_price', 0)
+                        volume = current_price_data.get('volume', 0)
+
+                        # 볼륨 점수 계산 (거래량 + 시가총액 가중)
+                        volume_score = 6.0  # 기본 점수
+
+                        # 거래량 보너스
+                        if volume > 5000000:  # 500만주 이상
+                            volume_score += 1.0
+                        elif volume > 1000000:  # 100만주 이상
+                            volume_score += 0.5
+
+                        # 시가총액 보너스 (안정성)
+                        if stock_code in market_cap_stocks[:5]:  # 시총 상위 5개
+                            volume_score += 1.5
+                        elif stock_code in market_cap_stocks[:15]:  # 시총 상위 15개
+                            volume_score += 1.0
+
+                        volume_candidates.append({
+                            'stock_code': stock_code,
+                            'current_price': current_price,
+                            'volume': volume,
+                            'score': round(volume_score, 1),
+                            'criteria': 'dynamic_volume_liquidity',
+                            'market_cap_rank': market_cap_stocks.index(stock_code) + 1 if stock_code in market_cap_stocks else 999,
+                            'volume_rank': volume_stocks.index(stock_code) + 1 if stock_code in volume_stocks else 999,
+                            'strategy_note': '동적 선별 - 거래량+안정성'
+                        })
+                except Exception as e:
+                    logger.debug(f"동적 볼륨 분석 실패 ({stock_code}): {e}")
+                    continue
+
+            volume_candidates.sort(key=lambda x: x['score'], reverse=True)
+            screening_results['volume_breakout'] = volume_candidates[:6]  # 상위 6개
+
+            # 4. 모멘텀 후보 (최근 추세 + 기술적 강세)
+            momentum_candidates = []
+            momentum_analysis_stocks = momentum_stocks[:12]  # 모멘텀 상위 12개
+
+            for stock_code in momentum_analysis_stocks:
+                try:
+                    # 최근 5일 추세 분석
+                    daily_data = self.get_daily_prices(stock_code, period_type="D")
+                    if len(daily_data) >= 5:
+                        recent_data = daily_data[-5:]
+
+                        # 상승 지속성 + 변동성 체크
+                        upward_days = 0
+                        total_change = 0
+                        daily_volumes = []
+
+                        for i in range(1, len(recent_data)):
+                            prev_close = recent_data[i-1]['close_price']
+                            curr_close = recent_data[i]['close_price']
+                            change = (curr_close - prev_close) / prev_close * 100
+                            total_change += change
+                            daily_volumes.append(recent_data[i]['volume'])
+
+                            if change > 0:
+                                upward_days += 1
+
+                        # 평균 거래량 계산
+                        avg_volume = sum(daily_volumes) / len(daily_volumes) if daily_volumes else 0
+
+                        # 모멘텀 점수 계산 (추세 + 거래량 + 지속성)
+                        momentum_score = 0
+
+                        if total_change > 1.0:  # 총 상승률 1% 이상
+                            momentum_score += total_change * 0.5
+
+                        if upward_days >= 3:  # 5일 중 3일 이상 상승
+                            momentum_score += upward_days * 0.8
+
+                        if avg_volume > 1000000:  # 평균 거래량 100만주 이상
+                            momentum_score += 1.0
+
+                        # 적정 범위 필터링 (과도한 급등주 제외)
+                        if 2.0 <= momentum_score <= 12.0 and total_change <= 15.0:
+                            momentum_candidates.append({
+                                'stock_code': stock_code,
+                                'current_price': recent_data[-1]['close_price'],
+                                'change_rate': round(total_change, 2),
+                                'upward_days': upward_days,
+                                'avg_volume': int(avg_volume),
+                                'score': round(momentum_score, 2),
+                                'criteria': 'dynamic_momentum_analysis',
+                                'trend_strength': 'STRONG' if momentum_score >= 8.0 else 'MODERATE'
+                            })
+                except Exception as e:
+                    logger.debug(f"동적 모멘텀 분석 실패 ({stock_code}): {e}")
+                    continue
+
+            momentum_candidates.sort(key=lambda x: x['score'], reverse=True)
+            screening_results['momentum'] = momentum_candidates[:5]  # 상위 5개
+
+            # 5. 백그라운드 모니터링용 (전체 후보 풀 활용)
+            background_candidates = []
+
+            # 전체 후보 풀을 다양한 기준으로 분류
+            for i, stock_code in enumerate(all_candidate_stocks[:30]):  # 상위 30개
+                # 기본 분류 점수
+                base_score = 8.0 - (i * 0.1)
+
+                # 분류별 가중치
+                category = "balanced"
+                if stock_code in market_cap_stocks[:10]:
+                    category = "stability_focused"
+                    base_score += 0.5
+                elif stock_code in volume_stocks[:10]:
+                    category = "liquidity_focused"
+                    base_score += 0.3
+                elif stock_code in momentum_stocks[:10]:
+                    category = "momentum_focused"
+                    base_score += 0.2
+
+                background_candidates.append({
+                    'stock_code': stock_code,
+                    'rank': i + 1,
+                    'current_price': 0,  # 실시간 조회는 부하 고려하여 생략
+                    'volume': 0,
+                    'change_rate': 0.0,
+                    'score': round(base_score, 1),
+                    'criteria': 'dynamic_comprehensive_pool',
+                    'category': category,
+                    'note': '동적 선별 - 다음날 모니터링 대상'
+                })
+
+            # 백그라운드를 용도별로 분할
+            screening_results['background'] = {
+                'volume_leaders': background_candidates[:8],      # 유동성 중심
+                'price_movers': background_candidates[8:16],     # 가격 변동 중심
+                'bid_ask_leaders': background_candidates[16:24]   # 호가 활성도 중심
+            }
+
+            # 🎯 결과 요약
+            total_dynamic = (len(screening_results['gap_trading']) +
+                            len(screening_results['volume_breakout']) +
+                            len(screening_results['momentum']) +
+                            len(screening_results['background']['volume_leaders']) +
+                            len(screening_results['background']['price_movers']) +
+                            len(screening_results['background']['bid_ask_leaders']))
+
+            logger.info(f"🌙 동적 프리 마켓 스크리닝 완료:")
+            logger.info(f"   📊 후보 풀: {len(all_candidate_stocks)}개 (시총+거래량+모멘텀 통합)")
+            logger.info(f"   🎯 갭 후보: {len(screening_results['gap_trading'])}개 (변동성 분석)")
+            logger.info(f"   📈 볼륨 후보: {len(screening_results['volume_breakout'])}개 (유동성+안정성)")
+            logger.info(f"   🚀 모멘텀 후보: {len(screening_results['momentum'])}개 (추세 분석)")
+            logger.info(f"   🔍 백그라운드: {len(screening_results['background']['volume_leaders']) + len(screening_results['background']['price_movers']) + len(screening_results['background']['bid_ask_leaders'])}개 (종합 모니터링)")
+            logger.info(f"   ✅ 총 {total_dynamic}개 다음날 거래 준비 완료 (100% 동적 선별)")
+
+        except Exception as e:
+            logger.error(f"동적 프리 마켓 스크리닝 오류: {e}")
+            # 오류 시에도 빈 구조 반환하여 시스템 안정성 유지
+
+        return screening_results

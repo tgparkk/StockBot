@@ -86,7 +86,7 @@ for stock_code in gap_candidates[:8]:
 def gap_trading_callback(stock_code, data, source):
     price = data['current_price']['current_price']
     change_rate = data['current_price']['change_rate']
-    
+
     if abs(change_rate) > 3.0:  # 3% 이상 갭
         print(f"🎯 갭 신호: {stock_code} {change_rate:+.1f}%")
         # 매매 로직 실행
@@ -97,7 +97,7 @@ def gap_trading_callback(stock_code, data, source):
 ```python
 def volume_watch_callback(stock_code, data, source):
     volume = data['current_price']['volume']
-    
+
     if volume > 1000000:  # 100만주 돌파
         # 백그라운드 → 실시간으로 승격
         data_manager.upgrade_priority(stock_code, DataPriority.CRITICAL)
@@ -114,7 +114,7 @@ from examples.optimal_websocket_usage import OptimalWebSocketTradingSystem
 
 async def run_automated_trading():
     system = OptimalWebSocketTradingSystem()
-    
+
     # 5시간 자동 운영
     await system.run_optimal_trading_session()
 
@@ -131,7 +131,7 @@ asyncio.run(run_automated_trading())
 📋 거래 세션 초기화
    현재 시간대: pre_market
    갭 후보 종목: 10개
-   거래량 후보: 15개  
+   거래량 후보: 15개
    스크리닝 대상: 100개
    📡 백그라운드 스크리닝 시작: 50개 종목
    ✅ 초기화 완료
@@ -206,7 +206,7 @@ data_manager.optimize_allocation()
 # MEDIUM: 30초 → 15초
 # LOW: 60초 → 30초
 
-# 점심시간: 느린 폴링  
+# 점심시간: 느린 폴링
 # MEDIUM: 30초 → 60초
 # LOW: 60초 → 120초
 ```
@@ -231,9 +231,9 @@ REST API 5분: 광범위 100개 종목 (발굴)
 # 호가 데이터는 30초 캐시
 def get_cached_orderbook(stock_code):
     cache_time = cache_timestamps.get(stock_code)
-    if cache_time and datetime.now() - cache_time < timedelta(seconds=30):
+    if cache_time and now_kst() - cache_time < timedelta(seconds=30):
         return cached_data[stock_code]['orderbook']  # 캐시 사용
-    
+
     # 캐시 만료시에만 새로 조회
     return broker.get_orderbook(stock_code)
 ```
@@ -290,7 +290,7 @@ signal_queue = queue.PriorityQueue(maxsize=1000)
 ```python
 def print_performance_metrics():
     status = data_manager.get_system_status()
-    
+
     print("📊 성과 지표")
     print(f"총 모니터링 종목: {status['total_stocks']}개")
     print(f"WebSocket 효율성: {status['websocket_status']['total_subscriptions']}/41 = {status['websocket_status']['total_subscriptions']/41*100:.1f}%")
@@ -344,7 +344,7 @@ focus_closing_momentum()  # 마감 모멘텀 종목 집중
 - 거래량 평균 3배 이상
 - 기술적 돌파 임박
 
-# WebSocket 준실시간 (HIGH)  
+# WebSocket 준실시간 (HIGH)
 - 변동률 1% 이상
 - 거래량 평균 2배 이상
 - 관심 종목 리스트
@@ -396,4 +396,4 @@ volume_breakout_performance = analyze_strategy("volume_breakout")
 
 ---
 
-> **실행해보기**: `python examples/optimal_websocket_usage.py` 
+> **실행해보기**: `python examples/optimal_websocket_usage.py`
