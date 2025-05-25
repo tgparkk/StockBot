@@ -15,6 +15,7 @@ import threading
 from datetime import datetime
 from typing import Dict, List, Optional
 from utils.logger import setup_logger
+from utils.korean_time import now_kst, now_kst_timestamp, now_kst_str, now_kst_time_str
 import os
 import sys
 import signal
@@ -105,10 +106,10 @@ class StockBotMain:
         # 9. 계좌 잔고 캐시 초기화
         self._cached_balance = {
             'total_assets': 0,
-            'available_cash': 0,
             'stock_evaluation': 0,
             'profit_loss': 0,
             'profit_rate': 0,
+            'available_cash': 0,
         }
 
         # 10. 🚀 고성능 거래 신호 시스템 (기존 trading_signals 대체)
@@ -173,18 +174,14 @@ class StockBotMain:
             logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 제한된 모드로 실행됩니다")
 
         # 1. WebSocket 연결 (장외시간에는 선택적)
-        if is_market_open or self.testing_mode:
-            if not await self.websocket_manager.connect():
-                if is_market_open:
-                    raise Exception("WebSocket 연결 실패")
-                else:
-                    logger.warning("WebSocket 연결 실패 (장외시간이므로 계속 진행)")
-        else:
-            logger.info("장외시간: WebSocket 연결 생략")
+        if not await self.websocket_manager.connect():
+            if is_market_open:
+                raise Exception("WebSocket 연결 실패")
+            else:
+                logger.warning("WebSocket 연결 실패 (장외시간이므로 계속 진행)")
 
-        # 2. 체결통보 구독 (장중에만)
-        if is_market_open or self.testing_mode:
-            await self._setup_execution_notification()
+        # 2. 체결통보 구독
+        await self._setup_execution_notification()
 
         # 3. 하이브리드 데이터 매니저 시작
         self.data_manager.start_polling()
@@ -249,7 +246,7 @@ class StockBotMain:
 
                 # 주문 이력에 추가 (메모리용)
                 self.order_history.append({
-                    'timestamp': datetime.now(),
+                    'timestamp': now_kst(),
                     'stock_code': stock_code,
                     'order_type': order_type,
                     'price': execution_price,
@@ -267,7 +264,7 @@ class StockBotMain:
                         f"📊 <b>{stock_code}</b>\n"
                         f"🔄 {order_type} {execution_qty:,}주\n"
                         f"💰 {execution_price:,}원\n"
-                        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                        f"⏰ {now_kst_time_str()}"
                     )
                     # 비동기 방식으로 알림 전송 (효율적)
                     asyncio.create_task(
@@ -293,7 +290,7 @@ class StockBotMain:
                 'avg_price': 0,
                 'total_amount': 0,
                 'strategy_type': strategy_type,  # 전략 정보 추가
-                'entry_time': datetime.now(),    # 진입 시간 추가
+                'entry_time': now_kst(),    # 진입 시간 추가
                 'max_profit_rate': 0.0          # 최대 수익률 추적 (trailing stop용)
             }
 
@@ -307,7 +304,7 @@ class StockBotMain:
             'avg_price': new_avg_price,
             'total_amount': new_total_amount,
             'strategy_type': strategy_type,
-            'entry_time': position.get('entry_time', datetime.now()),
+            'entry_time': position.get('entry_time', now_kst()),
             'max_profit_rate': position.get('max_profit_rate', 0.0)
         }
 
@@ -424,7 +421,7 @@ class StockBotMain:
                     'price': price,
                     'quantity': quantity,
                     'strategy_type': strategy_type,
-                    'timestamp': datetime.now()
+                    'timestamp': now_kst()
                 }
 
                 order_type_kr = '매수' if order_type.upper() == 'BUY' else '매도'
@@ -440,91 +437,6 @@ class StockBotMain:
             logger.error(f"{strategy_type} 주문 실행 오류: {e}")
             return None
 
-    async def monitor_positions(self):
-        """포지션 모니터링 - 손절/익절 전담 (신호 처리는 별도 태스크로 분리)"""
-        logger.info("🔍 포지션 모니터링 시작 (신호 처리 분리됨)")
-        last_check_time = {}  # 종목별 마지막 체크 시간
-
-        while True:
-            try:
-                # 🚀 신호 처리는 전용 태스크에서 처리하므로 제거됨
-                # 포지션 모니터링에만 집중
-
-                if not self.positions:
-                    await asyncio.sleep(float(self.no_position_wait_time))  # 설정값 사용
-                    continue
-
-                current_time = datetime.now()
-                positions_to_check = []
-
-                # 스레드 안전하게 포지션 복사
-                with self.position_lock:
-                    for stock_code, position in list(self.positions.items()):
-                        # 종목별로 최소 5초 간격 체크 (API 부하 감소)
-                        last_time = last_check_time.get(stock_code, current_time)
-                        if (current_time - last_time).total_seconds() >= 5:
-                            positions_to_check.append((stock_code, position.copy()))
-                            last_check_time[stock_code] = current_time
-
-                # 락 해제 후 포지션 체크 (블로킹 최소화)
-                for stock_code, position in positions_to_check:
-                    try:
-                        # 🚀 새로운 통합 가격 조회 메서드 사용 (웹소켓 우선, fallback 자동)
-                        price_result = self.get_cached_price_with_fallback(stock_code)
-
-                        if not price_result['success']:
-                            logger.debug(f"현재가 데이터 없음: {stock_code}")
-                            continue
-
-                        current_price = price_result['price']
-                        data_source = price_result['source']
-                        avg_price = position['avg_price']
-                        quantity = position['quantity']
-
-                        # 안전장치: 가격이 0이면 스킵
-                        if avg_price <= 0:
-                            continue
-
-                        profit_rate = (current_price - avg_price) / avg_price
-
-                        # 최대 수익률 업데이트 (trailing stop용)
-                        if profit_rate > position.get('max_profit_rate', 0.0):
-                            with self.position_lock:
-                                if stock_code in self.positions:
-                                    self.positions[stock_code]['max_profit_rate'] = profit_rate
-
-                        # 전략별 매도 조건 적용
-                        sell_signal = self._check_strategy_sell_conditions(
-                            stock_code, position, current_price, profit_rate
-                        )
-
-                        if sell_signal:
-                            await self._execute_sell_order(
-                                stock_code, quantity, current_price, sell_signal['reason']
-                            )
-
-                        # 현재 상태 로깅 (5분마다)
-                        elif len(positions_to_check) <= 3:  # 포지션 적을 때만
-                            strategy_type = position.get('strategy_type', 'unknown')
-                            logger.debug(f"📊 {stock_code}({strategy_type}): {profit_rate*100:+.1f}% ({current_price:,}원) [from {data_source}]")
-
-                    except Exception as e:
-                        logger.error(f"포지션 체크 오류 ({stock_code}): {e}")
-
-                # 적응적 대기 시간 (포지션 수에 따라 조절, 설정값 기반)
-                position_count = len(self.positions)
-                if position_count == 0:
-                    sleep_time = float(self.no_position_wait_time)  # 포지션 없음
-                elif position_count <= 5:
-                    sleep_time = float(self.position_check_interval)   # 적은 포지션
-                else:
-                    sleep_time = max(2.0, float(self.position_check_interval) - 1.0)   # 많은 포지션 (최소 2초)
-
-                await asyncio.sleep(sleep_time)
-
-            except Exception as e:
-                logger.error(f"포지션 모니터링 전체 오류: {e}")
-                await asyncio.sleep(10)  # 오류 시 더 긴 대기
 
     async def _execute_sell_order(self, stock_code: str, quantity: int, price: int, reason: str):
         """매도 주문 실행 (포지션 모니터링용) - 통합 주문 메서드 사용"""
@@ -550,32 +462,47 @@ class StockBotMain:
             logger.error(f"매도 주문 실행 오류: {e}")
 
     async def get_account_balance(self) -> Dict:
-        """계좌 잔고 조회"""
+        """계좌 잔고 조회 + 매수가능금액 조회"""
         try:
+            # 1. 기본 잔고 정보 조회
             balance_info = self.trading_api.get_balance()
+
+            # 2. 매수가능조회 API 호출 (PDNO, ORD_UNPR 공란으로 전체 매수가능금액 조회)
+            buy_possible_info = self.trading_api.get_buy_possible(
+                stock_code="",      # 공란 입력시 매수금액만 조회
+                price=0,
+                order_type="00"     # 임의값
+            )
+
             if balance_info:
+                # 계좌 요약 정보에서 필요한 값들 추출
+                account_summary = balance_info.get('account_summary', {})
+
                 return {
-                    'total_assets': balance_info.get('total_evaluation_amount', 0),  # 총 평가금액
-                    'available_cash': balance_info.get('order_possible_cash', 0),    # 주문 가능 현금
-                    'stock_evaluation': balance_info.get('total_stock_evaluation', 0),  # 보유 주식 평가금액
-                    'profit_loss': balance_info.get('total_profit_loss', 0),        # 총 손익
-                    'profit_rate': balance_info.get('total_profit_rate', 0),        # 총 손익률
+                    'total_assets': account_summary.get('tot_evlu_amt', 0),           # 총평가금액
+                    'stock_evaluation': account_summary.get('scts_evlu_amt', 0),     # 유가평가금액
+                    'profit_loss': account_summary.get('evlu_pfls_smtl_amt', 0),     # 평가손익합계금액
+                    'profit_rate': 0,  # 수익률은 별도 계산 필요
+                    'available_cash': buy_possible_info.get('ord_psbl_cash', 0),     # 🎯 매수가능현금 (새로 추가)
                 }
+
+            # fallback: 매수가능조회만이라도 성공한 경우
             return {
                 'total_assets': 0,
-                'available_cash': 0,
                 'stock_evaluation': 0,
                 'profit_loss': 0,
                 'profit_rate': 0,
+                'available_cash': buy_possible_info.get('ord_psbl_cash', 0),
             }
+
         except Exception as e:
             logger.error(f"계좌 잔고 조회 오류: {e}")
             return {
                 'total_assets': 0,
-                'available_cash': 0,
                 'stock_evaluation': 0,
                 'profit_loss': 0,
                 'profit_rate': 0,
+                'available_cash': 0,
             }
 
     def calculate_position_size(self, signal: Dict, stock_code: str, current_price: int) -> Dict:
@@ -693,7 +620,7 @@ class StockBotMain:
                 return
 
             # 🚀 중복 신호 검사 및 필터링
-            current_time = datetime.now().timestamp()
+            current_time = now_kst().timestamp()
             should_process = True
 
             with self.signal_dedup_lock:
@@ -737,7 +664,8 @@ class StockBotMain:
 
             # 🚀 중복이 아닌 경우 우선순위 큐에 추가
             priority = self._calculate_signal_priority(signal)
-            timestamp = datetime.now().timestamp()
+            # 한국시간 명시적 사용
+            timestamp = now_kst_timestamp()
 
             # 우선순위 큐에 추가 (priority, timestamp, signal)
             await self.priority_signals.put((priority, timestamp, signal))
@@ -799,7 +727,7 @@ class StockBotMain:
         """🚀 고성능 병렬 신호 처리 시스템 - 기존 순차 처리를 완전 대체"""
         try:
             batch_signals = []
-            start_time = datetime.now()
+            start_time = now_kst()
 
             # 1. 배치 수집 (최대 20개 또는 100ms 내)
             batch_timeout = 0.1  # 100ms
@@ -849,7 +777,7 @@ class StockBotMain:
             error_count = sum(1 for r in results if isinstance(r, Exception))
 
             # 6. 성능 통계 업데이트
-            processing_time = (datetime.now() - start_time).total_seconds()
+            processing_time = (now_kst() - start_time).total_seconds()
             self.signal_stats['total_processed'] += success_count
             self.signal_stats['average_processing_time'] = (
                 self.signal_stats['average_processing_time'] * 0.8 +
@@ -872,11 +800,11 @@ class StockBotMain:
         """세마포어를 사용한 제한된 병렬 신호 실행"""
         async with self.signal_processing_semaphore:  # 동시 실행 수 제한
             try:
-                start_time = datetime.now()
+                start_time = now_kst()
                 result = await self._execute_trading_signal_optimized(signal, priority)
 
                 # 처리 시간 추적
-                processing_time = (datetime.now() - start_time).total_seconds()
+                processing_time = (now_kst() - start_time).total_seconds()
                 if processing_time > 0.5:  # 500ms 이상 소요 시 경고
                     logger.warning(
                         f"⚠️ 느린 신호 처리: {signal.get('stock_code')} {processing_time*1000:.0f}ms"
@@ -1037,16 +965,27 @@ class StockBotMain:
             # 🕐 미체결 주문 모니터링 태스크
             pending_order_monitoring_task = asyncio.create_task(self.start_pending_order_monitoring())
 
+            # 🚀 WebSocket 실시간 데이터 수신 태스크 (누락되었던 부분!)
+            websocket_listening_task = None
+            if self.websocket_manager.is_connected:
+                websocket_listening_task = asyncio.create_task(self.websocket_manager.start_listening())
+                logger.info("🌐 WebSocket 실시간 데이터 수신 시작")
+
             logger.info("🚀 통합 거래 시스템 시작 - 모든 거래 결정이 하나의 큐로 통합됨")
 
             # 모든 태스크가 완료될 때까지 대기
-            await asyncio.gather(
+            tasks = [
                 scheduler_task,
                 signal_processor_task,
                 position_monitoring_task,
-                pending_order_monitoring_task,
-                return_exceptions=True
-            )
+                pending_order_monitoring_task
+            ]
+
+            # WebSocket 태스크가 있으면 추가
+            if websocket_listening_task:
+                tasks.append(websocket_listening_task)
+
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             logger.error(f"메인 실행 루프 오류: {e}")
@@ -1093,7 +1032,7 @@ class StockBotMain:
                 'missing_in_selected': list(scheduler_stocks - current_selected),
                 'extra_in_selected': list(current_selected - scheduler_stocks),
                 'current_time_slot': self.current_time_slot,
-                'last_sync_time': datetime.now().strftime('%H:%M:%S')
+                'last_sync_time': now_kst().strftime('%H:%M:%S')
             }
 
             if not sync_status['is_synced']:
@@ -1246,7 +1185,7 @@ class StockBotMain:
                         # 아직 가격 정보는 없지만 캐시 슬롯 준비
                         self.realtime_cache[stock_code] = {
                             'price': 0,
-                            'timestamp': datetime.now(),
+                            'timestamp': now_kst(),
                             'source': 'websocket_ready',
                             'status': 'waiting_for_data'
                         }
@@ -1284,7 +1223,7 @@ class StockBotMain:
                     with self.cache_lock:
                         self.realtime_cache[stock_code] = {
                             'price': current_price,
-                            'timestamp': datetime.now(),
+                            'timestamp': now_kst(),
                             'source': source,
                             'full_data': data
                         }
@@ -1387,9 +1326,9 @@ class StockBotMain:
     def _load_trading_settings(self):
         """거래 관련 설정 로드 (config_loader 사용)"""
         try:
-            # 손절/익절 설정
-            self.stop_loss_threshold = self._safe_float(self.config_loader.get_config_value('risk_management', 'stop_loss_percent', -3.0), -3.0) / 100
-            self.take_profit_threshold = self._safe_float(self.config_loader.get_config_value('risk_management', 'take_profit_percent', 5.0), 5.0) / 100
+            # 손절/익절 설정 ([trading] 섹션에서)
+            self.stop_loss_threshold = self._safe_float(self.config_loader.get_config_value('trading', 'stop_loss_percent', -1.0), -1.0) / 100
+            self.take_profit_threshold = self._safe_float(self.config_loader.get_config_value('trading', 'take_profit_percent', 2.0), 2.0) / 100
 
             # 포지션 보호 설정 (시간대 변경 시 더 보수적)
             self.protection_stop_loss = self._safe_float(self.config_loader.get_config_value('position_protection', 'stop_loss_percent', -2.0), -2.0) / 100
@@ -1418,9 +1357,9 @@ class StockBotMain:
                                        current_price: int, profit_rate: float) -> Optional[Dict]:
         """전략별 매도 조건 체크"""
         strategy_type = position.get('strategy_type', 'unknown')
-        entry_time = position.get('entry_time', datetime.now())
+        entry_time = position.get('entry_time', now_kst())
         max_profit_rate = position.get('max_profit_rate', 0.0)
-        holding_minutes = (datetime.now() - entry_time).total_seconds() / 60
+        holding_minutes = (now_kst() - entry_time).total_seconds() / 60
 
         # 전략별 매도 조건
         if strategy_type == 'gap_trading' or 'gap_trading' in strategy_type:
@@ -1563,7 +1502,7 @@ class StockBotMain:
             with self.cache_lock:
                 self.realtime_cache[stock_code] = {
                     'price': current_price,
-                    'timestamp': datetime.now(),
+                    'timestamp': now_kst(),
                     'source': source
                 }
 
@@ -1572,7 +1511,7 @@ class StockBotMain:
         with self.cache_lock:
             cached_data = self.realtime_cache.get(stock_code)
             if cached_data:
-                cache_age = (datetime.now() - cached_data['timestamp']).total_seconds()
+                cache_age = (now_kst() - cached_data['timestamp']).total_seconds()
                 if cache_age <= max_age_seconds:
                     return {
                         'price': cached_data['price'],
@@ -1628,6 +1567,7 @@ class StockBotMain:
             'success': False
         }
 
+
     async def start_position_monitoring_signals(self):
         """🚀 포지션 모니터링을 신호로 변환하는 새로운 시스템"""
         logger.info("🛡️ 통합 포지션 모니터링 시작 (신호 기반)")
@@ -1639,7 +1579,7 @@ class StockBotMain:
                     await asyncio.sleep(float(self.no_position_wait_time))
                     continue
 
-                current_time = datetime.now()
+                current_time = now_kst()
                 positions_to_check = []
 
                 # 스레드 안전하게 포지션 복사
@@ -1662,7 +1602,7 @@ class StockBotMain:
                         current_price = price_result['price']
                         avg_price = position['avg_price']
 
-                        if avg_price <= 0:
+                        if avg_price <= 0 or current_price <= 0:
                             continue
 
                         profit_rate = (current_price - avg_price) / avg_price
@@ -1729,7 +1669,7 @@ class StockBotMain:
 
         while self.signal_processing_active:
             try:
-                current_time = datetime.now()
+                current_time = now_kst()
                 timeout_orders = []
 
                 # 스레드 안전하게 미체결 주문 복사

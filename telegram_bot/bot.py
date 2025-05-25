@@ -12,6 +12,7 @@ from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from utils.logger import setup_logger
 from database.db_manager import db_manager
+from utils.korean_time import now_kst, now_kst_time
 
 # 환경변수 로드
 load_dotenv()
@@ -154,7 +155,7 @@ class TelegramBot:
             "🤖 <b>StockBot 텔레그램 연결 완료!</b>\n\n"
             "📊 실시간 모니터링이 시작되었습니다.\n"
             "💬 /help 명령어로 사용법을 확인하세요.\n\n"
-            f"⏰ 시작 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"⏰ 시작 시간: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
         try:
@@ -236,7 +237,7 @@ class TelegramBot:
                 f"🕐 스케줄러: {status.get('scheduler', {}).get('current_slot', 'None')}\n"
                 f"📈 활성 전략: {len(status.get('scheduler', {}).get('active_strategies', []))}\n"
                 f"🎯 활성 종목: {status.get('scheduler', {}).get('total_active_stocks', 0)}개\n\n"
-                f"⏰ 확인 시간: {datetime.now().strftime('%H:%M:%S')}"
+                f"⏰ 확인 시간: {now_kst().strftime('%H:%M:%S')}"
             )
 
             await update.message.reply_text(message, parse_mode='HTML')
@@ -357,7 +358,7 @@ class TelegramBot:
                     f"💵 총 평가금액: {total_eval_str}원\n"
                     f"{profit_emoji} 평가손익: {profit_str}원 ({profit_rate:+.2f}%)\n"
                     f"📦 보유 종목: {len(positions)}개\n\n"
-                    f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"⏰ {now_kst().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
 
                 await loading_msg.edit_text(message, parse_mode='HTML')
@@ -427,7 +428,7 @@ class TelegramBot:
                 f"✅ 수익 거래: {win_count}건\n"
                 f"❌ 손실 거래: {lose_count}건\n"
                 f"📊 승률: {win_rate:.1f}%\n\n"
-                f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"⏰ {now_kst().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
             await update.message.reply_text(message, parse_mode='HTML')
@@ -547,7 +548,7 @@ class TelegramBot:
 
             message = (
                 f"📊 <b>오늘 종합 요약</b>\n"
-                f"📅 {datetime.now().strftime('%Y-%m-%d')}\n\n"
+                f"📅 {now_kst().strftime('%Y-%m-%d')}\n\n"
                 f"{profit_emoji} <b>수익 현황</b>\n"
                 f"💰 실현 손익: {realized_pnl:+,}원\n"
                 f"🎯 거래 건수: {total_trades}건\n"
@@ -567,7 +568,7 @@ class TelegramBot:
                 }.get(slot, slot)
                 message += f"  {slot_name}: {count}개\n"
 
-            message += f"\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+            message += f"\n⏰ {now_kst().strftime('%H:%M:%S')}"
 
             await update.message.reply_text(message, parse_mode='HTML')
 
@@ -618,7 +619,7 @@ class TelegramBot:
                 }.get(strategy, strategy)
                 message += f"  {strategy_name}: {count}개\n"
 
-            message += f"\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+            message += f"\n⏰ {now_kst().strftime('%H:%M:%S')}"
 
             await update.message.reply_text(message, parse_mode='HTML')
 
@@ -678,7 +679,7 @@ class TelegramBot:
 
                 message += "\n"
 
-            message += f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            message += f"⏰ {now_kst().strftime('%H:%M:%S')}"
 
             await update.message.reply_text(message, parse_mode='HTML')
 

@@ -17,6 +17,7 @@ from Crypto.Util.Padding import unpad
 from base64 import b64decode
 from dotenv import load_dotenv
 from utils.logger import setup_logger
+from utils.korean_time import now_kst, now_kst_time
 from .rest_api_manager import KISRestAPIManager
 import pytz
 
@@ -121,7 +122,8 @@ class KISWebSocketManager:
         self.callbacks = {
             "stock_price": [],      # 주식체결가 콜백
             "stock_orderbook": [],  # 주식호가 콜백
-            "stock_execution": []   # 주식체결통보 콜백
+            "stock_execution": [],  # 주식체결통보 콜백
+            "market_index": []      # 🆕 시장지수 콜백
         }
 
         # 통계
@@ -309,7 +311,7 @@ class KISWebSocketManager:
 
     def get_current_time_slot(self) -> TradingTimeSlot:
         """현재 시간대 확인"""
-        now = datetime.now()
+        now = now_kst()
         current_time = now.time()
 
         if current_time < datetime.strptime("09:00", "%H:%M").time():
@@ -639,7 +641,7 @@ class KISWebSocketManager:
                 'tr_id': tr_id,
                 'header': header,
                 'body': body,
-                'timestamp': datetime.now()
+                'timestamp': now_kst()
             }
 
         except Exception as e:
@@ -673,6 +675,8 @@ class KISWebSocketManager:
                 await self._process_stock_orderbook_data(parsed_data)
             elif tr_id == SubscriptionType.STOCK_EXECUTION.value:
                 await self._process_stock_execution_data(parsed_data)
+            elif tr_id == SubscriptionType.MARKET_INDEX.value:
+                await self._process_market_index_data(parsed_data)
 
         except Exception as e:
             logger.error(f"메시지 처리 실패: {e}")
@@ -680,9 +684,9 @@ class KISWebSocketManager:
     async def _process_stock_price_data(self, data: Dict):
         """주식체결가 데이터 처리"""
         try:
-            # 콜백 함수들 실행
+            # 🚀 동기/비동기 콜백 함수들 실행
             for callback in self.callbacks["stock_price"]:
-                await callback(data)
+                await self._execute_callback_safely(callback, data)
 
         except Exception as e:
             logger.error(f"주식체결가 데이터 처리 실패: {e}")
@@ -690,9 +694,9 @@ class KISWebSocketManager:
     async def _process_stock_orderbook_data(self, data: Dict):
         """주식호가 데이터 처리"""
         try:
-            # 콜백 함수들 실행
+            # 🚀 동기/비동기 콜백 함수들 실행
             for callback in self.callbacks["stock_orderbook"]:
-                await callback(data)
+                await self._execute_callback_safely(callback, data)
 
         except Exception as e:
             logger.error(f"주식호가 데이터 처리 실패: {e}")
@@ -700,12 +704,87 @@ class KISWebSocketManager:
     async def _process_stock_execution_data(self, data: Dict):
         """주식체결통보 데이터 처리"""
         try:
-            # 콜백 함수들 실행
+            # 🚀 동기/비동기 콜백 함수들 실행
             for callback in self.callbacks["stock_execution"]:
-                await callback(data)
+                await self._execute_callback_safely(callback, data)
 
         except Exception as e:
             logger.error(f"주식체결통보 데이터 처리 실패: {e}")
+
+    async def _process_market_index_data(self, data: Dict):
+        """🆕 시장지수 데이터 처리 - H0UPCNT0"""
+        try:
+            # 🚀 시장지수 데이터 파싱 (H0UPCNT0 기준)
+            parsed_index_data = self._parse_market_index_data(data)
+
+            if parsed_index_data:
+                # 🚀 동기/비동기 콜백 함수들 실행
+                for callback in self.callbacks.get("market_index", []):
+                    await self._execute_callback_safely(callback, parsed_index_data)
+
+                # 디버그 로깅
+                index_code = parsed_index_data.get('index_code', 'UNKNOWN')
+                current_value = parsed_index_data.get('current_value', 0)
+                change_rate = parsed_index_data.get('change_rate', 0)
+
+                logger.debug(f"📊 시장지수 수신: {index_code} {current_value:,.2f} ({change_rate:+.2f}%)")
+
+        except Exception as e:
+            logger.error(f"시장지수 데이터 처리 실패: {e}")
+
+    async def _execute_callback_safely(self, callback: Callable, data: Dict):
+        """🚀 동기/비동기 콜백 함수 안전 실행"""
+        try:
+            import asyncio
+            import inspect
+
+            # 콜백이 코루틴 함수인지 확인
+            if inspect.iscoroutinefunction(callback):
+                # 비동기 함수: await로 호출
+                await callback(data)
+            else:
+                # 동기 함수: executor에서 실행 (메인 스레드 차단 방지)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, callback, data)
+
+        except Exception as e:
+            logger.error(f"콜백 실행 실패: {e}")
+
+    def _parse_market_index_data(self, data: Dict) -> Optional[Dict]:
+        """🆕 시장지수 데이터 파싱 (H0UPCNT0)"""
+        try:
+            # KIS API H0UPCNT0 응답 형식에 맞춘 파싱
+            if 'output' not in data:
+                return None
+
+            output = data['output']
+
+            # 주요 지수 정보 추출
+            parsed_data = {
+                'index_code': output.get('mksc_shrn_iscd', ''),  # 지수 코드
+                'index_name': output.get('hts_kor_isnm', ''),    # 지수명
+                'current_value': float(output.get('bstp_nmix_prpr', 0)),  # 현재 지수값
+                'change_value': float(output.get('bstp_nmix_prdy_vrss', 0)),  # 전일대비
+                'change_rate': float(output.get('prdy_vrss_rate', 0)),  # 등락률
+                'volume': int(output.get('acml_vol', 0)),  # 누적거래량
+                'transaction_amount': int(output.get('acml_tr_pbmn', 0)),  # 누적거래대금
+                'timestamp': now_kst(),
+                'market_status': output.get('bstp_cls_code', ''),  # 시장구분
+
+                # 추가 지수 정보
+                'high_value': float(output.get('bstp_nmix_hgpr', 0)),  # 최고가
+                'low_value': float(output.get('bstp_nmix_lwpr', 0)),   # 최저가
+                'open_value': float(output.get('bstp_nmix_oprc', 0)),  # 시가
+
+                # 원본 데이터 보존
+                'raw_data': output
+            }
+
+            return parsed_data
+
+        except Exception as e:
+            logger.error(f"시장지수 데이터 파싱 실패: {e}")
+            return None
 
     # ===== 메인 루프 =====
 
@@ -721,8 +800,8 @@ class KISWebSocketManager:
         kst = pytz.timezone('Asia/Seoul')
         now = datetime.now(kst)
 
-        if not KISRestAPIManager.is_market_open(now):
-            logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 웹소켓 연결 유지만 합니다")
+        #if not KISRestAPIManager.is_market_open(now):
+        #    logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 웹소켓 연결 유지만 합니다")
 
         try:
             async for message in self.websocket:
@@ -791,8 +870,8 @@ class PerformanceTracker:
     def update_score(self, stock_code: str, score: float):
         """점수 업데이트"""
         self.stock_scores[stock_code] = score
-        self.score_history[stock_code].append((datetime.now(), score))
-        self.last_update[stock_code] = datetime.now()
+        self.score_history[stock_code].append((now_kst(), score))
+        self.last_update[stock_code] = now_kst()
 
     def get_score(self, stock_code: str) -> float:
         """점수 조회"""
@@ -835,13 +914,13 @@ class RebalanceScheduler:
 
     def __init__(self, manager: KISWebSocketManager):
         self.manager = manager
-        self.last_rebalance = datetime.now()
+        self.last_rebalance = now_kst()
         self.rebalance_interval = timedelta(minutes=5)  # 5분마다
         self.rebalance_count = 0
 
     def should_rebalance(self) -> bool:
         """리밸런싱 필요 여부"""
-        now = datetime.now()
+        now = now_kst()
 
         if now - self.last_rebalance >= self.rebalance_interval:
             self.last_rebalance = now
