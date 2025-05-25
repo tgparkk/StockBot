@@ -100,11 +100,13 @@ class KISWebSocketManager:
         # REST API 관리자 (접속키 발급용)
         self.rest_api = KISRestAPIManager()
         self.approval_key = None  # 웹소켓 접속키
+        self.approval_key_created_at = None  # 접속키 발급 시간
 
         # 웹소켓 연결 정보
         self.websocket = None
         self.is_connected = False
         self.encryption_keys = {}  # 암호화 키 저장
+        self.connection_start_time = None  # 연결 시작 시간
 
         # 최적화 구독 관리
         self.current_subscriptions: Dict[str, SubscriptionSlot] = {}
@@ -131,7 +133,9 @@ class KISWebSocketManager:
             'total_subscriptions': 0,
             'subscription_changes': 0,
             'performance_upgrades': 0,
-            'emergency_additions': 0
+            'emergency_additions': 0,
+            'reconnection_count': 0,
+            'approval_key_renewals': 0
         }
 
     def _init_allocation_strategies(self) -> Dict[TradingTimeSlot, AllocationStrategy]:
@@ -203,19 +207,39 @@ class KISWebSocketManager:
             # 웹소켓 접속키 발급
             logger.info("웹소켓 접속키 발급 중...")
             self.approval_key = self.rest_api.get_websocket_approval_key()
+            self.approval_key_created_at = now_kst()
+            logger.info(f"웹소켓 접속키 발급 성공: {self.approval_key[:10]}...")
 
-            logger.info("웹소켓 연결 시작...")
+            logger.info(f"웹소켓 연결 시작... (URL: {self.WS_ENDPOINTS['real_time']})")
+            
+            # ⚠️ keepalive 설정 추가 (연결 유지)
             self.websocket = await websockets.connect(
                 self.WS_ENDPOINTS["real_time"],
-                ping_interval=None,
-                ping_timeout=None
+                ping_interval=30,     # 30초마다 ping
+                ping_timeout=10,      # ping 응답 대기 10초
+                close_timeout=10,     # 연결 종료 대기 10초
+                max_size=2**20,       # 1MB 메시지 크기 제한
+                compression=None      # 압축 비활성화
             )
             self.is_connected = True
+            self.connection_start_time = now_kst()
             logger.info("웹소켓 연결 성공")
+            
+            # 연결 상태 정보 로깅
+            logger.debug(f"웹소켓 상태: open={getattr(self.websocket, 'open', True)}, "
+                        f"local_address={getattr(self.websocket, 'local_address', 'N/A')}, "
+                        f"remote_address={getattr(self.websocket, 'remote_address', 'N/A')}")
+            
             return True
 
         except Exception as e:
             logger.error(f"웹소켓 연결 실패: {e}")
+            # 상세 에러 정보 로깅
+            if hasattr(e, 'code'):
+                logger.error(f"연결 실패 코드: {e.code}")
+            if hasattr(e, 'reason'):
+                logger.error(f"연결 실패 이유: {e.reason}")
+            
             self.is_connected = False
             return False
 
@@ -223,6 +247,7 @@ class KISWebSocketManager:
         """웹소켓 연결 해제"""
         if self.websocket:
             try:
+                # websockets 라이브러리 버전에 따른 안전한 속성 접근
                 is_closed = getattr(self.websocket, 'closed', False)
                 if not is_closed:
                     await self.websocket.close()
@@ -803,20 +828,112 @@ class KISWebSocketManager:
         #if not KISRestAPIManager.is_market_open(now):
         #    logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 웹소켓 연결 유지만 합니다")
 
+        # 연결 상태 모니터링을 위한 변수들
+        last_message_time = datetime.now()
+        message_count = 0
+        
+        # 연결 상태 모니터링 태스크 시작
+        monitor_task = asyncio.create_task(self._monitor_connection_health())
+        
         try:
             async for message in self.websocket:
+                message_count += 1
+                last_message_time = datetime.now()
+                
+                # 주기적으로 연결 상태 로깅 (1000건마다)
+                if message_count % 1000 == 0:
+                    logger.debug(f"메시지 수신 상태: {message_count}건, "
+                                f"마지막 수신: {last_message_time.strftime('%H:%M:%S')}")
+                
                 await self._handle_message(message)
 
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("웹소켓 연결이 끊어졌습니다.")
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"🔌 웹소켓 연결이 끊어졌습니다. 코드: {e.code}, 이유: {e.reason}")
+            logger.info(f"📊 연결 통계: 총 메시지 {message_count}건, "
+                       f"마지막 메시지: {last_message_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # 연결 끊김 원인 분석
+            connection_duration = (datetime.now() - last_message_time).total_seconds()
+            logger.info(f"⏱️ 연결 끊김까지 시간: {connection_duration:.1f}초")
+            ``
+            # 일반적인 연결 끊김 원인들 체크
+            self._analyze_disconnect_reason(e, connection_duration, message_count)
+            
             self.is_connected = False
 
             # 장중이면 재연결 시도
             if KISRestAPIManager.is_market_open(datetime.now(kst)):
                 logger.info("장중 재연결 시도...")
                 await self._reconnect()
+        except websockets.exceptions.InvalidMessage as e:
+            logger.error(f"❌ 잘못된 메시지 수신: {e}")
+        except websockets.exceptions.ProtocolError as e:
+            logger.error(f"❌ 프로토콜 오류: {e}")
+        except websockets.exceptions.WebSocketException as e:
+            logger.error(f"❌ 웹소켓 일반 오류: {e}")
         except Exception as e:
-            logger.error(f"데이터 수신 중 오류: {e}")
+            logger.error(f"❌ 데이터 수신 중 예상치 못한 오류: {e}")
+            import traceback
+            logger.error(f"스택 트레이스:\n{traceback.format_exc()}")
+        finally:
+            # 모니터링 태스크 종료
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    def _analyze_disconnect_reason(self, exception: Exception, duration: float, message_count: int):
+        """연결 끊김 원인 분석"""
+        logger.info("🔍 연결 끊김 원인 분석:")
+        
+        # 1. 접속키 만료 체크
+        if hasattr(exception, 'code'):
+            if exception.code == 1000:
+                logger.info("  ✓ 정상 종료 (서버 또는 클라이언트 요청)")
+            elif exception.code == 1001:
+                logger.warning("  ⚠️ 서버 종료 또는 재시작")
+            elif exception.code == 1002:
+                logger.error("  ❌ 프로토콜 오류")
+            elif exception.code == 1003:
+                logger.error("  ❌ 지원하지 않는 데이터 타입")
+            elif exception.code == 1006:
+                logger.error("  ❌ 비정상 연결 종료 (네트워크 문제 가능성)")
+            elif exception.code == 1011:
+                logger.error("  ❌ 서버 내부 오류")
+            elif exception.code == 4000:
+                logger.error("  ❌ 인증 실패 또는 접속키 만료 가능성")
+            else:
+                logger.warning(f"  ❓ 알 수 없는 종료 코드: {exception.code}")
+        
+        # 2. 시간 기반 분석
+        if duration > 1800:  # 30분
+            logger.info("  💡 접속키 만료 가능성 (30분 이상 연결)")
+        elif duration < 60:  # 1분 미만
+            logger.warning("  ⚠️ 빠른 연결 끊김 - 인증 또는 프로토콜 문제 가능성")
+        
+        # 3. 메시지 수 기반 분석
+        if message_count == 0:
+            logger.error("  ❌ 메시지 수신 없음 - 구독 실패 또는 인증 문제")
+        elif message_count < 10:
+            logger.warning("  ⚠️ 적은 메시지 수신 - 구독 문제 가능성")
+        
+        # 4. 현재 구독 상태 확인
+        current_subs = len(self.current_subscriptions)
+        if current_subs > self.MAX_SUBSCRIPTIONS:
+            logger.error(f"  ❌ 구독 한도 초과: {current_subs}/{self.MAX_SUBSCRIPTIONS}")
+        elif current_subs == 0:
+            logger.warning("  ⚠️ 활성 구독 없음")
+        
+        # 5. 해결 방안 제시
+        logger.info("💡 해결 방안:")
+        if hasattr(exception, 'code') and exception.code in [4000, 1006]:
+            logger.info("  - 접속키 재발급 후 재연결")
+            logger.info("  - API 인증 정보 확인")
+        if duration > 1800:
+            logger.info("  - 주기적 재연결 스케줄링 검토")
+        if current_subs > 35:
+            logger.info("  - 구독 수 최적화 필요")
 
     async def _reconnect(self, max_attempts: int = 3):
         """웹소켓 재연결 시도"""
@@ -825,8 +942,19 @@ class KISWebSocketManager:
                 logger.info(f"재연결 시도 {attempt + 1}/{max_attempts}")
                 await asyncio.sleep(5)  # 5초 대기
 
+                # 접속키 유효성 확인 및 갱신
+                if not await self._ensure_approval_key_valid():
+                    logger.error("접속키 갱신 실패로 재연결 중단")
+                    continue
+
                 if await self.connect():
                     logger.info("재연결 성공")
+                    self.stats['reconnection_count'] += 1
+                    
+                    # 기존 구독들 재적용
+                    if self.current_subscriptions:
+                        await self._reapply_subscriptions()
+                    
                     return True
 
             except Exception as e:
@@ -857,6 +985,96 @@ class KISWebSocketManager:
             status['subscription_breakdown'] = dict(type_counts)
 
             return status
+
+    def _is_approval_key_valid(self) -> bool:
+        """접속키 유효성 확인 (KIS API는 일반적으로 30분 유효)"""
+        if not self.approval_key or not self.approval_key_created_at:
+            return False
+        
+        # 25분이 지나면 만료로 간주 (5분 여유)
+        elapsed = now_kst() - self.approval_key_created_at
+        return elapsed.total_seconds() < 1500  # 25분
+
+    async def _ensure_approval_key_valid(self):
+        """접속키 유효성 확인 및 갱신"""
+        if not self._is_approval_key_valid():
+            logger.info("🔑 접속키 만료 또는 없음. 새로 발급합니다...")
+            try:
+                self.approval_key = self.rest_api.get_websocket_approval_key()
+                self.approval_key_created_at = now_kst()
+                self.stats['approval_key_renewals'] += 1
+                logger.info(f"🔑 접속키 갱신 완료: {self.approval_key[:10]}...")
+                return True
+            except Exception as e:
+                logger.error(f"❌ 접속키 갱신 실패: {e}")
+                return False
+        return True
+
+    async def _monitor_connection_health(self):
+        """연결 상태 모니터링 (백그라운드 태스크)"""
+        while self.is_connected:
+            try:
+                await asyncio.sleep(100)  # 1분40초 마다 체크
+                
+                if not self.is_connected:
+                    break
+                
+                # 1. 접속키 유효성 체크
+                if not self._is_approval_key_valid():
+                    logger.warning("⚠️ 접속키 만료 임박. 재연결 준비...")
+                    # 접속키 만료시 재연결 트리거
+                    asyncio.create_task(self._proactive_reconnect())
+                
+                # 2. 연결 지속 시간 체크
+                if self.connection_start_time:
+                    connection_duration = (now_kst() - self.connection_start_time).total_seconds()
+                    if connection_duration > 1800:  # 30분 이상 연결시
+                        logger.info(f"⏰ 장시간 연결 ({connection_duration/60:.1f}분). 예방적 재연결 검토")
+                
+                # 3. 웹소켓 상태 체크
+                if self.websocket and getattr(self.websocket, 'closed', False):
+                    logger.warning("⚠️ 웹소켓이 닫혀있음을 감지. 재연결 시도...")
+                    self.is_connected = False
+                    asyncio.create_task(self._proactive_reconnect())
+                    break
+                    
+            except Exception as e:
+                logger.error(f"연결 상태 모니터링 오류: {e}")
+                await asyncio.sleep(60)  # 오류시 1분 대기
+
+    async def _proactive_reconnect(self):
+        """예방적 재연결"""
+        logger.info("🔄 예방적 재연결 시작...")
+        
+        # 기존 연결 정리
+        if self.websocket and not getattr(self.websocket, 'closed', True):
+            await self.disconnect()
+        
+        # 새로운 연결 시도
+        if await self.connect():
+            logger.info("✅ 예방적 재연결 성공")
+            # 기존 구독들 재적용
+            if self.current_subscriptions:
+                await self._reapply_subscriptions()
+        else:
+            logger.error("❌ 예방적 재연결 실패")
+
+    async def _reapply_subscriptions(self):
+        """기존 구독들 재적용"""
+        if not self.current_subscriptions:
+            return
+            
+        logger.info(f"🔄 기존 구독 재적용: {len(self.current_subscriptions)}건")
+        
+        reapply_count = 0
+        for subscription_key in list(self.current_subscriptions.keys()):
+            try:
+                await self.subscribe(subscription_key)
+                reapply_count += 1
+            except Exception as e:
+                logger.error(f"구독 재적용 실패: {subscription_key} - {e}")
+        
+        logger.info(f"✅ 구독 재적용 완료: {reapply_count}/{len(self.current_subscriptions)}건")
 
 
 class PerformanceTracker:
