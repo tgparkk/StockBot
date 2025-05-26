@@ -184,8 +184,21 @@ class SimpleHybridDataManager:
                     )
             else:
                 # 웹소켓이 실행 중이 아니면 시작
-                self._start_websocket_if_needed()
-                success = True
+                if self._start_websocket_if_needed():
+                    # 웹소켓 시작 후 구독 시도
+                    time.sleep(0.5)  # 연결 대기
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        success = loop.run_until_complete(
+                            self.websocket_manager.subscribe_stock(stock_code, self._websocket_callback)
+                        )
+                        loop.close()
+                    except Exception as e:
+                        logger.error(f"웹소켓 구독 오류: {stock_code} - {e}")
+                        success = False
+                else:
+                    success = False
 
             if success:
                 self.realtime_stocks.append(stock_code)
@@ -353,8 +366,75 @@ class SimpleHybridDataManager:
                 logger.error(f"종목 폴링 오류: {stock_code} - {e}")
 
     def _data_callback(self, stock_code: str, data: Dict) -> None:
-        """실시간 데이터 콜백"""
+        """실시간 데이터 콜백 (폴링용)"""
         self._process_data_update(stock_code, data)
+
+    def _websocket_callback(self, stock_code: str, data: Dict) -> None:
+        """웹소켓 실시간 데이터 콜백"""
+        try:
+            logger.debug(f"웹소켓 데이터 수신: {stock_code} - {data.get('current_price', 0):,}원")
+            self._process_data_update(stock_code, data)
+        except Exception as e:
+            logger.error(f"웹소켓 콜백 오류: {stock_code} - {e}")
+
+    def _start_websocket_if_needed(self) -> bool:
+        """필요시 웹소켓 시작"""
+        try:
+            if self.websocket_running:
+                return True
+
+            # 웹소켓 연결 시작
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            async def start_websocket():
+                try:
+                    # 웹소켓 연결
+                    if await self.websocket_manager.connect():
+                        self.websocket_running = True
+                        logger.info("✅ 웹소켓 연결 성공")
+
+                        # 백그라운드에서 메시지 처리 시작
+                        self.websocket_task = asyncio.create_task(
+                            self.websocket_manager.start_listening()
+                        )
+                        return True
+                    else:
+                        logger.error("❌ 웹소켓 연결 실패")
+                        return False
+                except Exception as e:
+                    logger.error(f"웹소켓 시작 오류: {e}")
+                    return False
+
+            # 새 스레드에서 웹소켓 실행
+            def run_websocket():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    success = loop.run_until_complete(start_websocket())
+                    if success:
+                        # 연결 후 메시지 처리 루프 시작
+                        loop.run_until_complete(self.websocket_manager._message_handler())
+                except Exception as e:
+                    logger.error(f"웹소켓 루프 오류: {e}")
+                finally:
+                    loop.close()
+
+            websocket_thread = threading.Thread(
+                target=run_websocket,
+                name="WebSocketManager",
+                daemon=True
+            )
+            websocket_thread.start()
+
+            # 짧은 대기 후 연결 상태 확인
+            import time
+            time.sleep(1)
+            return self.websocket_running
+
+        except Exception as e:
+            logger.error(f"웹소켓 시작 실패: {e}")
+            return False
 
     def _process_data_update(self, stock_code: str, data: Dict) -> None:
         """데이터 업데이트 처리"""
@@ -486,9 +566,35 @@ class SimpleHybridDataManager:
 
     # === 정리 ===
 
+    def _stop_websocket(self) -> None:
+        """웹소켓 정리"""
+        try:
+            if self.websocket_running:
+                # 웹소켓 태스크 취소
+                if self.websocket_task and not self.websocket_task.done():
+                    self.websocket_task.cancel()
+
+                # 웹소켓 매니저 정리
+                if hasattr(self.websocket_manager, 'cleanup'):
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(self.websocket_manager.cleanup())
+                    finally:
+                        loop.close()
+
+                self.websocket_running = False
+                logger.info("웹소켓 정리 완료")
+
+        except Exception as e:
+            logger.error(f"웹소켓 정리 오류: {e}")
+
     def cleanup(self) -> None:
         """리소스 정리"""
         logger.info("스마트 하이브리드 데이터 관리자 정리 중...")
+
+        # 웹소켓 중지
+        self._stop_websocket()
 
         # 폴링 중지
         self.stop_polling()
