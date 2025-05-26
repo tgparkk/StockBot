@@ -183,6 +183,9 @@ class StockBotMain:
         # 2. 체결통보 구독
         await self._setup_execution_notification()
 
+        # 2.5. ⭐ 초기 구독 설정 (웹소켓 연결 유지)
+        await self._setup_initial_subscriptions()
+
         # 3. 하이브리드 데이터 매니저 시작
         self.data_manager.start_polling()
 
@@ -217,6 +220,43 @@ class StockBotMain:
         else:
             logger.error("❌ 체결통보 구독 실패")
             raise Exception("체결통보 구독 실패")
+
+    async def _setup_initial_subscriptions(self):
+        """⭐ 초기 구독 설정 - 연결 유지를 위한 최소한의 구독"""
+        logger.info("📡 웹소켓 연결 유지를 위한 최소 구독 설정")
+        
+        # 1. ⭐ 체결통보가 이미 구독되어 있는지 확인
+        existing_subscriptions = len(self.websocket_manager.current_subscriptions)
+        if existing_subscriptions > 0:
+            logger.info(f"✅ 기존 구독 {existing_subscriptions}건 확인됨 (체결통보 포함)")
+            logger.info("✅ 연결 유지를 위한 구독이 이미 설정되어 있습니다")
+            return
+        
+        # 2. 체결통보 구독이 실패했을 경우에만 시장 지수 구독 시도
+        logger.warning("⚠️ 기존 구독이 없습니다. 연결 유지를 위한 최소 구독을 설정합니다")
+        
+        # 시장 지수만 구독 (하드코딩 종목 제거)
+        market_indices = ["KOSPI", "KOSDAQ"]
+        successful_subscriptions = 0
+        
+        for index_code in market_indices:
+            subscription_key = f"{SubscriptionType.MARKET_INDEX.value}|{index_code}"
+            success = await self.websocket_manager.subscribe(subscription_key)
+            if success:
+                successful_subscriptions += 1
+                logger.debug(f"✅ 연결유지 시장지수 구독: {index_code}")
+            else:
+                logger.warning(f"❌ 시장지수 구독 실패: {index_code}")
+        
+        # 3. 구독 결과 확인
+        total_subscriptions = len(self.websocket_manager.current_subscriptions)
+        
+        if total_subscriptions == 0:
+            logger.error("❌ 모든 구독 실패 - 웹소켓 연결이 불안정할 수 있습니다")
+            logger.warning("🔄 strategy_scheduler가 시작되면 동적으로 종목 구독을 시도합니다")
+        else:
+            logger.info(f"✅ 연결 유지 구독 완료: {total_subscriptions}건")
+            logger.info("📋 실제 거래 종목은 strategy_scheduler가 동적으로 관리합니다")
 
     def handle_execution_notification(self, data: Dict):
         """체결통보 처리 - 자동 호출됨 (WebSocket → 포지션 관리)"""
