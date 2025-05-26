@@ -3,19 +3,17 @@
 별도 스레드에서 실행되어 실시간 명령 처리
 """
 import asyncio
-import os
 import threading
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-from dotenv import load_dotenv
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from utils.logger import setup_logger
 from database.db_manager import db_manager
 from utils.korean_time import now_kst, now_kst_time
 
-# 환경변수 로드
-load_dotenv()
+# 설정 import (settings.py에서 .env 파일을 읽어서 제공)
+from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID
 
 logger = setup_logger(__name__)
 
@@ -26,9 +24,9 @@ class TelegramBot:
         # StockBot 메인 인스턴스 참조
         self.stock_bot = stock_bot_instance
 
-        # 텔레그램 설정
-        self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        # 텔레그램 설정 (settings.py에서 가져옴)
+        self.bot_token = TELEGRAM_BOT_TOKEN
+        self.chat_id = TELEGRAM_ADMIN_ID
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 설정되지 않았습니다.")

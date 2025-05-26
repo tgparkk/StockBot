@@ -16,6 +16,7 @@ yfinance>=0.2.0
 
 # 환경 변수 관리
 python-dotenv>=1.0.0
+PyYAML>=6.0.0
 
 # 로깅
 loguru>=0.7.0

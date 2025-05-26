@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Optional, List, Any, Dict, Tuple
 from core.strategy.base import MarketData
 from utils.logger import setup_logger
+from utils.korean_time import now_kst
 
 logger = setup_logger(__name__)
 
