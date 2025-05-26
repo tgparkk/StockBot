@@ -25,7 +25,7 @@ from core.position_manager import PositionManager
 from core.strategy_scheduler import StrategyScheduler
 from core.rest_api_manager import KISRestAPIManager
 from core.hybrid_data_manager import SimpleHybridDataManager
-from core.websocket_manager import KISWebSocketManager
+from core.kis_websocket_manager import KISWebSocketManager
 
 # 텔레그램 봇
 from telegram_bot.bot import TelegramBot
@@ -156,8 +156,13 @@ class StockBot:
         if self.websocket_manager:
             try:
                 # WebSocket 관리자 정리 (cleanup 메서드 사용)
-                if hasattr(self.websocket_manager, 'cleanup'):
-                    self.websocket_manager.cleanup()
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self.websocket_manager.cleanup())
+                finally:
+                    loop.close()
                 logger.info("✅ WebSocket 관리자 정리 완료")
             except Exception as e:
                 logger.error(f"❌ WebSocket 정리 오류: {e}")
@@ -207,7 +212,8 @@ class StockBot:
         """텔레그램 봇 시작"""
         try:
             def run_telegram_bot():
-                self.telegram_bot.start_bot()
+                if self.telegram_bot:
+                    self.telegram_bot.start_bot()
 
             telegram_thread = threading.Thread(
                 target=run_telegram_bot,
@@ -276,6 +282,47 @@ class StockBot:
             try:
                 # 포지션별 현재가 업데이트
                 self.position_manager.update_position_prices()
+
+                # 매도 조건 확인 및 자동 매도 실행
+                sell_signals = self.position_manager.check_exit_conditions()
+                for sell_signal in sell_signals:
+                    try:
+                        logger.info(f"🚨 매도 조건 발생: {sell_signal['stock_code']} - {sell_signal['reason']}")
+
+                                                # 자동 매도용 지정가 계산
+                        current_price = sell_signal['current_price']
+                        strategy_type = sell_signal['strategy_type']
+                        auto_sell_price = self._calculate_sell_price(current_price, strategy_type, is_auto_sell=True)
+
+                        # 자동 매도 실행 (지정가)
+                        order_no = self.trading_manager.execute_order(
+                            stock_code=sell_signal['stock_code'],
+                            order_type="SELL",
+                            quantity=sell_signal['quantity'],
+                            price=auto_sell_price,  # 계산된 자동매도 지정가
+                            strategy_type=f"auto_sell_{sell_signal['reason']}"
+                        )
+
+                        if order_no:
+                            # 포지션 제거
+                            self.position_manager.remove_position(
+                                sell_signal['stock_code'],
+                                sell_signal['quantity'],
+                                auto_sell_price
+                            )
+
+                            self.stats['orders_executed'] += 1
+                            self.stats['positions_closed'] += 1
+
+                            logger.info(f"✅ 자동 매도 주문 완료: {sell_signal['stock_code']} {sell_signal['quantity']:,}주 @ {auto_sell_price:,}원 (현재가: {current_price:,}원)")
+
+                            # 텔레그램 알림 (업데이트된 정보로)
+                            sell_signal['auto_sell_price'] = auto_sell_price
+                            if self.telegram_bot:
+                                self._send_auto_sell_notification(sell_signal, order_no)
+
+                    except Exception as e:
+                        logger.error(f"자동 매도 실행 오류: {sell_signal['stock_code']} - {e}")
 
                 # 1분마다 업데이트
                 self.shutdown_event.wait(timeout=60)
@@ -415,6 +462,84 @@ class StockBot:
             except Exception as e:
                 logger.error(f"텔레그램 알림 전송 오류: {e}")
 
+    def _calculate_buy_price(self, current_price: int, strategy: str = 'default') -> int:
+        """매수 지정가 계산 (현재가 기준)"""
+        try:
+            # 전략별 매수 프리미엄 설정
+            buy_premiums = {
+                'gap_trading': 0.01,      # 갭 거래: 1.0% 위
+                'volume_breakout': 0.012,  # 거래량 돌파: 1.2% 위
+                'momentum': 0.015,         # 모멘텀: 1.5% 위
+                'default': 0.005           # 기본: 0.5% 위
+            }
+
+            premium = buy_premiums.get(strategy, buy_premiums['default'])
+
+            # 계산된 매수가 (상승여력 고려)
+            buy_price = int(current_price * (1 + premium))
+
+            # 호가 단위로 조정
+            buy_price = self._adjust_to_tick_size(buy_price)
+
+            logger.debug(f"매수가 계산: {current_price:,}원 → {buy_price:,}원 (프리미엄: {premium:.1%})")
+            return buy_price
+
+        except Exception as e:
+            logger.error(f"매수가 계산 오류: {e}")
+            return int(current_price * 1.005)  # 기본 0.5% 프리미엄
+
+    def _calculate_sell_price(self, current_price: int, strategy: str = 'default', is_auto_sell: bool = False) -> int:
+        """매도 지정가 계산 (현재가 기준)"""
+        try:
+            if is_auto_sell:
+                # 자동매도시 빠른 체결을 위해 더 낮은 가격
+                discount = 0.008  # 0.8% 할인
+            else:
+                # 전략별 매도 할인 설정
+                sell_discounts = {
+                    'gap_trading': 0.005,    # 갭 거래: 0.5% 아래
+                    'volume_breakout': 0.006, # 거래량 돌파: 0.6% 아래
+                    'momentum': 0.004,       # 모멘텀: 0.4% 아래
+                    'default': 0.005         # 기본: 0.5% 아래
+                }
+                discount = sell_discounts.get(strategy, sell_discounts['default'])
+
+            # 계산된 매도가 (빠른 체결 고려)
+            sell_price = int(current_price * (1 - discount))
+
+            # 호가 단위로 조정
+            sell_price = self._adjust_to_tick_size(sell_price)
+
+            logger.debug(f"매도가 계산: {current_price:,}원 → {sell_price:,}원 (할인: {discount:.1%})")
+            return sell_price
+
+        except Exception as e:
+            logger.error(f"매도가 계산 오류: {e}")
+            return int(current_price * 0.995)  # 기본 0.5% 할인
+
+    def _adjust_to_tick_size(self, price: int) -> int:
+        """호가 단위로 가격 조정"""
+        try:
+            # 한국 주식 호가 단위
+            if price < 1000:
+                return price  # 1원 단위
+            elif price < 5000:
+                return (price // 5) * 5  # 5원 단위
+            elif price < 10000:
+                return (price // 10) * 10  # 10원 단위
+            elif price < 50000:
+                return (price // 50) * 50  # 50원 단위
+            elif price < 100000:
+                return (price // 100) * 100  # 100원 단위
+            elif price < 500000:
+                return (price // 500) * 500  # 500원 단위
+            else:
+                return (price // 1000) * 1000  # 1000원 단위
+
+        except Exception as e:
+            logger.error(f"호가 단위 조정 오류: {e}")
+            return price
+
     def _signal_handler(self, signum, frame):
         """시스템 신호 처리"""
         logger.info(f"🛑 종료 신호 수신: {signum}")
@@ -434,11 +559,215 @@ class StockBot:
             if self.telegram_bot:
                 self._send_signal_notification(signal)
 
-            # 실제 거래는 여기서 구현
-            # TODO: 실제 매수/매도 로직 추가
+            # 실제 거래 로직
+            if signal['signal_type'] == 'BUY':
+                success = self._execute_buy_signal(signal)
+                if success:
+                    self.stats['orders_executed'] += 1
+                    self.stats['positions_opened'] += 1
+            elif signal['signal_type'] == 'SELL':
+                success = self._execute_sell_signal(signal)
+                if success:
+                    self.stats['orders_executed'] += 1
+                    self.stats['positions_closed'] += 1
 
         except Exception as e:
             logger.error(f"거래 신호 처리 오류: {e}")
+
+    def _execute_buy_signal(self, signal: dict) -> bool:
+        """매수 신호 실행"""
+        try:
+            stock_code = signal['stock_code']
+            strategy = signal['strategy']
+            price = signal.get('price', 0)
+            strength = signal.get('strength', 0.5)
+
+            # 1. 포지션 중복 체크
+            existing_positions = self.position_manager.get_positions('active')
+            if stock_code in existing_positions:
+                logger.warning(f"이미 보유 중인 종목: {stock_code}")
+                return False
+
+            # 2. 잔고 확인
+            balance = self.trading_manager.get_balance()
+            available_cash = balance.get('available_cash', 0)
+
+            if available_cash < 10000:  # 최소 1만원
+                logger.warning(f"잔고 부족: {available_cash:,}원")
+                return False
+
+            # 3. 최신 현재가 조회 (정확한 가격 계산을 위해)
+            current_data = self.data_manager.get_latest_data(stock_code)
+            if not current_data or current_data.get('status') != 'success':
+                logger.error(f"현재가 조회 실패: {stock_code}")
+                return False
+
+            current_price = current_data.get('current_price', 0)
+            if current_price <= 0:
+                logger.error(f"유효하지 않은 현재가: {stock_code} = {current_price}")
+                return False
+
+            # 4. 지정가 계산 (전략별 프리미엄 적용)
+            buy_price = self._calculate_buy_price(current_price, strategy)
+
+            # 5. 매수 수량 계산 (신호 강도에 따라 조절)
+            position_size = min(available_cash * 0.1 * strength, available_cash * 0.05)  # 잔고의 5-10%
+            quantity = int(position_size // buy_price) if buy_price > 0 else 0
+
+            if quantity <= 0:
+                logger.warning(f"매수 수량 부족: {stock_code} 현재가={current_price:,}원, 매수가={buy_price:,}원")
+                return False
+
+            # 최종 매수 금액 확인
+            total_buy_amount = quantity * buy_price
+            if total_buy_amount > available_cash:
+                # 수량 재조정
+                quantity = int(available_cash // buy_price)
+                total_buy_amount = quantity * buy_price
+                logger.info(f"매수 수량 재조정: {stock_code} {quantity}주, 총액={total_buy_amount:,}원")
+
+            # 6. 실제 매수 주문 (지정가)
+            order_no = self.trading_manager.execute_order(
+                stock_code=stock_code,
+                order_type="BUY",
+                quantity=quantity,
+                price=buy_price,  # 계산된 지정가
+                strategy_type=strategy
+            )
+
+            if order_no:
+                # 포지션 추가
+                self.position_manager.add_position(
+                    stock_code=stock_code,
+                    quantity=quantity,
+                    buy_price=buy_price,
+                    strategy_type=strategy
+                )
+
+                logger.info(f"✅ 매수 주문 완료: {stock_code} {quantity:,}주 @ {buy_price:,}원 (현재가: {current_price:,}원, 주문번호: {order_no})")
+
+                # 텔레그램 알림
+                if self.telegram_bot:
+                    self._send_order_notification('매수', stock_code, quantity, buy_price, strategy)
+
+                return True
+            else:
+                logger.error(f"❌ 매수 주문 실패: {stock_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"매수 신호 실행 오류: {e}")
+            return False
+
+    def _execute_sell_signal(self, signal: dict) -> bool:
+        """매도 신호 실행"""
+        try:
+            stock_code = signal['stock_code']
+            strategy = signal['strategy']
+            price = signal.get('price', 0)
+
+            # 1. 포지션 확인
+            existing_positions = self.position_manager.get_positions('active')
+            if stock_code not in existing_positions:
+                logger.warning(f"보유하지 않은 종목: {stock_code}")
+                return False
+
+            position = existing_positions[stock_code]
+            quantity = position.get('quantity', 0)
+            if quantity <= 0:
+                logger.warning(f"매도할 수량이 없음: {stock_code}")
+                return False
+
+            # 2. 최신 현재가 조회 (정확한 가격 계산을 위해)
+            current_data = self.data_manager.get_latest_data(stock_code)
+            if not current_data or current_data.get('status') != 'success':
+                logger.error(f"현재가 조회 실패: {stock_code}")
+                return False
+
+            current_price = current_data.get('current_price', 0)
+            if current_price <= 0:
+                logger.error(f"유효하지 않은 현재가: {stock_code} = {current_price}")
+                return False
+
+            # 3. 지정가 계산 (전략별 할인 적용)
+            sell_price = self._calculate_sell_price(current_price, strategy, is_auto_sell=False)
+
+            # 4. 실제 매도 주문 (지정가)
+            order_no = self.trading_manager.execute_order(
+                stock_code=stock_code,
+                order_type="SELL",
+                quantity=quantity,
+                price=sell_price,  # 계산된 지정가
+                strategy_type=strategy
+            )
+
+            if order_no:
+                # 포지션 제거 (실제 체결가는 매도가로 기록)
+                self.position_manager.remove_position(stock_code, quantity, sell_price)
+
+                # 수익률 계산
+                buy_price = position.get('buy_price', sell_price)
+                profit_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+
+                logger.info(f"✅ 매도 주문 완료: {stock_code} {quantity:,}주 @ {sell_price:,}원 (현재가: {current_price:,}원, 수익률: {profit_rate:.2f}%, 주문번호: {order_no})")
+
+                # 텔레그램 알림
+                if self.telegram_bot:
+                    self._send_order_notification('매도', stock_code, quantity, sell_price, strategy)
+
+                return True
+            else:
+                logger.error(f"❌ 매도 주문 실패: {stock_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"매도 신호 실행 오류: {e}")
+            return False
+
+    def _send_order_notification(self, order_type: str, stock_code: str, quantity: int, price: int, strategy: str):
+        """주문 알림 전송"""
+        try:
+            total_amount = quantity * price
+            message = (
+                f"🎯 {order_type} 주문 체결\n"
+                f"종목: {stock_code}\n"
+                f"수량: {quantity:,}주\n"
+                f"가격: {price:,}원\n"
+                f"금액: {total_amount:,}원\n"
+                f"전략: {strategy}\n"
+                f"시간: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            self._send_telegram_notification(message)
+        except Exception as e:
+            logger.error(f"주문 알림 전송 오류: {e}")
+
+    def _send_auto_sell_notification(self, sell_signal: dict, order_no: str):
+        """자동 매도 알림 전송"""
+        try:
+            stock_code = sell_signal['stock_code']
+            quantity = sell_signal['quantity']
+            current_price = sell_signal['current_price']
+            auto_sell_price = sell_signal.get('auto_sell_price', current_price)
+            profit_rate = sell_signal['profit_rate']
+            reason = sell_signal['reason']
+
+            total_amount = quantity * auto_sell_price
+
+            message = (
+                f"🤖 자동 매도 주문 완료\n"
+                f"종목: {stock_code}\n"
+                f"수량: {quantity:,}주\n"
+                f"주문가: {auto_sell_price:,}원\n"
+                f"현재가: {current_price:,}원\n"
+                f"주문금액: {total_amount:,}원\n"
+                f"수익률: {profit_rate:.2f}%\n"
+                f"사유: {reason}\n"
+                f"주문번호: {order_no}\n"
+                f"시간: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            self._send_telegram_notification(message)
+        except Exception as e:
+            logger.error(f"자동 매도 알림 전송 오류: {e}")
 
     def _send_signal_notification(self, signal: dict):
         """신호 알림 전송"""
