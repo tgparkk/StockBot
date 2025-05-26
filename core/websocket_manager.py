@@ -1,1254 +1,268 @@
 """
-통합 WebSocket 관리자
-KIS API WebSocket 41건 제한 최적화 + 실시간 데이터 수신
+KIS WebSocket 통합 관리자 (리팩토링 버전)
+공식 문서 기반 + 41건 제한 최적화
 """
-import os
 import json
 import asyncio
-import threading
-import websockets
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple, Callable, Any
-from dataclasses import dataclass, field
-from enum import Enum
-from collections import defaultdict, deque
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
-from base64 import b64decode
-from dotenv import load_dotenv
+from typing import Dict, List, Optional, Callable, Any
+from datetime import datetime
 from utils.logger import setup_logger
-from utils.korean_time import now_kst, now_kst_time
-from .rest_api_manager import KISRestAPIManager
-import pytz
-
-# 환경변수 로드
-load_dotenv('config/.env')
+from .kis_websocket_client import KISWebSocketClient
+from .kis_subscription_manager import KISSubscriptionManager, Subscription
+from .kis_data_parsers import (
+    parse_stock_price_data,
+    parse_stock_orderbook_data,
+    parse_stock_execution_data,
+    parse_market_index_data
+)
 
 logger = setup_logger(__name__)
 
-class SubscriptionType(Enum):
-    """구독 타입"""
-    STOCK_PRICE = "H0STCNT0"      # 주식체결가
-    STOCK_ORDERBOOK = "H0STASP0"  # 주식호가
-    STOCK_EXECUTION = "H0STCNI9"  # 주식체결통보
-    MARKET_INDEX = "H0UPCNT0"     # 지수
-
-class TradingTimeSlot(Enum):
-    """거래 시간대"""
-    PRE_MARKET = "pre_market"       # 08:30-09:00
-    GOLDEN_TIME = "golden_time"     # 09:00-09:30 (Gap Trading 집중)
-    MORNING_TREND = "morning_trend" # 09:30-11:30 (주도주 시간)
-    LUNCH_TIME = "lunch_time"       # 11:30-14:00 (점심 시간)
-    CLOSING_TREND = "closing_trend" # 14:00-15:20 (마감 추세)
-    AFTER_MARKET = "after_market"   # 15:20-15:30
-
-@dataclass
-class SubscriptionSlot:
-    """구독 슬롯"""
-    stock_code: str
-    subscription_type: SubscriptionType
-    priority: int = 0              # 우선순위 (높을수록 중요)
-    strategy_name: str = ""        # 전략명
-    performance_score: float = 0.0 # 성과 점수
-    created_at: datetime = field(default_factory=datetime.now)
-    last_activity: datetime = field(default_factory=datetime.now)
-
-    @property
-    def subscription_key(self) -> str:
-        """구독 키 생성"""
-        return f"{self.subscription_type.value}|{self.stock_code}"
-
-@dataclass
-class AllocationStrategy:
-    """할당 전략"""
-    name: str
-    max_realtime_stocks: int      # 실시간 종목 수 (체결가+호가)
-    max_semi_realtime_stocks: int # 준실시간 종목 수 (체결가만)
-    market_indices_count: int     # 시장 지수 수
-    reserve_slots: int            # 예비 슬롯
-    strategy_weights: Dict[str, float] = field(default_factory=dict)
-
-    @property
-    def total_slots(self) -> int:
-        """총 사용 슬롯 수"""
-        return (self.max_realtime_stocks * 2 +  # 체결가 + 호가
-                self.max_semi_realtime_stocks +   # 체결가만
-                self.market_indices_count +       # 지수
-                self.reserve_slots)               # 예비
 
 class KISWebSocketManager:
-    """통합 WebSocket 관리자 (연결 + 최적화)"""
+    """통합 WebSocket 관리자"""
 
-    # 웹소켓 엔드포인트
-    WS_ENDPOINTS = {
-        "real_time": "ws://ops.koreainvestment.com:21000",  # 실시간 데이터
-    }
-
-    # 최대 구독 제한
-    MAX_SUBSCRIPTIONS = 41  # KIS API 제한
-
-    def __init__(self):
+    def __init__(self, is_demo: bool = False):
         """초기화"""
-        # API 인증 정보
-        self.app_key = os.getenv('KIS_APP_KEY')
-        self.app_secret = os.getenv('KIS_APP_SECRET')
-        self.hts_id = os.getenv('KIS_HTS_ID')
+        # 클라이언트 및 관리자
+        self.client = KISWebSocketClient(is_demo)
+        self.subscription_manager = KISSubscriptionManager()
 
-        if not all([self.app_key, self.app_secret]):
-            raise ValueError("웹소켓 인증 정보가 설정되지 않았습니다. .env 파일을 확인하세요.")
-
-        # REST API 관리자 (접속키 발급용)
-        self.rest_api = KISRestAPIManager()
-        self.approval_key = None  # 웹소켓 접속키
-        self.approval_key_created_at = None  # 접속키 발급 시간
-
-        # 웹소켓 연결 정보
-        self.websocket = None
-        self.is_connected = False
-        self.encryption_keys = {}  # 암호화 키 저장
-        self.connection_start_time = None  # 연결 시작 시간
-
-        # 최적화 구독 관리
-        self.current_subscriptions: Dict[str, SubscriptionSlot] = {}
-        self.subscription_lock = threading.RLock()
-
-        # 시간대별 할당 전략
-        self.allocation_strategies = self._init_allocation_strategies()
-        self.current_strategy: Optional[AllocationStrategy] = None
-
-        # 성과 추적
-        self.performance_tracker = PerformanceTracker()
-        self.rebalance_scheduler = RebalanceScheduler(self)
+        # 메시지 처리 핸들러 설정
+        # self.client.set_message_handler(self._handle_message)  # 비동기 호환성 문제로 주석 처리
 
         # 콜백 함수들
         self.callbacks = {
-            "stock_price": [],      # 주식체결가 콜백
-            "stock_orderbook": [],  # 주식호가 콜백
-            "stock_execution": [],  # 주식체결통보 콜백
-            "market_index": []      # 🆕 시장지수 콜백
+            'stock_price': [],      # 주식체결가 (H0STCNT0)
+            'stock_orderbook': [],  # 주식호가 (H0STASP0)
+            'stock_execution': [],  # 주식체결통보 (H0STCNI0/H0STCNI9)
+            'market_index': []      # 시장지수 (H0UPCNT0)
         }
+
+        # 암호화 키 저장 (체결통보용)
+        self.encryption_keys = {}
 
         # 통계
         self.stats = {
-            'total_subscriptions': 0,
-            'subscription_changes': 0,
-            'performance_upgrades': 0,
-            'emergency_additions': 0,
-            'reconnection_count': 0,
-            'approval_key_renewals': 0
+            'messages_received': 0,
+            'data_processed': 0,
+            'errors': 0,
+            'last_message_time': None
         }
-
-    def _init_allocation_strategies(self) -> Dict[TradingTimeSlot, AllocationStrategy]:
-        """시간대별 할당 전략 초기화"""
-        strategies = {
-            TradingTimeSlot.GOLDEN_TIME: AllocationStrategy(
-                name="Gap Trading 집중",
-                max_realtime_stocks=8,      # 16슬롯 (체결가+호가)
-                max_semi_realtime_stocks=15, # 15슬롯 (체결가만)
-                market_indices_count=5,      # 5슬롯 (KOSPI, KOSDAQ 등)
-                reserve_slots=5,             # 5슬롯 (긴급용)
-                strategy_weights={
-                    'gap_trading': 1.0,
-                    'volume_breakout': 0.5,
-                    'momentum': 0.3
-                }
-            ),
-
-            TradingTimeSlot.MORNING_TREND: AllocationStrategy(
-                name="주도주 포착",
-                max_realtime_stocks=6,       # 12슬롯
-                max_semi_realtime_stocks=18, # 18슬롯
-                market_indices_count=5,      # 5슬롯
-                reserve_slots=6,             # 6슬롯
-                strategy_weights={
-                    'volume_breakout': 0.7,
-                    'momentum': 0.6,
-                    'gap_trading': 0.3
-                }
-            ),
-
-            TradingTimeSlot.LUNCH_TIME: AllocationStrategy(
-                name="거래량 모니터링",
-                max_realtime_stocks=5,       # 10슬롯
-                max_semi_realtime_stocks=20, # 20슬롯
-                market_indices_count=5,      # 5슬롯
-                reserve_slots=6,             # 6슬롯
-                strategy_weights={
-                    'volume_breakout': 0.8,
-                    'momentum': 0.4
-                }
-            ),
-
-            TradingTimeSlot.CLOSING_TREND: AllocationStrategy(
-                name="마감 추세",
-                max_realtime_stocks=7,       # 14슬롯
-                max_semi_realtime_stocks=16, # 16슬롯
-                market_indices_count=5,      # 5슬롯
-                reserve_slots=6,             # 6슬롯
-                strategy_weights={
-                    'momentum': 0.8,
-                    'volume_breakout': 0.6
-                }
-            )
-        }
-
-        # 모든 전략이 41건 이하인지 확인
-        for slot, strategy in strategies.items():
-            if strategy.total_slots > self.MAX_SUBSCRIPTIONS:
-                logger.warning(f"{slot.value} 전략이 {strategy.total_slots}건으로 제한 초과")
-
-        return strategies
-
-    # ===== WebSocket 연결 관리 =====
 
     async def connect(self) -> bool:
         """웹소켓 연결"""
-        try:
-            # 웹소켓 접속키 발급
-            logger.info("웹소켓 접속키 발급 중...")
-            self.approval_key = self.rest_api.get_websocket_approval_key()
-            self.approval_key_created_at = now_kst()
-            logger.info(f"웹소켓 접속키 발급 성공: {self.approval_key[:10]}...")
-
-            logger.info(f"웹소켓 연결 시작... (URL: {self.WS_ENDPOINTS['real_time']})")
-            
-            # ⚠️ keepalive 설정 추가 (연결 유지)
-            self.websocket = await websockets.connect(
-                self.WS_ENDPOINTS["real_time"],
-                ping_interval=30,     # 30초마다 ping
-                ping_timeout=10,      # ping 응답 대기 10초
-                close_timeout=10,     # 연결 종료 대기 10초
-                max_size=2**20,       # 1MB 메시지 크기 제한
-                compression=None      # 압축 비활성화
-            )
-            self.is_connected = True
-            self.connection_start_time = now_kst()
-            logger.info("웹소켓 연결 성공")
-            
-            # 연결 상태 정보 로깅
-            logger.debug(f"웹소켓 상태: open={getattr(self.websocket, 'open', True)}, "
-                        f"local_address={getattr(self.websocket, 'local_address', 'N/A')}, "
-                        f"remote_address={getattr(self.websocket, 'remote_address', 'N/A')}")
-            
-            return True
-
-        except Exception as e:
-            logger.error(f"웹소켓 연결 실패: {e}")
-            # 상세 에러 정보 로깅
-            if hasattr(e, 'code'):
-                logger.error(f"연결 실패 코드: {e.code}")
-            if hasattr(e, 'reason'):
-                logger.error(f"연결 실패 이유: {e.reason}")
-            
-            self.is_connected = False
-            return False
+        return await self.client.connect()
 
     async def disconnect(self):
         """웹소켓 연결 해제"""
-        if self.websocket:
-            try:
-                # websockets 라이브러리 버전에 따른 안전한 속성 접근
-                is_closed = getattr(self.websocket, 'closed', False)
-                if not is_closed:
-                    await self.websocket.close()
-            except Exception as e:
-                logger.warning(f"웹소켓 연결 해제 중 오류: {e}")
-            finally:
-                self.is_connected = False
-                logger.info("웹소켓 연결 해제")
+        await self.client.disconnect()
 
-    # ===== 메시지 생성 =====
-
-    def _create_subscribe_message(self, tr_id: str, tr_key: str) -> str:
-        """구독 메시지 생성"""
-        message = {
-            "header": {
-                "appkey": self.app_key,           # ⭐ 누락된 필드 추가
-                "approval_key": self.approval_key,
-                "custtype": "P",
-                "tr_type": "1",
-                "content-type": "utf-8"
-            },
-            "body": {
-                "input": {
-                    "tr_id": tr_id,
-                    "tr_key": tr_key
-                }
-            }
-        }
-        return json.dumps(message, ensure_ascii=False)
-
-    def _create_unsubscribe_message(self, tr_id: str, tr_key: str) -> str:
-        """구독 해제 메시지 생성"""
-        message = {
-            "header": {
-                "appkey": self.app_key,           # ⭐ 누락된 필드 추가
-                "approval_key": self.approval_key,
-                "custtype": "P",
-                "tr_type": "2",
-                "content-type": "utf-8"
-            },
-            "body": {
-                "input": {
-                    "tr_id": tr_id,
-                    "tr_key": tr_key
-                }
-            }
-        }
-        return json.dumps(message, ensure_ascii=False)
-
-    # ===== 구독 기본 기능 =====
-
-    async def subscribe(self, subscription_key: str) -> bool:
-        """구독 키로 구독 (예: "H0STCNT0|005930")"""
-        if not self.is_connected:
-            logger.error("웹소켓이 연결되지 않았습니다.")
-            return False
-
-        try:
-            tr_id, stock_code = subscription_key.split("|")
-            message = self._create_subscribe_message(tr_id, stock_code)
-
-            await self.websocket.send(message)
-            logger.debug(f"구독 완료: {subscription_key}")
-            return True
-
-        except Exception as e:
-            logger.error(f"구독 실패: {subscription_key} - {e}")
-            return False
-
-    async def unsubscribe(self, subscription_key: str) -> bool:
-        """구독 해제"""
-        if not self.is_connected:
-            return False
-
-        try:
-            tr_id, stock_code = subscription_key.split("|")
-            message = self._create_unsubscribe_message(tr_id, stock_code)
-
-            await self.websocket.send(message)
-            logger.debug(f"구독 해제: {subscription_key}")
-            return True
-
-        except Exception as e:
-            logger.error(f"구독 해제 실패: {subscription_key} - {e}")
-            return False
-
-    # ===== 시간대별 최적화 전략 =====
-
-    def get_current_time_slot(self) -> TradingTimeSlot:
-        """현재 시간대 확인"""
-        now = now_kst()
-        current_time = now.time()
-
-        if current_time < datetime.strptime("09:00", "%H:%M").time():
-            return TradingTimeSlot.PRE_MARKET
-        elif current_time < datetime.strptime("09:30", "%H:%M").time():
-            return TradingTimeSlot.GOLDEN_TIME
-        elif current_time < datetime.strptime("11:30", "%H:%M").time():
-            return TradingTimeSlot.MORNING_TREND
-        elif current_time < datetime.strptime("14:00", "%H:%M").time():
-            return TradingTimeSlot.LUNCH_TIME
-        elif current_time < datetime.strptime("15:20", "%H:%M").time():
-            return TradingTimeSlot.CLOSING_TREND
-        else:
-            return TradingTimeSlot.AFTER_MARKET
-
-    async def switch_strategy(self, time_slot: TradingTimeSlot = None) -> bool:
-        """⭐ 원자적 전략 전환 (구독 공백 방지)"""
-        if time_slot is None:
-            time_slot = self.get_current_time_slot()
-
-        if time_slot not in self.allocation_strategies:
-            logger.warning(f"지원하지 않는 시간대: {time_slot}")
-            return False
-
-        new_strategy = self.allocation_strategies[time_slot]
-
-        with self.subscription_lock:
-            logger.info(f"🔄 전략 전환: {new_strategy.name} ({time_slot.value})")
-
-            # ⭐ Step 1: 새로운 구독 목록 생성 (기존 유지)
-            new_subscriptions = await self._prepare_new_subscriptions(new_strategy)
-            if not new_subscriptions:
-                logger.error("❌ 새 구독 준비 실패")
-                return False
-
-            # ⭐ Step 2: 중복되지 않는 기존 구독들만 해제
-            old_keys = set(self.current_subscriptions.keys())
-            new_keys = set(slot.subscription_key for slot in new_subscriptions)
-            
-            keys_to_remove = old_keys - new_keys  # 새로운 구독에 없는 것들만 해제
-            keys_to_keep = old_keys & new_keys    # 유지할 구독들
-            keys_to_add = new_keys - old_keys     # 새로 추가할 구독들
-
-            logger.info(f"📊 구독 변경: 제거 {len(keys_to_remove)}개, 유지 {len(keys_to_keep)}개, 추가 {len(keys_to_add)}개")
-
-            # ⭐ Step 3: 제거할 구독들만 해제 (공백 최소화)
-            for key in keys_to_remove:
-                await self.unsubscribe(key)
-                if key in self.current_subscriptions:
-                    del self.current_subscriptions[key]
-
-            # ⭐ Step 4: 새로운 구독들 추가
-            for slot in new_subscriptions:
-                if slot.subscription_key in keys_to_add:
-                    success = await self.subscribe(slot.subscription_key)
-                    if success:
-                        self.current_subscriptions[slot.subscription_key] = slot
-
-            # ⭐ Step 5: 전략 정보 업데이트
-            self.current_strategy = new_strategy
-            self.stats['subscription_changes'] += 1
-
-            total_subs = len(self.current_subscriptions)
-            logger.info(f"✅ 원자적 전략 전환 완료: {total_subs}건 구독 활성")
-
-            return True
-
-    async def _prepare_new_subscriptions(self, strategy: AllocationStrategy) -> List[SubscriptionSlot]:
-        """⭐ 새로운 구독 목록 준비 (기존 _apply_strategy에서 분리)"""
-        try:
-            new_subscriptions = []
-
-            # 1. 시장 지수 구독 (최우선)
-            market_indices = self._get_market_indices()
-            for index_code in market_indices[:strategy.market_indices_count]:
-                slot = SubscriptionSlot(
-                    stock_code=index_code,
-                    subscription_type=SubscriptionType.MARKET_INDEX,
-                    priority=100,
-                    strategy_name="market_index"
-                )
-                new_subscriptions.append(slot)
-
-            # 2. 실시간 종목 (체결가 + 호가)
-            realtime_candidates = self._select_realtime_candidates(strategy)
-            for stock_code in realtime_candidates[:strategy.max_realtime_stocks]:
-                # 체결가 구독
-                price_slot = SubscriptionSlot(
-                    stock_code=stock_code,
-                    subscription_type=SubscriptionType.STOCK_PRICE,
-                    priority=90,
-                    strategy_name="realtime_core"
-                )
-                new_subscriptions.append(price_slot)
-
-                # 호가 구독
-                orderbook_slot = SubscriptionSlot(
-                    stock_code=stock_code,
-                    subscription_type=SubscriptionType.STOCK_ORDERBOOK,
-                    priority=85,
-                    strategy_name="realtime_core"
-                )
-                new_subscriptions.append(orderbook_slot)
-
-            # 3. 준실시간 종목 (체결가만)
-            semi_realtime_candidates = self._select_semi_realtime_candidates(strategy)
-            for stock_code in semi_realtime_candidates[:strategy.max_semi_realtime_stocks]:
-                slot = SubscriptionSlot(
-                    stock_code=stock_code,
-                    subscription_type=SubscriptionType.STOCK_PRICE,
-                    priority=70,
-                    strategy_name="semi_realtime"
-                )
-                new_subscriptions.append(slot)
-
-            # 4. 구독 수 제한 체크
-            if len(new_subscriptions) > self.MAX_SUBSCRIPTIONS:
-                logger.warning(f"⚠️ 구독 수 제한 초과: {len(new_subscriptions)} > {self.MAX_SUBSCRIPTIONS}")
-                # 우선순위 기준으로 정렬 후 상위만 선택
-                new_subscriptions.sort(key=lambda x: x.priority, reverse=True)
-                new_subscriptions = new_subscriptions[:self.MAX_SUBSCRIPTIONS]
-
-            logger.info(f"📋 새 구독 목록 준비: {len(new_subscriptions)}개")
-            return new_subscriptions
-
-        except Exception as e:
-            logger.error(f"새 구독 준비 실패: {e}")
-            return []
-
-    def _apply_strategy(self, strategy: AllocationStrategy) -> bool:
-        """전략 적용"""
-        try:
-            new_subscriptions = []
-
-            # 1. 시장 지수 구독 (최우선)
-            market_indices = self._get_market_indices()
-            for index_code in market_indices[:strategy.market_indices_count]:
-                slot = SubscriptionSlot(
-                    stock_code=index_code,
-                    subscription_type=SubscriptionType.MARKET_INDEX,
-                    priority=100,
-                    strategy_name="market_index"
-                )
-                new_subscriptions.append(slot)
-
-            # 2. 실시간 종목 (체결가 + 호가)
-            realtime_candidates = self._select_realtime_candidates(strategy)
-            for stock_code in realtime_candidates[:strategy.max_realtime_stocks]:
-                # 체결가 구독
-                price_slot = SubscriptionSlot(
-                    stock_code=stock_code,
-                    subscription_type=SubscriptionType.STOCK_PRICE,
-                    priority=90,
-                    strategy_name="realtime_core"
-                )
-                new_subscriptions.append(price_slot)
-
-                # 호가 구독
-                orderbook_slot = SubscriptionSlot(
-                    stock_code=stock_code,
-                    subscription_type=SubscriptionType.STOCK_ORDERBOOK,
-                    priority=85,
-                    strategy_name="realtime_core"
-                )
-                new_subscriptions.append(orderbook_slot)
-
-            # 3. 준실시간 종목 (체결가만)
-            semi_realtime_candidates = self._select_semi_realtime_candidates(strategy)
-            for stock_code in semi_realtime_candidates[:strategy.max_semi_realtime_stocks]:
-                slot = SubscriptionSlot(
-                    stock_code=stock_code,
-                    subscription_type=SubscriptionType.STOCK_PRICE,
-                    priority=70,
-                    strategy_name="semi_realtime"
-                )
-                new_subscriptions.append(slot)
-
-            # 4. 구독 적용
-            if len(new_subscriptions) <= self.MAX_SUBSCRIPTIONS:
-                self.current_subscriptions.clear()
-                for slot in new_subscriptions:
-                    self.current_subscriptions[slot.subscription_key] = slot
-
-                # WebSocket 구독 실행
-                asyncio.create_task(self._subscribe_slots(new_subscriptions))
-
-                return True
-            else:
-                logger.error(f"구독 수 초과: {len(new_subscriptions)} > {self.MAX_SUBSCRIPTIONS}")
-                return False
-
-        except Exception as e:
-            logger.error(f"전략 적용 실패: {e}")
-            return False
-
-    def _get_market_indices(self) -> List[str]:
-        """시장 지수 목록"""
-        return [
-            "KOSPI",      # 코스피 지수
-            "KOSDAQ",     # 코스닥 지수
-            "KRX100",     # KRX 100
-            "KOSPI200",   # 코스피 200
-            "USD"         # 달러 환율
-        ]
-
-    def _select_realtime_candidates(self, strategy: AllocationStrategy) -> List[str]:
-        """실시간 후보 선택 (성과 기반)"""
-        # 성과 점수 기반 정렬
-        scored_stocks = self.performance_tracker.get_top_performers(
-            strategy_weights=strategy.strategy_weights,
-            count=strategy.max_realtime_stocks * 2
-        )
-
-        return [stock for stock, score in scored_stocks]
-
-    def _select_semi_realtime_candidates(self, strategy: AllocationStrategy) -> List[str]:
-        """준실시간 후보 선택"""
-        # 실시간에서 제외된 중상위 종목들
-        all_candidates = self.performance_tracker.get_all_candidates()
-        realtime_stocks = set(self._select_realtime_candidates(strategy))
-
-        semi_candidates = [
-            stock for stock in all_candidates
-            if stock not in realtime_stocks
-        ]
-
-        return semi_candidates[:strategy.max_semi_realtime_stocks]
-
-    async def _subscribe_slots(self, slots: List[SubscriptionSlot]):
-        """슬롯 목록 구독"""
-        subscription_keys = [slot.subscription_key for slot in slots]
-
-        try:
-            for key in subscription_keys:
-                await self.subscribe(key)
-
-            logger.info(f"{len(subscription_keys)}건 WebSocket 구독 완료")
-            self.stats['total_subscriptions'] = len(self.current_subscriptions)
-
-        except Exception as e:
-            logger.error(f"WebSocket 구독 실패: {e}")
-
-    async def _unsubscribe_all(self):
-        """모든 구독 해제"""
-        try:
-            for key in list(self.current_subscriptions.keys()):
-                await self.unsubscribe(key)
-
-            logger.info("모든 WebSocket 구독 해제 완료")
-
-        except Exception as e:
-            logger.error(f"구독 해제 실패: {e}")
-
-    # ===== 긴급 구독 관리 =====
-
-    def add_emergency_subscription(self, stock_code: str, strategy_name: str, priority: int = 95) -> bool:
-        """긴급 구독 추가"""
-        with self.subscription_lock:
-            current_count = len(self.current_subscriptions)
-
-            if current_count >= self.MAX_SUBSCRIPTIONS:
-                # 가장 낮은 우선순위 종목 교체
-                lowest_priority_slot = min(
-                    self.current_subscriptions.values(),
-                    key=lambda x: x.priority
-                )
-
-                if lowest_priority_slot.priority < priority:
-                    # 교체 실행
-                    self.remove_subscription(lowest_priority_slot.subscription_key)
-                    logger.info(f"낮은 우선순위 종목 교체: {lowest_priority_slot.stock_code} → {stock_code}")
-                else:
-                    logger.warning(f"긴급 추가 실패: 우선순위 부족 ({priority} <= {lowest_priority_slot.priority})")
-                    return False
-
-            # 새 슬롯 추가
-            slot = SubscriptionSlot(
-                stock_code=stock_code,
-                subscription_type=SubscriptionType.STOCK_PRICE,
-                priority=priority,
-                strategy_name=strategy_name
-            )
-
-            self.current_subscriptions[slot.subscription_key] = slot
-
-            # WebSocket 구독
-            asyncio.create_task(self.subscribe(slot.subscription_key))
-
-            self.stats['emergency_additions'] += 1
-            logger.info(f"긴급 구독 추가: {stock_code} (우선순위: {priority})")
-
-            return True
-
-    def remove_subscription(self, subscription_key: str) -> bool:
-        """구독 제거"""
-        with self.subscription_lock:
-            if subscription_key in self.current_subscriptions:
-                del self.current_subscriptions[subscription_key]
-
-                # WebSocket 구독 해제
-                asyncio.create_task(self.unsubscribe(subscription_key))
-
-                return True
-
-            return False
-
-    # ===== 성과 관리 =====
-
-    def update_performance_score(self, stock_code: str, score: float):
-        """성과 점수 업데이트"""
-        self.performance_tracker.update_score(stock_code, score)
-
-        # 일정 주기마다 리밸런싱 트리거
-        if self.rebalance_scheduler.should_rebalance():
-            asyncio.create_task(self.rebalance_subscriptions())
-
-    async def rebalance_subscriptions(self):
-        """성과 기반 구독 리밸런싱"""
-        if not self.current_strategy:
-            return
-
-        with self.subscription_lock:
-            logger.info("성과 기반 구독 리밸런싱 시작")
-
-            # 현재 성과 평가
-            current_performance = {}
-            for key, slot in self.current_subscriptions.items():
-                score = self.performance_tracker.get_score(slot.stock_code)
-                current_performance[key] = score
-
-            # 하위 성과 종목 식별 (시장 지수 제외)
-            non_index_slots = {
-                k: v for k, v in current_performance.items()
-                if self.current_subscriptions[k].subscription_type != SubscriptionType.MARKET_INDEX
-            }
-
-            bottom_performers = sorted(
-                non_index_slots.items(),
-                key=lambda x: x[1]
-            )[:3]  # 하위 3개
-
-            # 새로운 기회 종목 검색
-            new_opportunities = self.performance_tracker.get_new_opportunities(count=5)
-
-            # 교체 실행
-            replacements = 0
-            for (old_key, old_score), new_stock in zip(bottom_performers, new_opportunities):
-                if new_stock[1] > old_score * 1.2:  # 20% 이상 성과 개선시에만
-                    old_slot = self.current_subscriptions[old_key]
-
-                    # 새 슬롯 생성
-                    new_slot = SubscriptionSlot(
-                        stock_code=new_stock[0],
-                        subscription_type=old_slot.subscription_type,
-                        priority=old_slot.priority + 5,
-                        strategy_name="performance_upgrade"
-                    )
-
-                    # 교체
-                    del self.current_subscriptions[old_key]
-                    self.current_subscriptions[new_slot.subscription_key] = new_slot
-
-                    # WebSocket 교체
-                    await self.unsubscribe(old_key)
-                    await self.subscribe(new_slot.subscription_key)
-
-                    replacements += 1
-                    logger.info(f"성과 기반 교체: {old_slot.stock_code} → {new_stock[0]}")
-
-            self.stats['performance_upgrades'] += replacements
-            logger.info(f"리밸런싱 완료: {replacements}건 교체")
-
-    # ===== 데이터 처리 =====
-
-    def _decrypt_data(self, encrypted_data: str, tr_id: str) -> str:
-        """데이터 복호화"""
-        try:
-            # 암호화 키가 없으면 원본 그대로 반환
-            if tr_id not in self.encryption_keys:
-                return encrypted_data
-
-            # AES 복호화
-            key = self.encryption_keys[tr_id].encode('utf-8')
-            cipher = AES.new(key, AES.MODE_ECB)
-
-            # Base64 디코딩 후 복호화
-            encrypted_bytes = b64decode(encrypted_data)
-            decrypted_bytes = cipher.decrypt(encrypted_bytes)
-
-            # 패딩 제거
-            decrypted_data = unpad(decrypted_bytes, AES.block_size)
-
-            return decrypted_data.decode('utf-8')
-
-        except Exception as e:
-            logger.warning(f"데이터 복호화 실패: {e}")
-            return encrypted_data
-
-    def _parse_real_time_data(self, message: str) -> Dict:
-        """실시간 데이터 파싱"""
-        try:
-            data = json.loads(message)
-
-            # 헤더 정보 추출
-            header = data.get('header', {})
-            tr_id = header.get('tr_id', '')
-
-            # 바디 데이터 추출
-            body = data.get('body', {})
-
-            return {
-                'tr_id': tr_id,
-                'header': header,
-                'body': body,
-                'timestamp': now_kst()
-            }
-
-        except Exception as e:
-            logger.error(f"실시간 데이터 파싱 실패: {e}")
-            return {}
-
-    def add_callback(self, data_type: str, callback: Callable):
+    def add_callback(self, data_type: str, callback: Callable[[Dict], None]):
         """콜백 함수 추가"""
         if data_type in self.callbacks:
             self.callbacks[data_type].append(callback)
+            logger.debug(f"콜백 추가: {data_type}")
 
-    def remove_callback(self, data_type: str, callback: Callable):
+    def remove_callback(self, data_type: str, callback: Callable[[Dict], None]):
         """콜백 함수 제거"""
         if data_type in self.callbacks and callback in self.callbacks[data_type]:
             self.callbacks[data_type].remove(callback)
+            logger.debug(f"콜백 제거: {data_type}")
+
+    def subscribe_stock_price(self, stock_code: str, strategy_name: str = "") -> bool:
+        """주식체결가 구독"""
+        return self.subscription_manager.add_subscription(
+            tr_id="H0STCNT0",
+            tr_key=stock_code,
+            strategy_name=strategy_name
+        )
+
+    def subscribe_stock_orderbook(self, stock_code: str, strategy_name: str = "") -> bool:
+        """주식호가 구독"""
+        return self.subscription_manager.add_subscription(
+            tr_id="H0STASP0",
+            tr_key=stock_code,
+            strategy_name=strategy_name
+        )
+
+    def subscribe_stock_execution(self, strategy_name: str = "") -> bool:
+        """주식체결통보 구독"""
+        return self.subscription_manager.add_subscription(
+            tr_id="H0STCNI9",  # 모의투자용
+            tr_key="",  # HTS ID 사용
+            strategy_name=strategy_name
+        )
+
+    def subscribe_market_index(self, index_code: str, strategy_name: str = "") -> bool:
+        """시장지수 구독"""
+        return self.subscription_manager.add_subscription(
+            tr_id="H0UPCNT0",
+            tr_key=index_code,
+            strategy_name=strategy_name
+        )
+
+    def unsubscribe(self, tr_id: str, tr_key: str) -> bool:
+        """구독 해제"""
+        subscription_key = f"{tr_id}|{tr_key}"
+        return self.subscription_manager.remove_subscription(subscription_key)
+
+    def unsubscribe_strategy(self, strategy_name: str) -> int:
+        """전략별 구독 해제"""
+        return self.subscription_manager.remove_by_strategy(strategy_name)
+
+    async def apply_subscriptions(self):
+        """대기 중인 구독 적용"""
+        # 추가할 구독들
+        for subscription in self.subscription_manager.get_pending_additions():
+            success = await self.client.subscribe(subscription.tr_id, subscription.tr_key)
+            if success:
+                self.subscription_manager.confirm_addition(subscription.subscription_key)
+                await asyncio.sleep(0.1)  # API 호출 간격
+
+        # 제거할 구독들
+        for subscription_key in self.subscription_manager.get_pending_removals():
+            tr_id, tr_key = subscription_key.split('|', 1)
+            success = await self.client.unsubscribe(tr_id, tr_key)
+            if success:
+                self.subscription_manager.confirm_removal(subscription_key)
+                await asyncio.sleep(0.1)  # API 호출 간격
+
+    async def start_listening(self):
+        """메시지 수신 시작"""
+        await self.client.start_listening()
 
     async def _handle_message(self, message: str):
         """메시지 처리"""
         try:
-            parsed_data = self._parse_real_time_data(message)
+            self.stats['messages_received'] += 1
+            self.stats['last_message_time'] = datetime.now()
 
-            if not parsed_data:
+            # 실시간 데이터인지 확인 (0 또는 1로 시작)
+            if message.startswith(('0', '1')):
+                await self._process_realtime_data(message)
+            else:
+                await self._process_response_data(message)
+
+        except Exception as e:
+            self.stats['errors'] += 1
+            logger.error(f"메시지 처리 오류: {e}")
+            logger.error(f"문제 메시지: {message[:200]}...")
+
+    async def _process_realtime_data(self, message: str):
+        """실시간 데이터 처리"""
+        try:
+            parts = message.split('|')
+            if len(parts) < 4:
                 return
 
-            tr_id = parsed_data['tr_id']
+            tr_id = parts[1]
+            data = parts[3]
 
-            # TR ID별 처리
-            if tr_id == SubscriptionType.STOCK_PRICE.value:
-                await self._process_stock_price_data(parsed_data)
-            elif tr_id == SubscriptionType.STOCK_ORDERBOOK.value:
-                await self._process_stock_orderbook_data(parsed_data)
-            elif tr_id == SubscriptionType.STOCK_EXECUTION.value:
-                await self._process_stock_execution_data(parsed_data)
-            elif tr_id == SubscriptionType.MARKET_INDEX.value:
-                await self._process_market_index_data(parsed_data)
+            # TR ID별 데이터 처리
+            if tr_id == "H0STCNT0":  # 주식체결가
+                parsed_data = parse_stock_price_data(data)
+                await self._execute_callbacks('stock_price', parsed_data)
 
-        except Exception as e:
-            logger.error(f"메시지 처리 실패: {e}")
+            elif tr_id == "H0STASP0":  # 주식호가
+                parsed_data = parse_stock_orderbook_data(data)
+                await self._execute_callbacks('stock_orderbook', parsed_data)
 
-    async def _process_stock_price_data(self, data: Dict):
-        """주식체결가 데이터 처리"""
-        try:
-            # 🚀 동기/비동기 콜백 함수들 실행
-            for callback in self.callbacks["stock_price"]:
-                await self._execute_callback_safely(callback, data)
+            elif tr_id in ["H0STCNI0", "H0STCNI9"]:  # 주식체결통보
+                if tr_id in self.encryption_keys:
+                    aes_key = self.encryption_keys[tr_id]['key']
+                    aes_iv = self.encryption_keys[tr_id]['iv']
+                    parsed_data = parse_stock_execution_data(data, aes_key, aes_iv)
+                    if parsed_data:
+                        await self._execute_callbacks('stock_execution', parsed_data)
 
-        except Exception as e:
-            logger.error(f"주식체결가 데이터 처리 실패: {e}")
+            elif tr_id == "H0UPCNT0":  # 시장지수
+                parsed_data = parse_market_index_data(data)
+                await self._execute_callbacks('market_index', parsed_data)
 
-    async def _process_stock_orderbook_data(self, data: Dict):
-        """주식호가 데이터 처리"""
-        try:
-            # 🚀 동기/비동기 콜백 함수들 실행
-            for callback in self.callbacks["stock_orderbook"]:
-                await self._execute_callback_safely(callback, data)
+            self.stats['data_processed'] += 1
 
         except Exception as e:
-            logger.error(f"주식호가 데이터 처리 실패: {e}")
+            logger.error(f"실시간 데이터 처리 오류: {e}")
 
-    async def _process_stock_execution_data(self, data: Dict):
-        """주식체결통보 데이터 처리"""
+    async def _process_response_data(self, message: str):
+        """응답 데이터 처리 (JSON)"""
         try:
-            # 🚀 동기/비동기 콜백 함수들 실행
-            for callback in self.callbacks["stock_execution"]:
-                await self._execute_callback_safely(callback, data)
+            data = json.loads(message)
+            tr_id = data.get('header', {}).get('tr_id')
 
-        except Exception as e:
-            logger.error(f"주식체결통보 데이터 처리 실패: {e}")
+            if tr_id == "PINGPONG":
+                # PING 응답
+                await self.client.websocket.pong(message.encode())
+                logger.debug("PINGPONG 응답 전송")
 
-    async def _process_market_index_data(self, data: Dict):
-        """🆕 시장지수 데이터 처리 - H0UPCNT0"""
-        try:
-            # 🚀 시장지수 데이터 파싱 (H0UPCNT0 기준)
-            parsed_index_data = self._parse_market_index_data(data)
+            elif tr_id in ["H0STCNI0", "H0STCNI9"]:
+                # 체결통보 암호화 키 저장
+                rt_cd = data.get('body', {}).get('rt_cd')
+                if rt_cd == '0':  # 성공
+                    output = data.get('body', {}).get('output', {})
+                    if 'key' in output and 'iv' in output:
+                        self.encryption_keys[tr_id] = {
+                            'key': output['key'],
+                            'iv': output['iv']
+                        }
+                        logger.info(f"체결통보 암호화 키 저장: {tr_id}")
 
-            if parsed_index_data:
-                # 🚀 동기/비동기 콜백 함수들 실행
-                for callback in self.callbacks.get("market_index", []):
-                    await self._execute_callback_safely(callback, parsed_index_data)
-
-                # 디버그 로깅
-                index_code = parsed_index_data.get('index_code', 'UNKNOWN')
-                current_value = parsed_index_data.get('current_value', 0)
-                change_rate = parsed_index_data.get('change_rate', 0)
-
-                logger.debug(f"📊 시장지수 수신: {index_code} {current_value:,.2f} ({change_rate:+.2f}%)")
-
-        except Exception as e:
-            logger.error(f"시장지수 데이터 처리 실패: {e}")
-
-    async def _execute_callback_safely(self, callback: Callable, data: Dict):
-        """🚀 동기/비동기 콜백 함수 안전 실행"""
-        try:
-            import asyncio
-            import inspect
-
-            # 콜백이 코루틴 함수인지 확인
-            if inspect.iscoroutinefunction(callback):
-                # 비동기 함수: await로 호출
-                await callback(data)
             else:
-                # 동기 함수: executor에서 실행 (메인 스레드 차단 방지)
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, callback, data)
+                # 일반 응답 처리
+                rt_cd = data.get('body', {}).get('rt_cd')
+                msg = data.get('body', {}).get('msg1', '')
+
+                if rt_cd == '0':
+                    logger.debug(f"구독 성공: {tr_id} - {msg}")
+                else:
+                    logger.warning(f"구독 오류: {tr_id} - {msg}")
 
         except Exception as e:
-            logger.error(f"콜백 실행 실패: {e}")
+            logger.error(f"응답 데이터 처리 오류: {e}")
 
-    def _parse_market_index_data(self, data: Dict) -> Optional[Dict]:
-        """🆕 시장지수 데이터 파싱 (H0UPCNT0)"""
-        try:
-            # KIS API H0UPCNT0 응답 형식에 맞춘 파싱
-            if 'output' not in data:
-                return None
-
-            output = data['output']
-
-            # 주요 지수 정보 추출
-            parsed_data = {
-                'index_code': output.get('mksc_shrn_iscd', ''),  # 지수 코드
-                'index_name': output.get('hts_kor_isnm', ''),    # 지수명
-                'current_value': float(output.get('bstp_nmix_prpr', 0)),  # 현재 지수값
-                'change_value': float(output.get('bstp_nmix_prdy_vrss', 0)),  # 전일대비
-                'change_rate': float(output.get('prdy_vrss_rate', 0)),  # 등락률
-                'volume': int(output.get('acml_vol', 0)),  # 누적거래량
-                'transaction_amount': int(output.get('acml_tr_pbmn', 0)),  # 누적거래대금
-                'timestamp': now_kst(),
-                'market_status': output.get('bstp_cls_code', ''),  # 시장구분
-
-                # 추가 지수 정보
-                'high_value': float(output.get('bstp_nmix_hgpr', 0)),  # 최고가
-                'low_value': float(output.get('bstp_nmix_lwpr', 0)),   # 최저가
-                'open_value': float(output.get('bstp_nmix_oprc', 0)),  # 시가
-
-                # 원본 데이터 보존
-                'raw_data': output
-            }
-
-            return parsed_data
-
-        except Exception as e:
-            logger.error(f"시장지수 데이터 파싱 실패: {e}")
-            return None
-
-    # ===== 메인 루프 =====
-
-    async def start_listening(self):
-        """실시간 데이터 수신 시작 (재연결 로직 포함)"""
-        if not self.is_connected:
-            logger.error("웹소켓이 연결되지 않았습니다.")
+    async def _execute_callbacks(self, data_type: str, data: Dict):
+        """콜백 함수 실행"""
+        if data_type not in self.callbacks:
             return
 
-        logger.info("실시간 데이터 수신 시작")
-
-        # ⭐ 구독 상태 최종 확인
-        subscription_count = len(self.current_subscriptions)
-        if subscription_count == 0:
-            logger.warning("⚠️ 활성 구독이 없습니다. 연결 유지를 위한 기본 구독을 시도합니다")
-            
-            # 긴급 시장지수 구독 (연결 유지 목적)
-            emergency_subscribed = False
-            for index_code in ["KOSPI", "KOSDAQ"]:
-                subscription_key = f"{SubscriptionType.MARKET_INDEX.value}|{index_code}"
-                if await self.subscribe(subscription_key):
-                    emergency_subscribed = True
-                    logger.info(f"🆘 긴급 구독 성공: {index_code} (연결 유지)")
-                    break
-            
-            if not emergency_subscribed:
-                logger.error("❌ 긴급 구독도 실패 - 연결이 즉시 끊어질 수 있습니다")
-        else:
-            logger.info(f"✅ 활성 구독 확인: {subscription_count}건")
-
-        # 장외시간 체크
-        kst = pytz.timezone('Asia/Seoul')
-        now = datetime.now(kst)
-
-        #if not KISRestAPIManager.is_market_open(now):
-        #    logger.warning(f"🕐 장외시간 ({now.strftime('%Y-%m-%d %H:%M:%S')}): 웹소켓 연결 유지만 합니다")
-
-        # 연결 상태 모니터링을 위한 변수들
-        last_message_time = datetime.now()
-        message_count = 0
-        
-        # 연결 상태 모니터링 태스크 시작
-        monitor_task = asyncio.create_task(self._monitor_connection_health())
-        
-        try:
-            async for message in self.websocket:
-                message_count += 1
-                last_message_time = datetime.now()
-                
-                # 주기적으로 연결 상태 로깅 (1000건마다)
-                if message_count % 1000 == 0:
-                    logger.debug(f"메시지 수신 상태: {message_count}건, "
-                                f"마지막 수신: {last_message_time.strftime('%H:%M:%S')}")
-                
-                await self._handle_message(message)
-
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"🔌 웹소켓 연결이 끊어졌습니다. 코드: {e.code}, 이유: {e.reason}")
-            logger.info(f"📊 연결 통계: 총 메시지 {message_count}건, "
-                       f"마지막 메시지: {last_message_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            # 연결 끊김 원인 분석
-            connection_duration = (datetime.now() - last_message_time).total_seconds()
-            logger.info(f"⏱️ 연결 끊김까지 시간: {connection_duration:.1f}초")
-            
-            # 일반적인 연결 끊김 원인들 체크
-            self._analyze_disconnect_reason(e, connection_duration, message_count)
-            
-            self.is_connected = False
-
-            # 장중이면 재연결 시도
-            if KISRestAPIManager.is_market_open(datetime.now(kst)):
-                logger.info("장중 재연결 시도...")
-                await self._reconnect()
-        except websockets.exceptions.InvalidMessage as e:
-            logger.error(f"❌ 잘못된 메시지 수신: {e}")
-        except websockets.exceptions.ProtocolError as e:
-            logger.error(f"❌ 프로토콜 오류: {e}")
-        except websockets.exceptions.WebSocketException as e:
-            logger.error(f"❌ 웹소켓 일반 오류: {e}")
-        except Exception as e:
-            logger.error(f"❌ 데이터 수신 중 예상치 못한 오류: {e}")
-            import traceback
-            logger.error(f"스택 트레이스:\n{traceback.format_exc()}")
-        finally:
-            # 모니터링 태스크 종료
-            monitor_task.cancel()
+        for callback in self.callbacks[data_type]:
             try:
-                await monitor_task
-            except asyncio.CancelledError:
-                pass
-
-    def _analyze_disconnect_reason(self, exception: Exception, duration: float, message_count: int):
-        """연결 끊김 원인 분석"""
-        logger.info("🔍 연결 끊김 원인 분석:")
-        
-        # 1. 접속키 만료 체크
-        if hasattr(exception, 'code'):
-            if exception.code == 1000:
-                logger.info("  ✓ 정상 종료 (서버 또는 클라이언트 요청)")
-            elif exception.code == 1001:
-                logger.warning("  ⚠️ 서버 종료 또는 재시작")
-            elif exception.code == 1002:
-                logger.error("  ❌ 프로토콜 오류")
-            elif exception.code == 1003:
-                logger.error("  ❌ 지원하지 않는 데이터 타입")
-            elif exception.code == 1006:
-                logger.error("  ❌ 비정상 연결 종료 (네트워크 문제 가능성)")
-            elif exception.code == 1011:
-                logger.error("  ❌ 서버 내부 오류")
-            elif exception.code == 4000:
-                logger.error("  ❌ 인증 실패 또는 접속키 만료 가능성")
-            else:
-                logger.warning(f"  ❓ 알 수 없는 종료 코드: {exception.code}")
-        
-        # 2. 시간 기반 분석
-        if duration > 1800:  # 30분
-            logger.info("  💡 접속키 만료 가능성 (30분 이상 연결)")
-        elif duration < 60:  # 1분 미만
-            logger.warning("  ⚠️ 빠른 연결 끊김 - 인증 또는 프로토콜 문제 가능성")
-        
-        # 3. 메시지 수 기반 분석
-        if message_count == 0:
-            logger.error("  ❌ 메시지 수신 없음 - 구독 실패 또는 인증 문제")
-        elif message_count < 10:
-            logger.warning("  ⚠️ 적은 메시지 수신 - 구독 문제 가능성")
-        
-        # 4. 현재 구독 상태 확인
-        current_subs = len(self.current_subscriptions)
-        if current_subs > self.MAX_SUBSCRIPTIONS:
-            logger.error(f"  ❌ 구독 한도 초과: {current_subs}/{self.MAX_SUBSCRIPTIONS}")
-        elif current_subs == 0:
-            logger.warning("  ⚠️ 활성 구독 없음")
-        
-        # 5. 해결 방안 제시
-        logger.info("💡 해결 방안:")
-        if hasattr(exception, 'code') and exception.code in [4000, 1006]:
-            logger.info("  - 접속키 재발급 후 재연결")
-            logger.info("  - API 인증 정보 확인")
-        if duration > 1800:
-            logger.info("  - 주기적 재연결 스케줄링 검토")
-        if current_subs > 35:
-            logger.info("  - 구독 수 최적화 필요")
-
-    async def _reconnect(self, max_attempts: int = 3):
-        """웹소켓 재연결 시도"""
-        for attempt in range(max_attempts):
-            try:
-                logger.info(f"재연결 시도 {attempt + 1}/{max_attempts}")
-                await asyncio.sleep(5)  # 5초 대기
-
-                # 접속키 유효성 확인 및 갱신
-                if not await self._ensure_approval_key_valid():
-                    logger.error("접속키 갱신 실패로 재연결 중단")
-                    continue
-
-                if await self.connect():
-                    logger.info("재연결 성공")
-                    self.stats['reconnection_count'] += 1
-                    
-                    # 기존 구독들 재적용
-                    if self.current_subscriptions:
-                        await self._reapply_subscriptions()
-                    
-                    return True
-
+                # 비동기 콜백인지 확인
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(data)
+                else:
+                    callback(data)
             except Exception as e:
-                logger.warning(f"재연결 시도 {attempt + 1} 실패: {e}")
+                logger.error(f"콜백 실행 오류 ({data_type}): {e}")
 
-        logger.error(f"재연결 실패 - {max_attempts}회 시도 모두 실패")
-        return False
+    def get_status(self) -> Dict:
+        """상태 정보"""
+        client_status = self.client.get_status()
+        subscription_status = self.subscription_manager.get_subscription_status()
 
-    # ===== 상태 조회 =====
+        return {
+            'client': client_status,
+            'subscriptions': subscription_status,
+            'stats': self.stats.copy(),
+            'encryption_keys': list(self.encryption_keys.keys())
+        }
 
-    def get_subscription_status(self) -> Dict:
-        """구독 상태 조회"""
-        with self.subscription_lock:
-            status = {
-                'total_subscriptions': len(self.current_subscriptions),
-                'available_slots': self.MAX_SUBSCRIPTIONS - len(self.current_subscriptions),
-                'current_strategy': self.current_strategy.name if self.current_strategy else None,
-                'time_slot': self.get_current_time_slot().value,
-                'statistics': self.stats.copy(),
-                'is_connected': self.is_connected
-            }
+    async def reconnect_and_restore(self) -> bool:
+        """재연결 및 구독 복원"""
+        logger.info("웹소켓 재연결 및 구독 복원 시작")
 
-            # 타입별 분류
-            type_counts = defaultdict(int)
-            for slot in self.current_subscriptions.values():
-                type_counts[slot.subscription_type.value] += 1
-
-            status['subscription_breakdown'] = dict(type_counts)
-
-            return status
-
-    def _is_approval_key_valid(self) -> bool:
-        """접속키 유효성 확인 (KIS API는 일반적으로 30분 유효)"""
-        if not self.approval_key or not self.approval_key_created_at:
+        # 재연결
+        if not await self.client.reconnect():
             return False
-        
-        # 25분이 지나면 만료로 간주 (5분 여유)
-        elapsed = now_kst() - self.approval_key_created_at
-        return elapsed.total_seconds() < 1500  # 25분
 
-    async def _ensure_approval_key_valid(self):
-        """접속키 유효성 확인 및 갱신"""
-        if not self._is_approval_key_valid():
-            logger.info("🔑 접속키 만료 또는 없음. 새로 발급합니다...")
-            try:
-                self.approval_key = self.rest_api.get_websocket_approval_key()
-                self.approval_key_created_at = now_kst()
-                self.stats['approval_key_renewals'] += 1
-                logger.info(f"🔑 접속키 갱신 완료: {self.approval_key[:10]}...")
-                return True
-            except Exception as e:
-                logger.error(f"❌ 접속키 갱신 실패: {e}")
-                return False
+        # 기존 구독 복원
+        subscriptions_by_type = self.subscription_manager.get_subscriptions_by_type()
+
+        for tr_id, tr_keys in subscriptions_by_type.items():
+            for tr_key in tr_keys:
+                await self.client.subscribe(tr_id, tr_key)
+                await asyncio.sleep(0.1)  # API 호출 간격
+
+        logger.info(f"구독 복원 완료: {sum(len(keys) for keys in subscriptions_by_type.values())}건")
         return True
-
-    async def _monitor_connection_health(self):
-        """연결 상태 모니터링 (백그라운드 태스크)"""
-        while self.is_connected:
-            try:
-                await asyncio.sleep(100)  # 1분40초 마다 체크
-                
-                if not self.is_connected:
-                    break
-                
-                # 1. 접속키 유효성 체크
-                if not self._is_approval_key_valid():
-                    logger.warning("⚠️ 접속키 만료 임박. 재연결 준비...")
-                    # 접속키 만료시 재연결 트리거
-                    asyncio.create_task(self._proactive_reconnect())
-                
-                # 2. 연결 지속 시간 체크
-                if self.connection_start_time:
-                    connection_duration = (now_kst() - self.connection_start_time).total_seconds()
-                    if connection_duration > 1800:  # 30분 이상 연결시
-                        logger.info(f"⏰ 장시간 연결 ({connection_duration/60:.1f}분). 예방적 재연결 검토")
-                
-                # 3. 웹소켓 상태 체크
-                if self.websocket and getattr(self.websocket, 'closed', False):
-                    logger.warning("⚠️ 웹소켓이 닫혀있음을 감지. 재연결 시도...")
-                    self.is_connected = False
-                    asyncio.create_task(self._proactive_reconnect())
-                    break
-                    
-            except Exception as e:
-                logger.error(f"연결 상태 모니터링 오류: {e}")
-                await asyncio.sleep(60)  # 오류시 1분 대기
-
-    async def _proactive_reconnect(self):
-        """예방적 재연결"""
-        logger.info("🔄 예방적 재연결 시작...")
-        
-        # 기존 연결 정리
-        if self.websocket and not getattr(self.websocket, 'closed', True):
-            await self.disconnect()
-        
-        # 새로운 연결 시도
-        if await self.connect():
-            logger.info("✅ 예방적 재연결 성공")
-            # 기존 구독들 재적용
-            if self.current_subscriptions:
-                await self._reapply_subscriptions()
-        else:
-            logger.error("❌ 예방적 재연결 실패")
-
-    async def _reapply_subscriptions(self):
-        """기존 구독들 재적용"""
-        if not self.current_subscriptions:
-            return
-            
-        logger.info(f"🔄 기존 구독 재적용: {len(self.current_subscriptions)}건")
-        
-        reapply_count = 0
-        for subscription_key in list(self.current_subscriptions.keys()):
-            try:
-                await self.subscribe(subscription_key)
-                reapply_count += 1
-            except Exception as e:
-                logger.error(f"구독 재적용 실패: {subscription_key} - {e}")
-        
-        logger.info(f"✅ 구독 재적용 완료: {reapply_count}/{len(self.current_subscriptions)}건")
-
-
-class PerformanceTracker:
-    """성과 추적기"""
-
-    def __init__(self):
-        self.stock_scores: Dict[str, float] = {}
-        self.score_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
-        self.last_update: Dict[str, datetime] = {}
-
-    def update_score(self, stock_code: str, score: float):
-        """점수 업데이트"""
-        self.stock_scores[stock_code] = score
-        self.score_history[stock_code].append((now_kst(), score))
-        self.last_update[stock_code] = now_kst()
-
-    def get_score(self, stock_code: str) -> float:
-        """점수 조회"""
-        return self.stock_scores.get(stock_code, 0.0)
-
-    def get_top_performers(self, strategy_weights: Dict[str, float], count: int = 10) -> List[Tuple[str, float]]:
-        """상위 성과 종목 조회"""
-        # 실제로는 각 전략별 점수를 가중평균하여 계산
-        # 여기서는 단순화된 버전
-        sorted_stocks = sorted(
-            self.stock_scores.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        return sorted_stocks[:count]
-
-    def get_all_candidates(self) -> List[str]:
-        """모든 후보 종목 조회"""
-        return list(self.stock_scores.keys())
-
-    def get_new_opportunities(self, count: int = 5) -> List[Tuple[str, float]]:
-        """새로운 기회 종목 조회"""
-        # 최근에 점수가 급상승한 종목들
-        recent_gainers = []
-
-        for stock_code, history in self.score_history.items():
-            if len(history) >= 2:
-                recent_score = history[-1][1]
-                old_score = history[-2][1]
-
-                if recent_score > old_score * 1.1:  # 10% 이상 증가
-                    recent_gainers.append((stock_code, recent_score))
-
-        return sorted(recent_gainers, key=lambda x: x[1], reverse=True)[:count]
-
-
-class RebalanceScheduler:
-    """리밸런싱 스케줄러"""
-
-    def __init__(self, manager: KISWebSocketManager):
-        self.manager = manager
-        self.last_rebalance = now_kst()
-        self.rebalance_interval = timedelta(minutes=5)  # 5분마다
-        self.rebalance_count = 0
-
-    def should_rebalance(self) -> bool:
-        """리밸런싱 필요 여부"""
-        now = now_kst()
-
-        if now - self.last_rebalance >= self.rebalance_interval:
-            self.last_rebalance = now
-            self.rebalance_count += 1
-            return True
-
-        return False

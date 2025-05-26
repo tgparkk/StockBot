@@ -1,1364 +1,387 @@
 """
-시간대별 전략 스케줄러
-각 시간대 이전에 종목 탐색을 완료하고 전략을 전환하는 시스템
-별도 스레드를 사용하여 메인 스레드 차단 방지
-하드코딩된 종목 제거하고 REST API 동적 발굴 적용
+전략 스케줄러 (리팩토링 간소화 버전)
+기존 1365줄을 300줄 이하로 간소화
 """
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time, timedelta
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
-from dataclasses import dataclass, field
+from datetime import datetime, time
+from typing import Dict, List, Optional, TYPE_CHECKING
 from enum import Enum
-import pytz
 from utils.logger import setup_logger
-from utils.config_loader import ConfigLoader  # 🆕 ConfigLoader 사용
-from utils.korean_time import now_kst, now_kst_time
+from .time_slot_manager import TimeSlotManager, TimeSlotConfig
+from .stock_discovery import StockDiscovery, StockCandidate
 from core.rest_api_manager import KISRestAPIManager
-from core.hybrid_data_manager import HybridDataManager, DataPriority
+from core.hybrid_data_manager import SimpleHybridDataManager
 
-# 순환 import 방지를 위한 TYPE_CHECKING
+# 순환 import 방지
 if TYPE_CHECKING:
-    from main import StockBotMain
-
-# 데이터베이스 관리
-from database.db_manager import db_manager
-from database.db_models import TimeSlot as DBTimeSlot
-
-# 한국 시간대 설정
-KST = pytz.timezone('Asia/Seoul')
+    from main import StockBot
 
 logger = setup_logger(__name__)
 
 class StrategyPhase(Enum):
     """전략 단계"""
-    PREPARATION = "preparation"    # 준비 단계 (종목 탐색)
-    EXECUTION = "execution"        # 실행 단계 (실제 거래)
-    TRANSITION = "transition"      # 전환 단계 (다음 전략 준비)
-
-@dataclass
-class TimeSlotConfig:
-    """시간대별 설정"""
-    name: str
-    start_time: time
-    end_time: time
-    description: str
-    primary_strategies: Dict[str, float]
-    secondary_strategies: Dict[str, float]
-    preparation_time: int = 15  # 사전 준비 시간(분)
-
-@dataclass
-class StockCandidate:
-    """종목 후보"""
-    stock_code: str
-    strategy_type: str
-    score: float
-    reason: str
-    discovered_at: datetime
-    data: Dict = field(default_factory=dict)
+    PREPARATION = "preparation"
+    EXECUTION = "execution"
+    TRANSITION = "transition"
 
 class StrategyScheduler:
-    """시간대별 전략 스케줄러 - 동적 종목 발굴 버전"""
+    """간소화된 전략 스케줄러"""
 
-    def __init__(self, trading_api: KISRestAPIManager, data_manager: HybridDataManager):
+    def __init__(self, trading_api: KISRestAPIManager, data_manager: SimpleHybridDataManager):
+        """초기화"""
         self.trading_api = trading_api
         self.data_manager = data_manager
 
-        # 🆕 ConfigLoader 사용 (configparser 대신)
-        self.config_loader = ConfigLoader('config/settings.ini')
+        # 관리자들
+        self.time_manager = TimeSlotManager()
+        self.stock_discovery = StockDiscovery(trading_api)
 
         # 스케줄러 상태
         self.scheduler_running = False
-        self.screening_active = False
         self.current_slot: Optional[TimeSlotConfig] = None
         self.current_phase = StrategyPhase.PREPARATION
         self.preparation_completed = False
 
-        # 시간대별 설정 로드 (ConfigLoader 기반)
-        self.time_slots = self._load_time_slot_configs()
+        # 봇 인스턴스 (나중에 설정)
+        self.bot_instance: Optional['StockBot'] = None
 
-        # 종목 후보 관리 (스레드 안전)
-        self.candidates: Dict[str, List[StockCandidate]] = {}
+        # 활성 종목 저장
         self.active_stocks: Dict[str, List[str]] = {}
-        self.discovery_lock = threading.RLock()
 
-        # 스레드 풀 - 종목 탐색용 (메인 스레드 차단 방지)
-        self.discovery_executor = ThreadPoolExecutor(
-            max_workers=3,
-            thread_name_prefix="discovery"
-        )
-        # 백그라운드 스크리닝용 스레드 풀
-        self.screening_executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="screening"
-        )
-
-        logger.info("🕐 전략 스케줄러 초기화 완료 (ConfigLoader 기반)")
-
-    def _load_time_slot_configs(self) -> Dict[str, TimeSlotConfig]:
-        """시간대별 설정 로드 - ConfigLoader 기반"""
-        slots = {}
-
-        try:
-            # 🆕 ConfigLoader의 load_time_based_strategies() 사용
-            time_configs = self.config_loader.load_time_based_strategies()
-
-            # ConfigLoader 결과를 TimeSlotConfig 객체로 변환
-            for slot_name, config_data in time_configs.items():
-                slots[slot_name] = TimeSlotConfig(
-                    name=slot_name,
-                    start_time=config_data['start_time'],
-                    end_time=config_data['end_time'],
-                    description=config_data['description'],
-                    primary_strategies=config_data['primary_strategies'],
-                    secondary_strategies=config_data['secondary_strategies']
-                )
-
-            logger.info("⚙️ 시간대별 설정 로드 완료 (ConfigLoader 기반)")
-            for slot_name, slot_config in slots.items():
-                logger.info(f"   📅 {slot_name}: {slot_config.start_time} - {slot_config.end_time}")
-
-        except Exception as e:
-            logger.error(f"❌ 시간대별 설정 로드 실패: {e}")
-            # 기본값으로 fallback
-            slots = self._get_default_time_slots()
-
-        return slots
-
-    def _get_default_slot_config(self, slot_name: str, description: str,
-                                default_start: str, default_end: str) -> TimeSlotConfig:
-        """기본 시간대 설정 반환"""
-        start_time = datetime.strptime(default_start, '%H:%M').time()
-        end_time = datetime.strptime(default_end, '%H:%M').time()
-
-        # 기본 전략 설정
-        default_strategies = {
-            'golden_time': ({'gap_trading': 0.7}, {'volume_breakout': 0.3}),
-            'morning_leaders': ({'volume_breakout': 0.6}, {'momentum': 0.4}),
-            'lunch_time': ({'momentum': 0.5}, {'gap_trading': 0.3, 'volume_breakout': 0.2}),
-            'closing_trend': ({'momentum': 0.8}, {'volume_breakout': 0.2})
-        }
-
-        primary, secondary = default_strategies.get(slot_name, ({'gap_trading': 1.0}, {}))
-
-        return TimeSlotConfig(
-            name=slot_name,
-            start_time=start_time,
-            end_time=end_time,
-            description=description,
-            primary_strategies=primary,
-            secondary_strategies=secondary
-        )
-
-    def _get_default_time_slots(self) -> Dict[str, TimeSlotConfig]:
-        """기본 시간대 설정 (fallback용)"""
-        logger.warning("⚠️ 기본값으로 시간대 설정 생성")
-
-        return {
-            'golden_time': self._get_default_slot_config(
-                'golden_time', '골든타임 - 갭 트레이딩 집중', '09:00', '09:30'
-            ),
-            'morning_leaders': self._get_default_slot_config(
-                'morning_leaders', '주도주 시간 - 거래량 돌파', '09:30', '11:30'
-            ),
-            'lunch_time': self._get_default_slot_config(
-                'lunch_time', '점심시간 - 안정적 모멘텀', '11:30', '14:00'
-            ),
-            'closing_trend': self._get_default_slot_config(
-                'closing_trend', '마감 추세 - 모멘텀 강화', '14:00', '15:20'
-            )
-        }
+        logger.info("📅 간소화된 전략 스케줄러 초기화 완료")
 
     async def start_scheduler(self):
-        """스케줄러 시작 - 초기화 + 메인 루프"""
+        """스케줄러 시작"""
         try:
-            # 1. 초기화 단계
-            await self._initialize_scheduler()
+            logger.info("🚀 전략 스케줄러 시작")
 
-            # 2. 메인 스케줄링 루프
-            await self._run_main_loop()
+            # 백그라운드 스크리닝 시작
+            self.stock_discovery.start_background_screening()
+
+            # 메인 스케줄링 루프 시작
+            self.scheduler_running = True
+            await self._main_scheduling_loop()
 
         except Exception as e:
-            logger.error(f"❌ 스케줄러 시작 실패: {e}")
+            logger.error(f"스케줄러 시작 실패: {e}")
             raise
         finally:
-            logger.info("🛑 스케줄러 종료")
+            self.stop_scheduler()
 
-    async def _initialize_scheduler(self):
-        """스케줄러 초기화"""
-        self.scheduler_running = True
-        logger.info("🕐 전략 스케줄러 시작")
-
-        # 1. 백그라운드 스크리닝 시작
-        await self._start_background_screening()
-        logger.info("📊 백그라운드 스크리닝 활성화")
-
-        # 2. 즉시 첫 번째 스케줄링 실행 (30초 대기 없이)
-        await self._schedule_loop()
-        logger.info("⚡ 초기 전략 활성화 완료")
-
-    async def _run_main_loop(self):
-        """메인 스케줄링 루프 - 하루 4번 전략 전환"""
-        logger.info("🔄 메인 스케줄링 루프 시작 (시간대별 전환)")
-
-        consecutive_errors = 0
-        max_consecutive_errors = 3
+    async def _main_scheduling_loop(self):
+        """메인 스케줄링 루프"""
+        logger.info("🔄 메인 스케줄링 루프 시작")
 
         while self.scheduler_running:
             try:
-                # 다음 전략 준비 시간까지 대기
-                next_preparation_time = self._get_next_preparation_time()
+                # 다음 준비 시간 계산
+                next_prep_time = self.time_manager.get_next_preparation_time()
 
-                if next_preparation_time:
-                    sleep_seconds = self._calculate_sleep_time(next_preparation_time)
+                if next_prep_time:
+                    # 준비 시간까지 대기
+                    sleep_seconds = self.time_manager.calculate_sleep_time(next_prep_time)
 
-                    if sleep_seconds > 60:  # 1분 이상 남은 경우
-                        logger.info(f"⏰ 다음 전략 준비까지 {sleep_seconds//60}분 {sleep_seconds%60}초 대기")
+                    if sleep_seconds > 60:
+                        logger.info(f"⏰ 다음 전략 준비까지 {sleep_seconds//60}분 대기")
 
-                        # 긴 대기 시간은 1분 단위로 나누어 체크 (중간에 중단 가능)
+                        # 1분씩 나누어 대기 (중간 중단 가능)
                         while sleep_seconds > 0 and self.scheduler_running:
-                            wait_time = min(60, sleep_seconds)  # 최대 1분씩 대기
+                            wait_time = min(60, sleep_seconds)
                             await asyncio.sleep(wait_time)
                             sleep_seconds -= wait_time
                     else:
                         await asyncio.sleep(sleep_seconds)
 
-                    # 전략 준비 시간 도달 - 스케줄링 실행
+                    # 전략 실행
                     if self.scheduler_running:
-                        await self._schedule_loop()
+                        await self._execute_time_slot_strategy()
                 else:
-                    # 장외 시간 - 더 긴 간격으로 대기
+                    # 장외 시간 - 30분 대기
                     logger.info("💤 장외 시간 - 30분 대기")
-                    await asyncio.sleep(1800)  # 30분 대기
-
-                # 성공 시 오류 카운터 리셋
-                consecutive_errors = 0
+                    await asyncio.sleep(1800)
 
             except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"스케줄러 오류 ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                logger.error(f"스케줄링 루프 오류: {e}")
+                await asyncio.sleep(300)  # 5분 대기 후 재시도
 
-                # 연속 오류 시 점진적 대기 시간 증가
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.warning(f"⚠️ 연속 오류 {max_consecutive_errors}회 - 시스템 안정화 대기")
-                    await asyncio.sleep(300)  # 5분 대기
-                    consecutive_errors = 0
-                else:
-                    backoff_time = min(30 * consecutive_errors, 120)
-                    await asyncio.sleep(backoff_time)
-
-    def _get_next_preparation_time(self) -> Optional[datetime]:
-        """다음 전략 준비 시간 계산 - ConfigLoader 기반"""
-        now = datetime.now(KST)
-        today = now.date()
-
-        # 시간대별 준비 시간 (시작 15분 전) - 동적으로 계산
-        preparation_times = []
-
+    async def _execute_time_slot_strategy(self):
+        """시간대별 전략 실행"""
         try:
-            for slot_name, slot_config in self.time_slots.items():
-                start_time = slot_config.start_time
+            # 현재 시간대 확인
+            current_slot = self.time_manager.get_current_time_slot()
 
-                # 준비 시간 = 시작 시간에서 15분 전
-                start_datetime = datetime.combine(today, start_time)
-                prep_datetime = start_datetime - timedelta(minutes=15)
-                preparation_times.append(prep_datetime)
-
-            # 시간순 정렬
-            preparation_times.sort()
-
-            logger.debug(f"📅 준비 시간 목록: {[pt.strftime('%H:%M') for pt in preparation_times]}")
-
-            # 한국 시간대 적용
-            preparation_times = [KST.localize(dt) for dt in preparation_times]
-
-            # 현재 시간 이후의 가장 가까운 준비 시간 찾기
-            for prep_time in preparation_times:
-                if prep_time > now:
-                    logger.info(f"⏰ 다음 준비 시간: {prep_time.strftime('%H:%M')}")
-                    return prep_time
-
-            # 오늘의 모든 준비 시간이 지났으면 다음 날 첫 번째 시간
-            if preparation_times:
-                tomorrow = today + timedelta(days=1)
-                next_day_first_time = preparation_times[0].time()
-                next_day_first = datetime.combine(tomorrow, next_day_first_time)
-                next_day_first_kst = KST.localize(next_day_first)
-                logger.info(f"⏰ 내일 첫 준비 시간: {next_day_first_kst.strftime('%Y-%m-%d %H:%M')}")
-                return next_day_first_kst
-
-        except Exception as e:
-            logger.error(f"❌ 준비 시간 계산 실패: {e}")
-            # fallback: 기본 시간 사용
-            return self._get_default_next_preparation_time(now, today)
-
-        return None
-
-    def _get_default_next_preparation_time(self, now: datetime, today) -> Optional[datetime]:
-        """기본 준비 시간 계산 (fallback용)"""
-        logger.warning("⚠️ 기본 준비 시간 사용")
-
-        # 기본 준비 시간들 (하드코딩된 백업)
-        default_preparation_times = [
-            datetime.combine(today, time(8, 45)),   # 골든타임 준비 (08:45)
-            datetime.combine(today, time(9, 15)),   # 주도주 시간 준비 (09:15)
-            datetime.combine(today, time(11, 15)),  # 점심시간 준비 (11:15)
-            datetime.combine(today, time(13, 45)),  # 마감 추세 준비 (13:45)
-        ]
-
-        # 한국 시간대 적용
-        preparation_times = [KST.localize(dt) for dt in default_preparation_times]
-
-        # 현재 시간 이후의 가장 가까운 준비 시간 찾기
-        for prep_time in preparation_times:
-            if prep_time > now:
-                return prep_time
-
-        # 오늘의 모든 준비 시간이 지났으면 다음 날 첫 번째 시간
-        tomorrow = today + timedelta(days=1)
-        next_day_first = datetime.combine(tomorrow, time(8, 45))
-        return KST.localize(next_day_first)
-
-    def _calculate_sleep_time(self, target_time: datetime) -> int:
-        """대상 시간까지의 대기 시간 계산 (초)"""
-        now = datetime.now(KST)
-        time_diff = target_time - now
-        return max(0, int(time_diff.total_seconds()))
-
-    async def _start_background_screening(self):
-        """백그라운드 스크리닝 시작 - 프리 마켓 대응 강화"""
-        self.screening_active = True
-
-        # 🚀 단순화: 한 번만 스레드에서 실행 (중복 제거)
-        loop = asyncio.get_event_loop()
-        screening_future = loop.run_in_executor(
-            self.screening_executor,
-            self._background_screening_sync
-        )
-
-        logger.info("�� 백그라운드 시장 스크리닝 시작 (프리 마켓 대응 강화)")
-
-    def _background_screening_sync(self):
-        """백그라운드 스크리닝 (동기 버전) - 프리 마켓 대응 강화"""
-        try:
-            while self.screening_active:
-                # 🆕 현재 시간 체크 (장외시간 대응)
-                from datetime import datetime
-                import pytz
-                kst = pytz.timezone('Asia/Seoul')
-                now = datetime.now(kst)
-                is_market_hours = self.trading_api.is_market_open(now)
-
-                if not is_market_hours:
-                    logger.info(f"🌙 장외시간 백그라운드 스크리닝 ({now.strftime('%H:%M')})")
-                    # 장외시간에는 프리 마켓 스크리닝으로 다음날 준비
-                    screening_results = self.trading_api.get_market_screening_candidates("all")
-
-                    if screening_results:
-                        # 🌟 프리 마켓 결과를 백그라운드 모니터링에 추가
-                        self._process_pre_market_screening(screening_results)
-                        logger.info("🌙 프리 마켓 스크리닝 백그라운드 처리 완료")
-
-                    # 장외시간에는 더 긴 간격 (30분)
-                    import time
-                    time.sleep(1800)  # 30분 대기
-                    continue
-
-                # 🚀 장중 일반 스크리닝 (기존 로직)
-                logger.info("📊 장중 백그라운드 스크리닝 실행")
-                screening_results = self.trading_api.get_market_screening_candidates("all")
-
-                # 백그라운드 데이터 처리 (장중)
-                background_data = screening_results.get('background', [])
-                if isinstance(background_data, list):
-                    background_dict = {
-                        'volume_leaders': background_data[:15],
-                        'price_movers': background_data[15:30] if len(background_data) > 15 else [],
-                        'bid_ask_leaders': background_data[30:40] if len(background_data) > 30 else []
-                    }
-                    background_data = background_dict
-
-                # 거래량 급증 종목들
-                volume_leaders = background_data.get('volume_leaders', [])
-                for stock_data in volume_leaders[:15]:  # 상위 15개
-                    stock_code = stock_data['stock_code']
-                    if stock_data['volume_ratio'] >= 200:  # 2배 이상
-                        self.data_manager.add_stock_request(
-                            stock_code=stock_code,
-                            priority=DataPriority.BACKGROUND,
-                            strategy_name="background_screening",
-                            callback=self.background_screening_callback
-                        )
-
-                # 등락률 상위 종목들
-                price_movers = background_data.get('price_movers', [])
-                for stock_data in price_movers[:15]:  # 상위 15개
-                    stock_code = stock_data['stock_code']
-                    if abs(stock_data['change_rate']) >= 3.0:  # 3% 이상
-                        self.data_manager.add_stock_request(
-                            stock_code=stock_code,
-                            priority=DataPriority.BACKGROUND,
-                            strategy_name="background_screening",
-                            callback=self.background_screening_callback
-                        )
-
-                # 호가 잔량 주요 종목들
-                bid_ask_leaders = background_data.get('bid_ask_leaders', [])
-                for stock_data in bid_ask_leaders[:10]:  # 상위 10개
-                    stock_code = stock_data['stock_code']
-                    if stock_data['buying_pressure'] == 'STRONG':
-                        self.data_manager.add_stock_request(
-                            stock_code=stock_code,
-                            priority=DataPriority.BACKGROUND,
-                            strategy_name="background_screening",
-                            callback=self.background_screening_callback
-                        )
-
-                logger.info(f"📊 백그라운드 스크리닝 완료 - 거래량:{len(volume_leaders)}, 등락률:{len(price_movers)}, 호가:{len(bid_ask_leaders)}")
-
-                # 5분 대기 (장중)
-                import time
-                time.sleep(300)
-
-        except Exception as e:
-            logger.error(f"백그라운드 스크리닝 오류: {e}")
-
-    def _process_pre_market_screening(self, screening_results: Dict):
-        """🆕 프리 마켓 스크리닝 결과 처리"""
-        try:
-            processed_count = 0
-
-            # 1. 갭 트레이딩 후보들을 BACKGROUND 우선순위로 추가
-            gap_candidates = screening_results.get('gap_trading', [])
-            for candidate in gap_candidates[:8]:  # 상위 8개
-                stock_code = candidate.get('stock_code')
-                if stock_code:
-                    self.data_manager.add_stock_request(
-                        stock_code=stock_code,
-                        priority=DataPriority.BACKGROUND,
-                        strategy_name="pre_market_gap",
-                        callback=self._create_pre_market_callback(stock_code, "gap")
-                    )
-                    processed_count += 1
-
-            # 2. 볼륨 브레이크아웃 후보들
-            volume_candidates = screening_results.get('volume_breakout', [])
-            for candidate in volume_candidates[:8]:  # 상위 8개
-                stock_code = candidate.get('stock_code')
-                if stock_code:
-                    self.data_manager.add_stock_request(
-                        stock_code=stock_code,
-                        priority=DataPriority.BACKGROUND,
-                        strategy_name="pre_market_volume",
-                        callback=self._create_pre_market_callback(stock_code, "volume")
-                    )
-                    processed_count += 1
-
-            # 3. 모멘텀 후보들
-            momentum_candidates = screening_results.get('momentum', [])
-            for candidate in momentum_candidates[:6]:  # 상위 6개
-                stock_code = candidate.get('stock_code')
-                if stock_code:
-                    self.data_manager.add_stock_request(
-                        stock_code=stock_code,
-                        priority=DataPriority.BACKGROUND,
-                        strategy_name="pre_market_momentum",
-                        callback=self._create_pre_market_callback(stock_code, "momentum")
-                    )
-                    processed_count += 1
-
-            # 4. 백그라운드 종목들 (제한적으로)
-            background_data = screening_results.get('background', {})
-            if isinstance(background_data, dict):
-                all_background = []
-                all_background.extend(background_data.get('volume_leaders', [])[:5])
-                all_background.extend(background_data.get('price_movers', [])[:5])
-
-                for candidate in all_background:
-                    stock_code = candidate.get('stock_code')
-                    if stock_code:
-                        self.data_manager.add_stock_request(
-                            stock_code=stock_code,
-                            priority=DataPriority.BACKGROUND,
-                            strategy_name="pre_market_background",
-                            callback=self._create_pre_market_callback(stock_code, "background")
-                        )
-                        processed_count += 1
-
-            logger.info(f"🌙 프리 마켓 종목 처리 완료: {processed_count}개 백그라운드 모니터링 추가")
-
-        except Exception as e:
-            logger.error(f"프리 마켓 스크리닝 처리 오류: {e}")
-
-    def _create_pre_market_callback(self, stock_code: str, strategy_type: str):
-        """🆕 프리 마켓 전용 콜백 함수 생성"""
-        def callback(stock_code: str, data: Dict, source: str):
-            try:
-                # 장 시작 전에는 조용히 모니터링
-                # 장 시작 후에는 활성화
-                from datetime import datetime
-                import pytz
-                kst = pytz.timezone('Asia/Seoul')
-                now = datetime.now(kst)
-                is_market_hours = self.trading_api.is_market_open(now)
-
-                if not is_market_hours:
-                    # 장외시간에는 로깅만
-                    if 'current_price' in data:
-                        price_data = data['current_price']
-                        change_rate = price_data.get('change_rate', 0)
-                        logger.debug(f"🌙 프리마켓 모니터링: {stock_code} {change_rate:+.1f}% ({strategy_type})")
-                    return
-
-                # 🚀 장 시작 후에는 적극적 처리
-                if 'current_price' not in data:
-                    return
-
-                price_data = data['current_price']
-                change_rate = price_data.get('change_rate', 0)
-                volume = price_data.get('volume', 0)
-                current_price = price_data.get('current_price', 0)
-
-                # 프리마켓 예상이 맞았는지 확인
-                if strategy_type == "gap" and abs(change_rate) >= 3.0:
-                    logger.info(f"🎯 갭 예상 적중: {stock_code} {change_rate:+.1f}%")
-                    # HIGH 우선순위로 승격
-                    self.data_manager.upgrade_priority(stock_code, DataPriority.HIGH)
-
-                    # 강한 갭 신호 생성
-                    candidate = StockCandidate(
-                        stock_code=stock_code,
-                        strategy_type='gap_trading_confirmed',
-                        score=abs(change_rate) * 1.5,
-                        reason=f"프리마켓 갭 예상 적중 {change_rate:+.1f}%",
-                        discovered_at=now_kst(),
-                        data=data
-                    )
-                    self._add_discovered_candidate(candidate)
-
-                elif strategy_type == "volume" and volume > 0:
-                    # 볼륨 비교는 전일 대비로만 가능
-                    volume_score = min(10.0, volume / 1000000)  # 임시 점수
-                    if volume_score >= 3.0:
-                        logger.info(f"🚀 볼륨 예상 적중: {stock_code} 거래량 {volume:,}")
-                        self.data_manager.upgrade_priority(stock_code, DataPriority.MEDIUM)
-
-                elif strategy_type == "momentum" and change_rate > 2.0:
-                    logger.info(f"📈 모멘텀 예상 적중: {stock_code} {change_rate:+.1f}%")
-                    self.data_manager.upgrade_priority(stock_code, DataPriority.MEDIUM)
-
-                    candidate = StockCandidate(
-                        stock_code=stock_code,
-                        strategy_type='momentum_confirmed',
-                        score=change_rate + 2.0,
-                        reason=f"프리마켓 모멘텀 예상 적중",
-                        discovered_at=now_kst(),
-                        data=data
-                    )
-                    self._add_discovered_candidate(candidate)
-
-            except Exception as e:
-                logger.error(f"프리마켓 콜백 오류 ({stock_code}): {e}")
-
-        return callback
-
-    def background_screening_callback(self, stock_code: str, data: Dict, source: str):
-        """백그라운드 스크리닝 콜백"""
-        try:
-            # 주목할 만한 움직임 감지시 우선순위 상향
-            if 'current_price' not in data:
+            if not current_slot:
+                logger.info("📅 활성 시간대가 없음")
                 return
 
-            price_data = data['current_price']
-            change_rate = price_data.get('change_rate', 0)
-            volume = price_data.get('volume', 0)
+            # 새로운 시간대 시작
+            if not self.current_slot or self.current_slot.name != current_slot.name:
+                logger.info(f"🔄 새 시간대 시작: {current_slot.name} ({current_slot.description})")
+                self.current_slot = current_slot
 
-            # 거래량 급증 (3배 이상) 감지
-            avg_volume = volume / 3  # 임시 평균
-            volume_ratio = volume / avg_volume if avg_volume > 0 else 0
+                # 이전 전략 정리
+                await self._cleanup_previous_strategy()
 
-            if volume_ratio >= 5.0:  # 5배 이상 급증
-                candidate = StockCandidate(
-                    stock_code=stock_code,
-                    strategy_type='emergency_volume',
-                    score=volume_ratio / 3.0,
-                    reason=f"거래량{volume_ratio:.1f}배 폭증",
-                    discovered_at=now_kst(),
-                    data=data
-                )
-                self._add_discovered_candidate(candidate)
-
-                # MEDIUM 우선순위로 승격
-                self.data_manager.upgrade_priority(stock_code, DataPriority.MEDIUM)
-                logger.info(f"🚨 긴급 거래량 급증: {stock_code} {volume_ratio:.1f}배 → MEDIUM 우선순위")
-
-            # 급격한 가격 변동 (5% 이상) 감지
-            if abs(change_rate) >= 5.0:
-                candidate = StockCandidate(
-                    stock_code=stock_code,
-                    strategy_type='emergency_price',
-                    score=abs(change_rate) / 2.0,
-                    reason=f"급격한 변동{change_rate:+.1f}%",
-                    discovered_at=now_kst(),
-                    data=data
-                )
-                self._add_discovered_candidate(candidate)
-
-                if abs(change_rate) >= 8.0:  # 8% 이상은 HIGH 우선순위
-                    self.data_manager.upgrade_priority(stock_code, DataPriority.HIGH)
-                    logger.info(f"🚨 급격한 가격 변동: {stock_code} {change_rate:+.1f}% → HIGH 우선순위")
+                # 새 전략 준비 및 활성화
+                await self._prepare_and_activate_strategy(current_slot)
 
         except Exception as e:
-            logger.error(f"백그라운드 스크리닝 오류: {e}")
-
-    def _add_discovered_candidate(self, candidate: StockCandidate):
-        """발견된 후보 추가 (스레드 안전)"""
-        with self.discovery_lock:
-            strategy_type = candidate.strategy_type
-            if strategy_type not in self.candidates:
-                self.candidates[strategy_type] = []
-
-            # 중복 제거 및 점수순 정렬
-            existing_codes = {c.stock_code for c in self.candidates[strategy_type]}
-            if candidate.stock_code not in existing_codes:
-                self.candidates[strategy_type].append(candidate)
-                self.candidates[strategy_type].sort(key=lambda x: x.score, reverse=True)
-
-                # 최대 20개까지만 유지
-                self.candidates[strategy_type] = self.candidates[strategy_type][:20]
-
-    def stop_scheduler(self):
-        """스케줄러 중지"""
-        self.scheduler_running = False
-        self.screening_active = False
-
-        # 스레드 풀 종료
-        self.discovery_executor.shutdown(wait=True)
-        self.screening_executor.shutdown(wait=True)
-
-        logger.info("🛑 전략 스케줄러 중지")
-
-    async def _schedule_loop(self):
-        """스케줄링 메인 루프 - 시간대 전환 시에만 실행"""
-        now = datetime.now(KST)
-        current_time = now.time()
-
-        logger.info(f"🔄 전략 스케줄링 실행: {current_time.strftime('%H:%M:%S')}")
-
-        # 시간대 변경 체크
-        new_slot = self._get_time_slot_for_time(current_time)
-
-        if new_slot != self.current_slot:
-            logger.info(f"🔄 시간대 변경: {self.current_slot.name if self.current_slot else 'None'} → {new_slot.name if new_slot else 'None'}")
-
-            if new_slot:
-                # 새 시간대 시작
-                await self._start_new_time_slot(new_slot)
-            else:
-                # 장외 시간
-                await self._handle_after_hours()
-
-        # 현재 시간대가 있고 아직 준비가 완료되지 않았다면 준비 상태 체크
-        elif self.current_slot and not self.preparation_completed:
-            await self._check_preparation_status()
-
-        # 이미 준비가 완료된 상태라면 로그만 출력
-        elif self.current_slot and self.preparation_completed:
-            logger.info(f"✅ {self.current_slot.name} 전략 실행 중 (준비 완료)")
-        else:
-            logger.info("⏸️ 대기 상태 - 해당 시간대 없음")
-
-    def _get_time_slot_for_time(self, current_time: time) -> Optional[TimeSlotConfig]:
-        """현재 시간에 해당하는 시간대 반환"""
-        for slot in self.time_slots.values():
-            if slot.start_time <= current_time <= slot.end_time:
-                return slot
-        return None
-
-    async def _start_new_time_slot(self, slot: TimeSlotConfig):
-        """새 시간대 시작"""
-        self.current_slot = slot
-        self.current_phase = StrategyPhase.PREPARATION
-        self.preparation_completed = False
-
-        logger.info(f"📅 새 시간대 시작: {slot.description}")
-
-        # 이전 전략 정리
-        await self._cleanup_previous_strategy()
-
-        # 새 전략을 위한 종목 탐색 시작 (별도 스레드에서!)
-        await self._start_stock_discovery_threaded()
+            logger.error(f"시간대 전략 실행 오류: {e}")
 
     async def _cleanup_previous_strategy(self):
         """이전 전략 정리"""
-        # 기존 활성 종목들을 백그라운드로 전환
-        for strategy_type, stocks in self.active_stocks.items():
-            for stock_code in stocks:
-                self.data_manager.upgrade_priority(stock_code, DataPriority.BACKGROUND)
+        try:
+            logger.info("🧹 이전 전략 정리 중...")
 
-        # 활성 종목 초기화
-        self.active_stocks.clear()
-        logger.info("🧹 이전 전략 정리 완료")
+            # 활성 종목 정리
+            if hasattr(self, 'active_stocks'):
+                for strategy_name, stock_codes in self.active_stocks.items():
+                    for stock_code in stock_codes:
+                        self.data_manager.remove_stock(stock_code)
+                self.active_stocks.clear()
 
-    async def _start_stock_discovery_threaded(self):
-        """종목 탐색 시작 (별도 스레드에서 실행)"""
-        if not self.current_slot:
-            return
+            logger.info("✅ 이전 전략 정리 완료")
 
-        logger.info(f"🔍 종목 탐색 시작: {self.current_slot.description}")
+        except Exception as e:
+            logger.error(f"이전 전략 정리 오류: {e}")
 
-        # 스레드에서 실행할 태스크들 준비
-        loop = asyncio.get_event_loop()
-        discovery_futures = []
+    async def _prepare_and_activate_strategy(self, slot: TimeSlotConfig):
+        """전략 준비 및 활성화"""
+        try:
+            logger.info(f"🎯 전략 준비 시작: {slot.name}")
 
-        # 주요 전략 탐색
-        for strategy_name, weight in self.current_slot.primary_strategies.items():
-            future = loop.run_in_executor(
-                self.discovery_executor,
-                self._discover_stocks_sync,
+            # 1단계: 종목 탐색
+            await self._discover_strategy_stocks(slot)
+
+            # 2단계: 전략 활성화
+            await self._activate_strategies(slot)
+
+            logger.info(f"✅ 전략 활성화 완료: {slot.name}")
+
+        except Exception as e:
+            logger.error(f"전략 준비/활성화 오류: {e}")
+
+    async def _discover_strategy_stocks(self, slot: TimeSlotConfig):
+        """전략별 종목 탐색"""
+        try:
+            logger.info(f"🔍 종목 탐색 시작: {slot.name}")
+
+            # 기본 전략들 탐색
+            all_strategies = {**slot.primary_strategies, **slot.secondary_strategies}
+
+            discovery_tasks = []
+            for strategy_name, weight in all_strategies.items():
+                task = asyncio.create_task(
+                    self._discover_single_strategy(strategy_name, weight)
+                )
+                discovery_tasks.append(task)
+
+            # 모든 탐색 완료 대기 (최대 60초)
+            await asyncio.wait_for(
+                asyncio.gather(*discovery_tasks, return_exceptions=True),
+                timeout=60
+            )
+
+            logger.info("✅ 종목 탐색 완료")
+
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ 종목 탐색 시간 초과 (60초)")
+        except Exception as e:
+            logger.error(f"종목 탐색 오류: {e}")
+
+    async def _discover_single_strategy(self, strategy_name: str, weight: float):
+        """단일 전략 종목 탐색"""
+        try:
+            # 별도 스레드에서 탐색 실행
+            loop = asyncio.get_event_loop()
+            candidates = await loop.run_in_executor(
+                None,
+                self.stock_discovery.discover_strategy_stocks,
                 strategy_name, weight, True
             )
-            discovery_futures.append(future)
 
-        # 보조 전략 탐색
-        for strategy_name, weight in self.current_slot.secondary_strategies.items():
-            future = loop.run_in_executor(
-                self.discovery_executor,
-                self._discover_stocks_sync,
-                strategy_name, weight, False
-            )
-            discovery_futures.append(future)
-
-        # 모든 탐색 완료 대기
-        results = await asyncio.gather(*discovery_futures, return_exceptions=True)
-
-        # 결과 처리
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"종목 탐색 오류: {result}")
-
-        # 탐색 완료 후 전략 활성화
-        await self._activate_discovered_strategies()
-
-    def _discover_stocks_sync(self, strategy_name: str, weight: float, is_primary: bool) -> List[StockCandidate]:
-        """동기 방식 종목 탐색 (스레드에서 실행) - 동적 발굴 적용"""
-        try:
-            if strategy_name == 'gap_trading':
-                candidates = self._discover_gap_candidates_sync()
-            elif strategy_name == 'volume_breakout':
-                candidates = self._discover_volume_candidates_sync()
-            elif strategy_name == 'momentum':
-                candidates = self._discover_momentum_candidates_sync()
-            else:
-                logger.warning(f"알 수 없는 전략: {strategy_name}")
-                return []
-
-            # 스레드 안전하게 후보 저장
-            with self.discovery_lock:
-                self.candidates[strategy_name] = candidates
-
-            logger.info(f"✅ {strategy_name} 탐색 완료: {len(candidates)}개 후보")
-            return candidates
-
-        except Exception as e:
-            logger.error(f"{strategy_name} 탐색 중 오류: {e}")
-            return []
-
-    def _discover_gap_candidates_sync(self) -> List[StockCandidate]:
-        """갭 트레이딩 후보 탐색 (동기) - REST API 동적 발굴"""
-        candidates = []
-
-        try:
-            # 🆕 ConfigLoader의 load_strategy_config() 사용
-            gap_config = self.config_loader.load_strategy_config('gap_trading')
-            min_gap = float(gap_config.get('min_gap_percent', 3.0))
-            max_gap = float(gap_config.get('max_gap_percent', 15.0))
-            min_volume_ratio = float(gap_config.get('min_volume_ratio', 2.0))
-
-            # REST API를 통한 동적 갭 트레이딩 후보 발굴
-            gap_candidates = self.trading_api.discover_gap_trading_candidates(
-                gap_min=min_gap,
-                gap_max=max_gap,
-                volume_ratio_min=min_volume_ratio
-            )
-
-            # StockCandidate 객체로 변환
-            for gap_data in gap_candidates:
-                candidate = StockCandidate(
-                    stock_code=gap_data['stock_code'],
-                    strategy_type='gap_trading',
-                    score=gap_data['score'],
-                    reason=f"갭{gap_data['gap_rate']:+.1f}% 거래량{gap_data['volume_ratio']:.1f}배",
-                    discovered_at=now_kst(),
-                    data=gap_data
-                )
-                candidates.append(candidate)
-
-            logger.info(f"🔍 갭 트레이딩 후보 발굴: {len(candidates)}개")
-
-        except Exception as e:
-            logger.error(f"갭 트레이딩 후보 탐색 중 오류: {e}")
-
-        return candidates
-
-    def _discover_volume_candidates_sync(self) -> List[StockCandidate]:
-        """거래량 돌파 후보 탐색 (동기) - REST API 동적 발굴"""
-        candidates = []
-
-        try:
-            # 🆕 ConfigLoader의 load_strategy_config() 사용
-            volume_config = self.config_loader.load_strategy_config('volume_breakout')
-            min_volume_ratio = float(volume_config.get('min_volume_ratio', 3.0))
-            min_price_change = float(volume_config.get('min_price_change', 1.0))
-
-            # REST API를 통한 동적 거래량 돌파 후보 발굴
-            volume_candidates = self.trading_api.discover_volume_breakout_candidates(
-                volume_ratio_min=min_volume_ratio,
-                price_change_min=min_price_change
-            )
-
-            # StockCandidate 객체로 변환
-            for volume_data in volume_candidates:
-                candidate = StockCandidate(
-                    stock_code=volume_data['stock_code'],
-                    strategy_type='volume_breakout',
-                    score=volume_data['score'],
-                    reason=f"거래량{volume_data['volume_ratio']:.1f}배 변동{volume_data['change_rate']:+.1f}%",
-                    discovered_at=now_kst(),
-                    data=volume_data
-                )
-                candidates.append(candidate)
-
-            logger.info(f"🚀 거래량 돌파 후보 발굴: {len(candidates)}개")
-
-        except Exception as e:
-            logger.error(f"거래량 돌파 후보 탐색 중 오류: {e}")
-
-        return candidates
-
-    def _discover_momentum_candidates_sync(self) -> List[StockCandidate]:
-        """모멘텀 후보 탐색 (동기) - REST API 동적 발굴"""
-        candidates = []
-
-        try:
-            # 🆕 ConfigLoader의 load_strategy_config() 사용
-            momentum_config = self.config_loader.load_strategy_config('momentum')
-            min_change_rate = float(momentum_config.get('min_momentum_percent', 1.5))
-            min_volume_ratio = float(momentum_config.get('min_volume_ratio', 1.5))
-
-            # REST API를 통한 동적 모멘텀 후보 발굴
-            momentum_candidates = self.trading_api.discover_momentum_candidates(
-                min_change_rate=min_change_rate,
-                min_volume_ratio=min_volume_ratio
-            )
-
-            # StockCandidate 객체로 변환
-            for momentum_data in momentum_candidates:
-                candidate = StockCandidate(
-                    stock_code=momentum_data['stock_code'],
-                    strategy_type='momentum',
-                    score=momentum_data['score'],
-                    reason=f"모멘텀{momentum_data['change_rate']:+.1f}% {momentum_data['trend_quality']}",
-                    discovered_at=now_kst(),
-                    data=momentum_data
-                )
-                candidates.append(candidate)
-
-            logger.info(f"📈 모멘텀 후보 발굴: {len(candidates)}개")
-
-        except Exception as e:
-            logger.error(f"모멘텀 후보 탐색 중 오류: {e}")
-
-        return candidates
-
-    async def _activate_discovered_strategies(self):
-        """탐색된 전략 활성화"""
-        if not self.current_slot:
-            return
-
-        logger.info("🚀 전략 활성화 시작")
-
-        # 주요 전략 활성화
-        for strategy_name, weight in self.current_slot.primary_strategies.items():
-            candidates = self.candidates.get(strategy_name, [])
             if candidates:
-                await self._activate_strategy_candidates(strategy_name, candidates, DataPriority.CRITICAL, weight)
-
-        # 보조 전략 활성화
-        for strategy_name, weight in self.current_slot.secondary_strategies.items():
-            candidates = self.candidates.get(strategy_name, [])
-            if candidates:
-                await self._activate_strategy_candidates(strategy_name, candidates, DataPriority.HIGH, weight)
-
-        self.preparation_completed = True
-        self.current_phase = StrategyPhase.EXECUTION
-
-        # 🆕 main.py와 동기화 - selected_stocks 업데이트
-        await self._sync_with_main_bot()
-
-        logger.info("✅ 전략 활성화 완료")
-
-    async def _sync_with_main_bot(self):
-        """🆕 main.py 봇 인스턴스와 동기화"""
-        bot_instance = getattr(self, '_bot_instance', None)
-        if not bot_instance or not self.current_slot:
-            return
-
-        from typing import cast
-        bot_instance = cast('StockBotMain', bot_instance)
-
-        try:
-            # active_stocks의 모든 종목들을 하나의 리스트로 합치기
-            all_active_stocks = []
-            for strategy_stocks in self.active_stocks.values():
-                all_active_stocks.extend(strategy_stocks)
-
-            # 중복 제거
-            unique_stocks = list(set(all_active_stocks))
-
-            # main.py의 handle_time_slot_change 호출
-            bot_instance.handle_time_slot_change(
-                new_time_slot=self.current_slot.name,
-                new_stocks=unique_stocks
-            )
-
-            logger.info(f"🔄 main.py 동기화 완료: {self.current_slot.name} - {len(unique_stocks)}개 종목")
+                stock_codes = [c.stock_code for c in candidates]
+                self.active_stocks[strategy_name] = stock_codes
+                logger.info(f"✅ {strategy_name} 전략: {len(stock_codes)}개 종목 발견")
 
         except Exception as e:
-            logger.error(f"main.py 동기화 오류: {e}")
+            logger.error(f"단일 전략 탐색 오류 ({strategy_name}): {e}")
 
-    async def _activate_strategy_candidates(self, strategy_name: str, candidates: List[StockCandidate],
-                                         priority: DataPriority, weight: float):
-        """전략 후보들을 활성화"""
-        activated_stocks = []
+    async def _activate_strategies(self, slot: TimeSlotConfig):
+        """전략 활성화"""
+        try:
+            all_strategies = {**slot.primary_strategies, **slot.secondary_strategies}
 
-        # 우선순위에 따른 종목 수 제한
-        max_stocks = 8 if priority == DataPriority.CRITICAL else 15
+            for strategy_name, weight in all_strategies.items():
+                if strategy_name in self.active_stocks:
+                    await self._activate_single_strategy(strategy_name, weight)
 
-        # 현재 시간대를 DB 시간대 enum으로 변환
-        current_db_slot = self._convert_to_db_timeslot(self.current_slot.name if self.current_slot else 'golden_time')
+        except Exception as e:
+            logger.error(f"전략 활성화 오류: {e}")
 
-        for candidate in candidates[:max_stocks]:
-            success = self.data_manager.add_stock_request(
-                stock_code=candidate.stock_code,
-                priority=priority,
-                strategy_name=strategy_name,
-                callback=self._create_strategy_callback(strategy_name)
-            )
+    async def _activate_single_strategy(self, strategy_name: str, weight: float):
+        """단일 전략 활성화"""
+        try:
+            stock_codes = self.active_stocks.get(strategy_name, [])
 
-            if success:
-                activated_stocks.append(candidate.stock_code)
+            for i, stock_code in enumerate(stock_codes):
+                # 데이터 관리자에 종목 추가 (우선순위와 실시간 여부 설정)
+                callback = self._create_strategy_callback(strategy_name)
 
-                # 데이터베이스에 선택된 종목 기록
-                self._record_selected_stock(candidate, current_db_slot, priority, success)
+                # 상위 13개는 실시간 시도, 나머지는 폴링
+                use_realtime = i < 13
+                priority = self._get_strategy_priority(strategy_name, i)
 
-                logger.info(f"📊 {strategy_name} 활성화: {candidate.stock_code} ({candidate.reason})")
+                self.data_manager.add_stock(
+                    stock_code=stock_code,
+                    strategy_name=strategy_name,
+                    use_realtime=use_realtime,
+                    callback=callback,
+                    priority=priority
+                )
 
-        self.active_stocks[strategy_name] = activated_stocks
-        logger.info(f"✅ {strategy_name} 전략: {len(activated_stocks)}개 종목 활성화")
+            logger.info(f"🎯 {strategy_name} 전략 활성화: {len(stock_codes)}개 종목")
 
-    def _convert_to_db_timeslot(self, slot_name: str) -> DBTimeSlot:
-        """시간대 이름을 DB TimeSlot enum으로 변환"""
-        mapping = {
-            'golden_time': DBTimeSlot.GOLDEN_TIME,
-            'morning_leaders': DBTimeSlot.MORNING_LEADERS,
-            'lunch_time': DBTimeSlot.LUNCH_TIME,
-            'closing_trend': DBTimeSlot.CLOSING_TREND,
+        except Exception as e:
+            logger.error(f"단일 전략 활성화 오류 ({strategy_name}): {e}")
+
+    def _get_strategy_priority(self, strategy_name: str, stock_index: int) -> int:
+        """전략별 우선순위 결정"""
+        # 기본 전략 우선순위
+        strategy_base_priority = {
+            'gap_trading': 1,      # 갭 트레이딩이 가장 높음
+            'momentum': 2,         # 모멘텀이 두번째
+            'volume_breakout': 3   # 거래량 돌파가 세번째
         }
-        return mapping.get(slot_name, DBTimeSlot.GOLDEN_TIME)
 
-    def _record_selected_stock(self, candidate: StockCandidate, time_slot: DBTimeSlot,
-                             priority: DataPriority, activation_success: bool):
-        """선택된 종목을 데이터베이스에 기록"""
-        try:
-            stock_data = {
-                'stock_code': candidate.stock_code,
-                'stock_name': candidate.data.get('stock_name', ''),
-                'strategy_type': candidate.strategy_type,
-                'score': candidate.score,
-                'reason': candidate.reason,
-                'priority': priority.value,
-                'current_price': candidate.data.get('current_price', 0),
-                'change_rate': candidate.data.get('change_rate', 0),
-                'volume': candidate.data.get('volume', 0),
-                'activation_success': activation_success,
-            }
+        base = strategy_base_priority.get(strategy_name, 3)
 
-            # 전략별 특화 데이터 추가
-            if candidate.strategy_type == 'gap_trading':
-                stock_data.update({
-                    'volume_ratio': candidate.data.get('volume_ratio'),
-                    'gap_rate': candidate.data.get('gap_rate'),
-                })
-            elif candidate.strategy_type == 'volume_breakout':
-                stock_data.update({
-                    'volume_ratio': candidate.data.get('volume_ratio'),
-                    'breakout_direction': candidate.data.get('breakout_direction'),
-                    'buying_pressure': candidate.data.get('buying_pressure'),
-                })
-            elif candidate.strategy_type == 'momentum':
-                stock_data.update({
-                    'momentum_strength': candidate.data.get('momentum_strength'),
-                    'trend_quality': candidate.data.get('trend_quality'),
-                    'consecutive_up_days': candidate.data.get('consecutive_up_days'),
-                    'ma_position': candidate.data.get('ma_position'),
-                })
-
-            # DB에 기록
-            success = db_manager.record_selected_stock(time_slot, stock_data)
-            if success:
-                logger.debug(f"💾 종목 선택 기록: {candidate.stock_code} ({time_slot.value})")
-            else:
-                logger.warning(f"⚠️ 종목 선택 기록 실패: {candidate.stock_code}")
-
-        except Exception as e:
-            logger.error(f"종목 선택 기록 중 오류: {e}")
+        # 같은 전략 내에서도 순위별 우선순위 (상위 5개는 우선순위 상승)
+        if stock_index < 5:
+            return base
+        elif stock_index < 10:
+            return base + 1
+        else:
+            return base + 2
 
     def _create_strategy_callback(self, strategy_name: str):
-        """전략별 콜백 함수 생성 - 실제 거래 신호 처리"""
+        """전략별 콜백 생성"""
         def callback(stock_code: str, data: Dict, source: str):
             try:
-                # 현재 포지션이 있는지 확인
-                bot_instance = getattr(self, '_bot_instance', None)
-                if not bot_instance:
-                    return
-
-                # 🚀 타입 힌트 추가 - IDE가 StockBotMain의 속성들을 인식하도록
-                from typing import cast
-                bot_instance = cast('StockBotMain', bot_instance)
-
-                # 실시간 데이터에서 필요한 정보 추출
-                current_price_data = data.get('current_price', {})
-                if not current_price_data:
-                    return
-
-                current_price = current_price_data.get('current_price', 0)
-                if current_price <= 0:
-                    return
-
-                # 포지션 확인 (이제 IDE가 positions 속성을 인식함)
-                has_position = stock_code in bot_instance.positions
-
-                # 전략별 신호 생성 및 처리
-                signal = self._generate_trading_signal(
-                    strategy_name, stock_code, data, source, has_position
-                )
-
+                # 간단한 신호 생성
+                signal = self._generate_simple_signal(strategy_name, stock_code, data)
                 if signal:
-                    # 신호를 main의 거래 큐에 전송 (주문 실행은 monitor_positions에서)
-                    signal['stock_code'] = stock_code
-                    signal['strategy_type'] = f"signal_{strategy_name}"
-
-                    # 🚀 비동기 호출 문제 해결: 스레드 안전 방식으로 신호 전송
-                    try:
-                        # 현재 실행 중인 이벤트 루프가 있으면 사용
-                        loop = asyncio.get_running_loop()
-                        # 콜백이 다른 스레드에서 실행될 수 있으므로 thread-safe하게 처리
-                        loop.call_soon_threadsafe(
-                            lambda: asyncio.create_task(bot_instance.add_trading_signal(signal))
-                        )
-                    except RuntimeError:
-                        # 이벤트 루프가 없거나 다른 스레드인 경우 로깅만
-                        logger.warning(f"⚠️ 이벤트 루프 없음 - 신호 전송 실패: {stock_code} {signal.get('action')}")
-                    except Exception as e:
-                        logger.error(f"신호 전송 오류 ({stock_code}): {e}")
-
+                    # 봇에게 신호 전달
+                    asyncio.create_task(self._send_signal_to_bot(signal))
             except Exception as e:
-                logger.error(f"{strategy_name} 콜백 오류: {e}")
+                logger.error(f"콜백 오류: {strategy_name} {stock_code} - {e}")
 
         return callback
 
-    def _generate_trading_signal(self, strategy_name: str, stock_code: str,
-                               data: Dict, source: str, has_position: bool) -> Optional[Dict]:
-        """실시간 데이터 기반 거래 신호 생성"""
+    def _generate_simple_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
+        """간단한 신호 생성"""
         try:
-            current_price_data = data.get('current_price', {})
-            current_price = current_price_data.get('current_price', 0)
-            change_rate = current_price_data.get('change_rate', 0)
-            volume = current_price_data.get('volume', 0)
-
-            # 기본 필터링
+            # 임시 신호 생성 로직 (실제로는 더 복잡한 분석 필요)
+            current_price = data.get('current_price', 0)
             if current_price <= 0:
                 return None
 
-            # 이미 포지션이 있는 경우 매도 신호만 고려
-            if has_position:
-                return self._check_sell_signal(strategy_name, stock_code, data)
+            # 가격 변화율 기반 간단한 신호
+            change_rate = data.get('change_rate', 0)
 
-            # 포지션이 없는 경우 매수 신호 고려
-            return self._check_buy_signal(strategy_name, stock_code, data)
+            signal = None
+            if strategy_name == 'gap_trading' and change_rate > 3.0:
+                signal = {
+                    'stock_code': stock_code,
+                    'signal_type': 'BUY',
+                    'strategy': strategy_name,
+                    'price': current_price,
+                    'strength': min(change_rate / 10.0, 1.0),
+                    'reason': f'갭 상승 {change_rate:.1f}%'
+                }
+            elif strategy_name == 'volume_breakout' and change_rate > 2.0:
+                volume = data.get('volume', 0)
+                if volume > 0:  # 거래량 체크는 추후 개선
+                    signal = {
+                        'stock_code': stock_code,
+                        'signal_type': 'BUY',
+                        'strategy': strategy_name,
+                        'price': current_price,
+                        'strength': min(change_rate / 8.0, 1.0),
+                        'reason': f'거래량 돌파 {change_rate:.1f}%'
+                    }
+            elif strategy_name == 'momentum' and change_rate > 1.0:
+                signal = {
+                    'stock_code': stock_code,
+                    'signal_type': 'BUY',
+                    'strategy': strategy_name,
+                    'price': current_price,
+                    'strength': min(change_rate / 5.0, 1.0),
+                    'reason': f'모멘텀 {change_rate:.1f}%'
+                }
+
+            return signal
 
         except Exception as e:
-            logger.error(f"거래 신호 생성 오류 ({strategy_name}, {stock_code}): {e}")
+            logger.error(f"신호 생성 오류: {strategy_name} {stock_code} - {e}")
             return None
 
-    def _check_buy_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
-        """매수 신호 확인 - 설정 파일 기반"""
-        current_price_data = data.get('current_price', {})
-        current_price = current_price_data.get('current_price', 0)
-        change_rate = current_price_data.get('change_rate', 0)
-        volume = current_price_data.get('volume', 0)
+    async def _send_signal_to_bot(self, signal: Dict):
+        """봇에게 신호 전달"""
+        try:
+            if self.bot_instance and hasattr(self.bot_instance, 'handle_trading_signal'):
+                self.bot_instance.handle_trading_signal(signal)
+        except Exception as e:
+            logger.error(f"신호 전달 오류: {e}")
 
-        # 전략별 매수 조건 확인 (설정 파일에서 로드)
-        if strategy_name == 'gap_trading':
-            # 🚀 ConfigLoader에서 갭 트레이딩 설정 로드
-            gap_config = self.config_loader.load_strategy_config('gap_trading')
-            min_change_rate = float(gap_config.get('min_gap_percent', 3.0))
-            strength_divisor = float(gap_config.get('strength_divisor', 10.0))
+    def set_bot_instance(self, bot_instance: 'StockBot'):
+        """봇 인스턴스 설정"""
+        self.bot_instance = bot_instance
+        logger.info("봇 인스턴스 설정 완료")
 
-            if change_rate >= min_change_rate and volume > 0:
-                return {
-                    'action': 'BUY',
-                    'price': current_price,
-                    'reason': f'갭 상승 {change_rate:.1f}% + 거래량 급증',
-                    'strength': min(change_rate / strength_divisor, 1.0)
-                }
+    def stop_scheduler(self):
+        """스케줄러 중지"""
+        try:
+            logger.info("🛑 전략 스케줄러 중지 중...")
 
-        elif strategy_name == 'volume_breakout':
-            # 🚀 ConfigLoader에서 볼륨 브레이크아웃 설정 로드
-            volume_config = self.config_loader.load_strategy_config('volume_breakout')
-            min_change_rate = float(volume_config.get('min_price_change', 2.0))
-            strength_divisor = float(volume_config.get('strength_divisor', 8.0))
+            self.scheduler_running = False
 
-            if change_rate >= min_change_rate and volume > 0:
-                return {
-                    'action': 'BUY',
-                    'price': current_price,
-                    'reason': f'거래량 돌파 + {change_rate:.1f}% 상승',
-                    'strength': min(change_rate / strength_divisor, 1.0)
-                }
+            # 백그라운드 스크리닝 중지
+            if hasattr(self.stock_discovery, 'stop_background_screening'):
+                self.stock_discovery.stop_background_screening()
 
-        elif strategy_name == 'momentum':
-            # 🚀 ConfigLoader에서 모멘텀 설정 로드
-            momentum_config = self.config_loader.load_strategy_config('momentum')
-            min_change_rate = float(momentum_config.get('min_momentum_percent', 1.5))
-            strength_divisor = float(momentum_config.get('strength_divisor', 6.0))
+            # 모든 구독 정리
+            for strategy_name, stock_codes in self.active_stocks.items():
+                for stock_code in stock_codes:
+                    self.data_manager.remove_stock(stock_code)
 
-            if change_rate >= min_change_rate and volume > 0:
-                return {
-                    'action': 'BUY',
-                    'price': current_price,
-                    'reason': f'모멘텀 지속 {change_rate:.1f}%',
-                    'strength': min(change_rate / strength_divisor, 1.0)
-                }
+            self.active_stocks.clear()
 
-        return None
+            logger.info("✅ 전략 스케줄러 중지 완료")
 
-    def _check_sell_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
-        """매도 신호 확인 (포지션 보유 시) - 설정 파일 기반"""
-        current_price_data = data.get('current_price', {})
-        current_price = current_price_data.get('current_price', 0)
-        change_rate = current_price_data.get('change_rate', 0)
-
-        # 🚀 기본 급락 신호 설정값 로드 (안전한 타입 변환)
-        general_sell_threshold = self._safe_float(self.config_loader.get_config_value('trading', 'emergency_sell_threshold', -2.0))
-        general_strength_divisor = self._safe_float(self.config_loader.get_config_value('trading', 'emergency_strength_divisor', 5.0))
-
-        # 급락 시 매도 신호
-        if change_rate <= general_sell_threshold:
-            return {
-                'action': 'SELL',
-                'price': current_price,
-                'reason': f'급락 신호 {change_rate:.1f}%',
-                'strength': min(abs(change_rate) / general_strength_divisor, 1.0)
-            }
-
-                # 전략별 매도 조건 (설정 파일에서 로드)
-        if strategy_name == 'gap_trading':
-            # 🚀 갭 트레이딩 매도 설정 로드 (직접 get_config_value 사용)
-            reversal_threshold = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'reversal_threshold', -1.0))
-            reversal_strength = self._safe_float(self.config_loader.get_config_value('gap_trading_sell', 'reversal_strength', 0.7))
-
-            if change_rate <= reversal_threshold:
-                return {
-                    'action': 'SELL',
-                    'price': current_price,
-                    'reason': f'갭 반전 {change_rate:.1f}%',
-                    'strength': reversal_strength
-                }
-
-        elif strategy_name == 'volume_breakout':
-            # 🚀 볼륨 브레이크아웃 매도 설정 로드
-            reversal_threshold = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'reversal_threshold', -1.5))
-            reversal_strength = self._safe_float(self.config_loader.get_config_value('volume_breakout_sell', 'reversal_strength', 0.8))
-
-            if change_rate <= reversal_threshold:
-                return {
-                    'action': 'SELL',
-                    'price': current_price,
-                    'reason': f'볼륨 반전 {change_rate:.1f}%',
-                    'strength': reversal_strength
-                }
-
-        elif strategy_name == 'momentum':
-            # 🚀 모멘텀 매도 설정 로드
-            reversal_threshold = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'reversal_threshold', -2.5))
-            reversal_strength = self._safe_float(self.config_loader.get_config_value('momentum_sell', 'reversal_strength', 0.6))
-
-            if change_rate <= reversal_threshold:
-                return {
-                    'action': 'SELL',
-                    'price': current_price,
-                    'reason': f'모멘텀 반전 {change_rate:.1f}%',
-                    'strength': reversal_strength
-                }
-
-        return None
-
-    def set_bot_instance(self, bot_instance: 'StockBotMain'):
-        """봇 인스턴스 설정 (콜백에서 사용)"""
-        self._bot_instance = bot_instance
-
-    async def _check_preparation_status(self):
-        """준비 상태 체크 - 종목 탐색 진행률 및 타임아웃 관리"""
-        if not self.current_slot:
-            return
-
-        # 현재 시간과 시간대 시작 시간 비교
-        now = now_kst()
-        current_time = now.time()
-
-        # 시간대 시작 후 경과 시간 계산
-        slot_start = datetime.combine(now.date(), self.current_slot.start_time)
-        if now < slot_start:
-            # 아직 시간대가 시작되지 않음
-            return
-
-        elapsed_minutes = (now - slot_start).total_seconds() / 60
-
-        # 준비 시간 초과 체크 (기본 15분)
-        max_preparation_time = self.current_slot.preparation_time
-
-        if elapsed_minutes > max_preparation_time:
-            logger.warning(f"⚠️ 준비 시간 초과: {elapsed_minutes:.1f}분 > {max_preparation_time}분")
-
-            # 강제로 기본 전략 활성화
-            await self._activate_emergency_strategies()
-            self.preparation_completed = True
-            self.current_phase = StrategyPhase.EXECUTION
-
-        elif elapsed_minutes > max_preparation_time * 0.7:  # 70% 경과 시 경고
-            progress_rate = self._calculate_discovery_progress()
-            logger.info(f"📊 종목 탐색 진행률: {progress_rate:.1f}% (경과: {elapsed_minutes:.1f}분)")
-
-            if progress_rate < 50:  # 진행률이 낮으면 경고
-                logger.warning(f"⚠️ 종목 탐색 지연 중 - 진행률: {progress_rate:.1f}%")
-
-        # 정상 진행 상황 로깅 (5분마다)
-        elif int(elapsed_minutes) % 5 == 0 and int(elapsed_minutes) > 0:
-            progress_rate = self._calculate_discovery_progress()
-            logger.debug(f"🔍 종목 탐색 중: {progress_rate:.1f}% 완료 (경과: {elapsed_minutes:.1f}분)")
-
-    def _calculate_discovery_progress(self) -> float:
-        """종목 탐색 진행률 계산"""
-        if not self.current_slot:
-            return 0.0
-
-        total_strategies = len(self.current_slot.primary_strategies) + len(self.current_slot.secondary_strategies)
-        if total_strategies == 0:
-            return 100.0
-
-        completed_strategies = 0
-
-        # 주요 전략 완료 체크
-        for strategy_name in self.current_slot.primary_strategies.keys():
-            if strategy_name in self.candidates and len(self.candidates[strategy_name]) > 0:
-                completed_strategies += 1
-
-        # 보조 전략 완료 체크
-        for strategy_name in self.current_slot.secondary_strategies.keys():
-            if strategy_name in self.candidates and len(self.candidates[strategy_name]) > 0:
-                completed_strategies += 1
-
-        return (completed_strategies / total_strategies) * 100.0
-
-    async def _activate_emergency_strategies(self):
-        """비상 시 기본 전략 활성화"""
-        logger.warning("🚨 비상 전략 활성화 - 기본 종목으로 대체")
-
-        # 백그라운드에서 발견된 종목들 중 상위 종목 사용
-        emergency_stocks = []
-
-        # 긴급 거래량 급증 종목들
-        if 'emergency_volume' in self.candidates:
-            emergency_stocks.extend(self.candidates['emergency_volume'][:5])
-
-        # 긴급 가격 변동 종목들
-        if 'emergency_price' in self.candidates:
-            emergency_stocks.extend(self.candidates['emergency_price'][:5])
-
-        # 종목이 부족하면 기본 대형주로 보완
-        if len(emergency_stocks) < 5:
-            default_stocks = [
-                '005930',  # 삼성전자
-                '000660',  # SK하이닉스
-                '035420',  # NAVER
-                '051910',  # LG화학
-                '006400',  # 삼성SDI
-            ]
-
-            for stock_code in default_stocks:
-                if len(emergency_stocks) >= 10:
-                    break
-
-                # 중복 제거
-                if not any(c.stock_code == stock_code for c in emergency_stocks):
-                    emergency_candidate = StockCandidate(
-                        stock_code=stock_code,
-                        strategy_type='emergency_default',
-                        score=50.0,
-                        reason="비상 기본 전략",
-                        discovered_at=now_kst()
-                    )
-                    emergency_stocks.append(emergency_candidate)
-
-        # 비상 전략 활성화
-        if emergency_stocks:
-            await self._activate_strategy_candidates(
-                'emergency',
-                emergency_stocks,
-                DataPriority.HIGH,
-                1.0
-            )
-            logger.info(f"✅ 비상 전략 활성화: {len(emergency_stocks)}개 종목")
-
-    async def _check_current_time_slot(self):
-        """현재 시간대 확인"""
-        current_time = now_kst_time()
-        slot = self._get_time_slot_for_time(current_time)
-
-        if slot:
-            await self._start_new_time_slot(slot)
-        else:
-            await self._handle_after_hours()
-
-    async def _handle_after_hours(self):
-        """장외 시간 처리"""
-        if self.current_slot:
-            logger.info("📴 장외 시간 - 모든 전략 비활성화")
-            await self._cleanup_previous_strategy()
-            self.current_slot = None
-            self.current_phase = StrategyPhase.PREPARATION
+        except Exception as e:
+            logger.error(f"스케줄러 중지 오류: {e}")
 
     def get_status(self) -> Dict:
-        """현재 스케줄러 상태 반환"""
-        return {
-            'scheduler_running': self.scheduler_running,
-            'current_slot': self.current_slot.name if self.current_slot else None,
-            'current_phase': self.current_phase.value,
-            'preparation_completed': self.preparation_completed,
-            'active_strategies': list(self.active_stocks.keys()),
-            'total_active_stocks': sum(len(stocks) for stocks in self.active_stocks.values()),
-            'candidates_count': {strategy: len(candidates) for strategy, candidates in self.candidates.items()},
-            'screening_active': self.screening_active
-        }
-
-    def _safe_float(self, value, default: float = 0.0) -> float:
-        """안전한 float 변환"""
+        """현재 상태 조회"""
         try:
-            if value is None:
-                return default
-            return float(value)
-        except (ValueError, TypeError):
-            return default
+            return {
+                'is_running': self.scheduler_running,
+                'current_slot': self.current_slot.name if self.current_slot else None,
+                'current_phase': self.current_phase.value,
+                'active_strategies': dict(self.active_stocks),
+                'total_stocks': sum(len(stocks) for stocks in self.active_stocks.values()),
+                'data_manager_status': self.data_manager.get_status() if self.data_manager else {}
+            }
+        except Exception as e:
+            logger.error(f"상태 조회 오류: {e}")
+            return {
+                'is_running': False,
+                'error': str(e)
+            }
+
+    def cleanup(self):
+        """정리"""
+        self.stop_scheduler()

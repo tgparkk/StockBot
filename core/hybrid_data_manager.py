@@ -1,452 +1,509 @@
 """
-하이브리드 데이터 관리자
-WebSocket(실시간) + REST API(보완) 하이브리드 데이터 수집 시스템
+KIS 하이브리드 데이터 관리자 (간소화 버전)
+데이터 수집기 + 캐시 + 간단한 스케줄링
 """
-import asyncio
 import time
 import threading
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Callable, Union
-from dataclasses import dataclass, field
-from enum import Enum
-from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from typing import Dict, List, Optional, Callable
 from utils.logger import setup_logger
-from core.rest_api_manager import KISRestAPIManager
-from core.websocket_manager import KISWebSocketManager, TradingTimeSlot
-from utils.korean_time import now_kst, now_kst_timestamp, now_kst_str, now_kst_time_str
+from . import kis_data_cache as cache
+from .kis_data_collector import KISDataCollector
+from .kis_websocket_manager import KISWebSocketManager
 
 logger = setup_logger(__name__)
 
-class DataPriority(Enum):
-    """데이터 우선순위"""
-    CRITICAL = 1      # WebSocket 실시간 (체결가+호가)
-    HIGH = 2          # WebSocket 준실시간 (체결가만)
-    MEDIUM = 3        # REST API 30초 간격
-    LOW = 4           # REST API 1분 간격
-    BACKGROUND = 5    # REST API 5분 간격
 
-@dataclass
-class StockDataRequest:
-    """종목 데이터 요청"""
-    stock_code: str
-    priority: DataPriority
-    strategy_name: str
-    callback: Optional[Callable] = None  # 데이터 수신시 콜백
-    last_update: datetime = field(default_factory=datetime.now)
-    update_count: int = 0
+class SimpleHybridDataManager:
+    """웹소켓 제한을 고려한 스마트 하이브리드 데이터 관리자"""
 
-class HybridDataManager:
-    """하이브리드 데이터 관리자"""
+    def __init__(self, is_demo: bool = False):
+        # 웹소켓 제한 상수
+        self.WEBSOCKET_LIMIT = 41  # KIS 웹소켓 제한
+        self.STREAMS_PER_STOCK = 3  # 종목당 스트림 수 (체결가 + 호가 + 예상체결)
+        self.MAX_REALTIME_STOCKS = self.WEBSOCKET_LIMIT // self.STREAMS_PER_STOCK  # 13개
 
-    def __init__(self, websocket_manager=None):
-        # 컴포넌트 초기화
-        self.rest_api = KISRestAPIManager()
-        self.websocket_manager = websocket_manager or KISWebSocketManager()
+        self.is_demo = is_demo
 
-        # 데이터 요청 관리
-        self.data_requests: Dict[str, StockDataRequest] = {}
-        self.request_lock = threading.RLock()
+        # 데이터 수집기
+        self.collector = KISDataCollector(is_demo=is_demo)
 
-        # REST API 폴링 관리
-        self.rest_polling_pools = {
-            DataPriority.MEDIUM: [],    # 30초 간격
-            DataPriority.LOW: [],       # 1분 간격
-            DataPriority.BACKGROUND: [] # 5분 간격
-        }
+        # 웹소켓 매니저
+        self.websocket_manager = KISWebSocketManager(is_demo=is_demo)
+        self.websocket_running = False
+        self.websocket_task: Optional[asyncio.Task] = None
 
-        # 스레드 풀
-        self.rest_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="REST-Poller")
+        # 구독 관리
+        self.subscriptions: Dict[str, Dict] = {}  # {stock_code: {strategy, callback, ...}}
+        self.subscription_lock = threading.RLock()
 
-        # 데이터 캐시
-        self.data_cache: Dict[str, Dict] = {}
-        self.cache_timestamps: Dict[str, datetime] = {}
-        self.cache_lock = threading.Lock()
+        # 실시간/폴링 분리 관리
+        self.realtime_stocks: List[str] = []  # 실시간 구독 종목
+        self.realtime_priority_queue: List[str] = []  # 실시간 대기열 (우선순위순)
+        self.polling_stocks: List[str] = []
 
-        # 폴링 상태
+        # 폴링 관리
         self.polling_active = False
-        self.polling_tasks = {}
+        self.polling_thread: Optional[threading.Thread] = None
+        self.polling_interval = 15  # 15초 간격
 
         # 통계
         self.stats = {
-            'websocket_updates': 0,
-            'rest_api_calls': 0,
-            'cache_hits': 0,
-            'total_requests': 0
+            'total_subscriptions': 0,
+            'active_realtime': 0,
+            'active_polling': 0,
+            'websocket_usage': 0,
+            'data_updates': 0,
+            'priority_swaps': 0  # 우선순위 교체 횟수
         }
 
-    def add_stock_request(self, stock_code: str, priority: DataPriority,
-                         strategy_name: str, callback: Callable = None) -> bool:
-        """종목 데이터 요청 추가"""
-        with self.request_lock:
-            request = StockDataRequest(
-                stock_code=stock_code,
-                priority=priority,
-                strategy_name=strategy_name,
-                callback=callback
-            )
+        logger.info(f"스마트 하이브리드 데이터 관리자 초기화 완료 ({'모의투자' if is_demo else '실전투자'})")
+        logger.info(f"웹소켓 제한: {self.WEBSOCKET_LIMIT}건, 최대 실시간 종목: {self.MAX_REALTIME_STOCKS}개")
 
-            self.data_requests[stock_code] = request
-            self.stats['total_requests'] += 1
+    # === 구독 관리 ===
 
-            # 우선순위에 따른 데이터 수집 방식 결정
-            success = self._assign_data_source(request)
+    def add_stock(self, stock_code: str, strategy_name: str,
+                  use_realtime: bool = False, callback: Optional[Callable] = None,
+                  priority: int = 1) -> bool:
+        """
+        종목 추가 (웹소켓 제한 고려)
 
-            logger.info(f"종목 요청 추가: {stock_code} (우선순위: {priority.name}, 전략: {strategy_name})")
-            return success
-
-    def _assign_data_source(self, request: StockDataRequest) -> bool:
-        """데이터 소스 할당"""
-        stock_code = request.stock_code
-        priority = request.priority
-
-        if priority == DataPriority.CRITICAL:
-            # WebSocket 실시간 (체결가 + 호가)
-            success = self.websocket_manager.add_emergency_subscription(
-                stock_code=stock_code,
-                strategy_name=request.strategy_name,
-                priority=95
-            )
-
-            # 호가도 추가 (별도 요청)
-            # 실제 구현시에는 WebSocketManager에서 처리
-            return success
-
-        elif priority == DataPriority.HIGH:
-            # WebSocket 준실시간 (체결가만)
-            return self.websocket_manager.add_emergency_subscription(
-                stock_code=stock_code,
-                strategy_name=request.strategy_name,
-                priority=85
-            )
-
-        elif priority in [DataPriority.MEDIUM, DataPriority.LOW, DataPriority.BACKGROUND]:
-            # REST API 폴링에 추가
-            self.rest_polling_pools[priority].append(request)
-            return True
-
-        return False
-
-    def remove_stock_request(self, stock_code: str) -> bool:
-        """종목 데이터 요청 제거"""
-        with self.request_lock:
-            if stock_code not in self.data_requests:
+        Args:
+            stock_code: 종목코드
+            strategy_name: 전략명
+            use_realtime: 실시간 선호 여부
+            callback: 콜백 함수
+            priority: 우선순위 (1:높음, 2:보통, 3:낮음)
+        """
+        with self.subscription_lock:
+            if stock_code in self.subscriptions:
+                logger.warning(f"이미 구독 중인 종목: {stock_code}")
                 return False
 
-            request = self.data_requests[stock_code]
+            subscription = {
+                'stock_code': stock_code,
+                'strategy_name': strategy_name,
+                'use_realtime': False,  # 초기값
+                'preferred_realtime': use_realtime,
+                'priority': priority,
+                'callback': callback,
+                'added_time': time.time(),
+                'last_update': None,
+                'update_count': 0,
+                'score': 0.0  # 동적 점수
+            }
 
-            # 데이터 소스에서 제거
-            if request.priority in [DataPriority.CRITICAL, DataPriority.HIGH]:
-                # WebSocket에서 제거
-                subscription_key = f"H0STCNT0|{stock_code}"  # 체결가
-                self.websocket_manager.remove_subscription(subscription_key)
+            self.subscriptions[stock_code] = subscription
+            self.stats['total_subscriptions'] += 1
 
-                if request.priority == DataPriority.CRITICAL:
-                    # 호가도 제거
-                    orderbook_key = f"H0STASP0|{stock_code}"
-                    self.websocket_manager.remove_subscription(orderbook_key)
-
+            # 실시간 또는 폴링 할당
+            if use_realtime and self._can_add_realtime():
+                self._add_to_realtime(stock_code)
+            elif use_realtime:
+                self._add_to_priority_queue(stock_code)
+                self._add_to_polling(stock_code)
+                logger.info(f"실시간 대기열 추가: {stock_code} (현재 {len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS})")
             else:
-                # REST 폴링에서 제거
-                pool = self.rest_polling_pools.get(request.priority, [])
-                self.rest_polling_pools[request.priority] = [
-                    r for r in pool if r.stock_code != stock_code
-                ]
+                self._add_to_polling(stock_code)
 
-            # 요청 제거
-            del self.data_requests[stock_code]
-
-            # 캐시에서도 제거
-            with self.cache_lock:
-                self.data_cache.pop(stock_code, None)
-                self.cache_timestamps.pop(stock_code, None)
-
-            logger.info(f"종목 요청 제거: {stock_code}")
             return True
 
-    def upgrade_priority(self, stock_code: str, new_priority: DataPriority) -> bool:
-        """우선순위 업그레이드"""
-        with self.request_lock:
-            if stock_code not in self.data_requests:
+    def remove_stock(self, stock_code: str) -> bool:
+        """종목 제거"""
+        with self.subscription_lock:
+            if stock_code not in self.subscriptions:
                 return False
 
-            request = self.data_requests[stock_code]
-            old_priority = request.priority
+            subscription = self.subscriptions[stock_code]
 
-            if new_priority.value >= old_priority.value:
-                logger.warning(f"우선순위 업그레이드 실패: {old_priority.name} → {new_priority.name}")
+            # 실시간에서 제거
+            if subscription['use_realtime']:
+                self._remove_from_realtime(stock_code)
+                # 대기열에서 실시간으로 승격
+                self._promote_from_queue()
+
+            # 폴링에서 제거
+            self._remove_from_polling(stock_code)
+
+            # 우선순위 대기열에서 제거
+            if stock_code in self.realtime_priority_queue:
+                self.realtime_priority_queue.remove(stock_code)
+
+            # 구독 제거
+            del self.subscriptions[stock_code]
+
+            logger.info(f"종목 구독 제거: {stock_code}")
+            return True
+
+    def update_stock_priority(self, stock_code: str, new_priority: int, new_score: Optional[float] = None):
+        """종목 우선순위 업데이트 (동적 교체)"""
+        with self.subscription_lock:
+            if stock_code not in self.subscriptions:
+                return
+
+            subscription = self.subscriptions[stock_code]
+            old_priority = subscription['priority']
+            subscription['priority'] = new_priority
+
+            if new_score is not None:
+                subscription['score'] = new_score
+
+            # 우선순위가 상승했고 실시간을 원하지만 폴링 중인 경우
+            if (new_priority < old_priority and
+                subscription['preferred_realtime'] and
+                not subscription['use_realtime']):
+
+                self._try_promote_to_realtime(stock_code)
+
+            logger.debug(f"우선순위 업데이트: {stock_code} P{old_priority}→P{new_priority}")
+
+    def _can_add_realtime(self) -> bool:
+        """실시간 추가 가능 여부"""
+        return len(self.realtime_stocks) < self.MAX_REALTIME_STOCKS
+
+    def _add_to_realtime(self, stock_code: str) -> bool:
+        """실시간 구독 추가"""
+        if not self._can_add_realtime():
+            return False
+
+        try:
+            # 웹소켓 구독 시도
+            if self.websocket_running:
+                # 비동기 구독을 동기적으로 처리
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # 이미 실행 중인 루프에서는 create_task 사용
+                    asyncio.create_task(
+                        self.websocket_manager.subscribe_stock(stock_code, self._websocket_callback)
+                    )
+                    success = True
+                else:
+                    # 새 루프에서 실행
+                    success = loop.run_until_complete(
+                        self.websocket_manager.subscribe_stock(stock_code, self._websocket_callback)
+                    )
+            else:
+                # 웹소켓이 실행 중이 아니면 시작
+                self._start_websocket_if_needed()
+                success = True
+
+            if success:
+                self.realtime_stocks.append(stock_code)
+                self.subscriptions[stock_code]['use_realtime'] = True
+                self._remove_from_polling(stock_code)
+
+                # 대기열에서 제거
+                if stock_code in self.realtime_priority_queue:
+                    self.realtime_priority_queue.remove(stock_code)
+
+                self._update_stats()
+                logger.info(f"실시간 구독 추가: {stock_code} ({len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS})")
+                return True
+            else:
+                logger.error(f"실시간 구독 실패: {stock_code}")
                 return False
 
-            # 기존 소스에서 제거
-            self.remove_stock_request(stock_code)
+        except Exception as e:
+            logger.error(f"실시간 구독 오류: {stock_code} - {e}")
+            return False
 
-            # 새 우선순위로 추가
-            return self.add_stock_request(
-                stock_code=stock_code,
-                priority=new_priority,
-                strategy_name=request.strategy_name,
-                callback=request.callback
-            )
+    def _remove_from_realtime(self, stock_code: str):
+        """실시간 구독 제거"""
+        if stock_code in self.realtime_stocks:
+            try:
+                # self.collector.unsubscribe_realtime(stock_code)
+                pass  # 임시
+            except Exception as e:
+                logger.error(f"실시간 구독 해제 오류: {stock_code} - {e}")
 
-    def start_polling(self):
-        """REST API 폴링 시작"""
+            self.realtime_stocks.remove(stock_code)
+            self.subscriptions[stock_code]['use_realtime'] = False
+            self._update_stats()
+
+    def _add_to_priority_queue(self, stock_code: str):
+        """우선순위 대기열에 추가"""
+        if stock_code not in self.realtime_priority_queue:
+            self.realtime_priority_queue.append(stock_code)
+            self._sort_priority_queue()
+
+    def _sort_priority_queue(self):
+        """우선순위 대기열 정렬 (우선순위 + 점수 기준)"""
+        def priority_key(stock_code: str) -> tuple:
+            sub = self.subscriptions.get(stock_code, {})
+            return (sub.get('priority', 999), -sub.get('score', 0))
+
+        self.realtime_priority_queue.sort(key=priority_key)
+
+    def _promote_from_queue(self):
+        """대기열에서 실시간으로 승격"""
+        if not self._can_add_realtime() or not self.realtime_priority_queue:
+            return
+
+        # 가장 높은 우선순위 종목 승격
+        stock_code = self.realtime_priority_queue[0]
+        if self._add_to_realtime(stock_code):
+            self.stats['priority_swaps'] += 1
+            logger.info(f"대기열→실시간 승격: {stock_code}")
+
+    def _try_promote_to_realtime(self, stock_code: str):
+        """특정 종목을 실시간으로 승격 시도"""
+        if stock_code not in self.subscriptions:
+            return
+
+        # 실시간 여유 공간이 있으면 바로 승격
+        if self._can_add_realtime():
+            self._add_to_realtime(stock_code)
+            return
+
+        # 더 낮은 우선순위 종목과 교체
+        current_priority = self.subscriptions[stock_code]['priority']
+        current_score = self.subscriptions[stock_code]['score']
+
+        for realtime_stock in self.realtime_stocks:
+            realtime_sub = self.subscriptions[realtime_stock]
+
+            # 우선순위가 더 높거나, 같은 우선순위에서 점수가 더 높으면 교체
+            if (current_priority < realtime_sub['priority'] or
+                (current_priority == realtime_sub['priority'] and current_score > realtime_sub['score'])):
+
+                # 교체 실행
+                self._remove_from_realtime(realtime_stock)
+                self._add_to_polling(realtime_stock)
+                self._add_to_priority_queue(realtime_stock)
+
+                self._add_to_realtime(stock_code)
+
+                self.stats['priority_swaps'] += 1
+                logger.info(f"실시간 교체: {realtime_stock}→{stock_code}")
+                break
+
+    def _add_to_polling(self, stock_code: str) -> None:
+        """폴링에 추가"""
+        if stock_code not in self.polling_stocks:
+            self.polling_stocks.append(stock_code)
+            self._update_stats()
+
+            # 폴링이 실행 중이 아니면 시작
+            if not self.polling_active:
+                self.start_polling()
+
+    def _remove_from_polling(self, stock_code: str) -> None:
+        """폴링에서 제거"""
+        if stock_code in self.polling_stocks:
+            self.polling_stocks.remove(stock_code)
+            self._update_stats()
+
+    def _update_stats(self):
+        """통계 업데이트"""
+        self.stats['active_realtime'] = len(self.realtime_stocks)
+        self.stats['active_polling'] = len(self.polling_stocks)
+        self.stats['websocket_usage'] = len(self.realtime_stocks) * self.STREAMS_PER_STOCK
+
+    # === 폴링 관리 ===
+
+    def start_polling(self) -> None:
+        """폴링 시작"""
         if self.polling_active:
-            logger.warning("폴링이 이미 활성화됨")
             return
 
         self.polling_active = True
+        self.polling_thread = threading.Thread(
+            target=self._polling_loop,
+            name="SmartDataPolling",
+            daemon=True
+        )
+        self.polling_thread.start()
+        logger.info(f"스마트 폴링 시작 (간격: {self.polling_interval}초)")
 
-        # 각 우선순위별 폴링 태스크 시작
-        polling_intervals = {
-            DataPriority.MEDIUM: 30,     # 30초
-            DataPriority.LOW: 60,        # 1분
-            DataPriority.BACKGROUND: 300 # 5분
-        }
-
-        for priority, interval in polling_intervals.items():
-            task = asyncio.create_task(
-                self._polling_loop(priority, interval)
-            )
-            self.polling_tasks[priority] = task
-
-        logger.info("REST API 폴링 시작")
-
-    def stop_polling(self):
-        """REST API 폴링 중지"""
+    def stop_polling(self) -> None:
+        """폴링 중지"""
         self.polling_active = False
+        if self.polling_thread and self.polling_thread.is_alive():
+            self.polling_thread.join(timeout=5)
+        logger.info("스마트 폴링 중지")
 
-        # 모든 폴링 태스크 취소
-        for task in self.polling_tasks.values():
-            task.cancel()
-
-        self.polling_tasks.clear()
-        logger.info("REST API 폴링 중지")
-
-    async def _polling_loop(self, priority: DataPriority, interval: int):
+    def _polling_loop(self) -> None:
         """폴링 루프"""
         while self.polling_active:
             try:
-                pool = self.rest_polling_pools.get(priority, [])
+                if self.polling_stocks:
+                    self._poll_data()
 
-                if pool:
-                    await self._batch_rest_api_calls(pool, priority)
+                time.sleep(self.polling_interval)
 
-                await asyncio.sleep(interval)
-
-            except asyncio.CancelledError:
-                break
             except Exception as e:
-                logger.error(f"{priority.name} 폴링 중 오류: {e}")
-                await asyncio.sleep(5)  # 오류시 5초 대기
+                logger.error(f"폴링 중 오류: {e}")
+                time.sleep(5)
 
-    async def _batch_rest_api_calls(self, requests: List[StockDataRequest], priority: DataPriority):
-        """배치 REST API 호출"""
-        batch_size = 5  # Rate Limiting 고려
-
-        for i in range(0, len(requests), batch_size):
-            batch = requests[i:i + batch_size]
-
-            # 비동기 배치 처리
-            tasks = []
-            for request in batch:
-                task = asyncio.create_task(self._fetch_rest_data(request))
-                tasks.append(task)
-
-            # 모든 배치 완료 대기
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # 결과 처리
-            for request, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    logger.error(f"REST API 호출 실패: {request.stock_code} - {result}")
-                else:
-                    self._process_data_update(request.stock_code, result, 'REST')
-
-            # Rate Limiting을 위한 배치간 대기
-            if i + batch_size < len(requests):
-                await asyncio.sleep(0.5)  # 0.5초 대기
-
-    async def _fetch_rest_data(self, request: StockDataRequest) -> Dict:
-        """REST API 데이터 조회"""
-        loop = asyncio.get_event_loop()
-
-        # 스레드 풀에서 동기 API 호출
-        data = await loop.run_in_executor(
-            self.rest_executor,
-            self._sync_fetch_data,
-            request.stock_code
-        )
-
-        self.stats['rest_api_calls'] += 1
-        return data
-
-    def _sync_fetch_data(self, stock_code: str) -> Dict:
-        """동기 데이터 조회"""
-        try:
-            # 현재가 조회
-            current_price = self.rest_api.get_current_price(stock_code)
-
-            # 캐시 확인 - 호가는 자주 호출하지 않음
-            orderbook = self._get_cached_orderbook(stock_code)
-            if not orderbook:
-                orderbook = self.rest_api.get_orderbook(stock_code)
-                self._cache_orderbook(stock_code, orderbook)
-
-            return {
-                'current_price': current_price,
-                'orderbook': orderbook,
-                'source': 'REST',
-                'timestamp': now_kst()
-            }
-
-        except Exception as e:
-            logger.error(f"동기 데이터 조회 실패: {stock_code} - {e}")
-            return {}
-
-    def _get_cached_orderbook(self, stock_code: str) -> Optional[Dict]:
-        """캐시된 호가 조회"""
-        with self.cache_lock:
-            if stock_code in self.data_cache:
-                cache_time = self.cache_timestamps.get(stock_code)
-                if cache_time and now_kst() - cache_time < timedelta(seconds=30):
-                    self.stats['cache_hits'] += 1
-                    return self.data_cache[stock_code].get('orderbook')
-            return None
-
-    def _cache_orderbook(self, stock_code: str, orderbook: Dict):
-        """호가 데이터 캐시"""
-        with self.cache_lock:
-            if stock_code not in self.data_cache:
-                self.data_cache[stock_code] = {}
-
-            self.data_cache[stock_code]['orderbook'] = orderbook
-            self.cache_timestamps[stock_code] = now_kst()
-
-    def handle_websocket_data(self, stock_code: str, data: Dict):
-        """WebSocket 데이터 처리"""
-        self._process_data_update(stock_code, data, 'WebSocket')
-        self.stats['websocket_updates'] += 1
-
-    def _process_data_update(self, stock_code: str, data: Dict, source: str):
-        """데이터 업데이트 처리"""
-        if stock_code not in self.data_requests:
-            return
-
-        request = self.data_requests[stock_code]
-        request.last_update = now_kst()
-        request.update_count += 1
-
-        # 데이터 캐시 업데이트
-        with self.cache_lock:
-            if stock_code not in self.data_cache:
-                self.data_cache[stock_code] = {}
-
-            self.data_cache[stock_code].update(data)
-            self.cache_timestamps[stock_code] = now_kst()
-
-        # 콜백 실행
-        if request.callback:
+    def _poll_data(self) -> None:
+        """데이터 폴링 실행"""
+        for stock_code in self.polling_stocks.copy():
             try:
-                request.callback(stock_code, data, source)
-            except Exception as e:
-                logger.error(f"콜백 실행 실패: {stock_code} - {e}")
+                # 현재가 조회
+                data = self.collector.get_current_price(stock_code, use_cache=True)
 
-        logger.debug(f"데이터 업데이트: {stock_code} ({source})")
+                if data.get('status') == 'success':
+                    self._process_data_update(stock_code, data)
+                else:
+                    logger.warning(f"폴링 데이터 조회 실패: {stock_code}")
+
+                time.sleep(0.1)  # Rate limiting
+
+            except Exception as e:
+                logger.error(f"종목 폴링 오류: {stock_code} - {e}")
+
+    def _data_callback(self, stock_code: str, data: Dict) -> None:
+        """실시간 데이터 콜백"""
+        self._process_data_update(stock_code, data)
+
+    def _process_data_update(self, stock_code: str, data: Dict) -> None:
+        """데이터 업데이트 처리"""
+        with self.subscription_lock:
+            if stock_code not in self.subscriptions:
+                return
+
+            subscription = self.subscriptions[stock_code]
+            subscription['last_update'] = time.time()
+            subscription['update_count'] += 1
+
+            self.stats['data_updates'] += 1
+
+            # 사용자 콜백 실행
+            if subscription['callback']:
+                try:
+                    subscription['callback'](stock_code, data)
+                except Exception as e:
+                    logger.error(f"사용자 콜백 오류: {stock_code} - {e}")
+
+    # === 데이터 조회 ===
 
     def get_latest_data(self, stock_code: str) -> Optional[Dict]:
         """최신 데이터 조회"""
-        with self.cache_lock:
-            data = self.data_cache.get(stock_code)
-            if data:
-                timestamp = self.cache_timestamps.get(stock_code)
-                return {
-                    **data,
-                    'cache_timestamp': timestamp,
-                    'age_seconds': (now_kst() - timestamp).total_seconds() if timestamp else None
-                }
-            return None
+        return self.collector.get_current_price(stock_code, use_cache=True)
 
-    def optimize_allocation(self):
-        """할당 최적화"""
-        # 시간대에 따른 자동 전략 전환
-        current_time_slot = self.websocket_manager.get_current_time_slot()
+    def get_orderbook(self, stock_code: str) -> Dict:
+        """호가 조회"""
+        return self.collector.get_orderbook(stock_code, use_cache=True)
 
-        # WebSocket 전략 전환
-        self.websocket_manager.switch_strategy(current_time_slot)
+    def get_stock_overview(self, stock_code: str) -> Dict:
+        """종목 개요"""
+        return self.collector.get_stock_overview(stock_code, use_cache=True)
 
-        # REST API 폴링 주기 조정
-        self._adjust_polling_intervals(current_time_slot)
+    def get_multiple_data(self, stock_codes: List[str]) -> Dict[str, Dict]:
+        """여러 종목 데이터"""
+        return self.collector.get_multiple_prices(stock_codes, use_cache=True)
 
-        logger.info(f"할당 최적화 완료: {current_time_slot.value}")
+    # === 설정 관리 ===
 
-    def _adjust_polling_intervals(self, time_slot: TradingTimeSlot):
-        """시간대별 폴링 주기 조정"""
-        # 시간대별로 폴링 주기를 다르게 설정
-        # 예: 골든타임에는 더 빠르게, 점심시간에는 느리게
+    def set_polling_interval(self, interval: int) -> None:
+        """폴링 간격 설정"""
+        self.polling_interval = max(10, interval)  # 최소 10초
+        logger.info(f"폴링 간격 변경: {self.polling_interval}초")
 
-        if time_slot == TradingTimeSlot.GOLDEN_TIME:
-            # 골든타임: 더 빠른 폴링
-            self._update_polling_intervals({
-                DataPriority.MEDIUM: 15,    # 15초
-                DataPriority.LOW: 30,       # 30초
-                DataPriority.BACKGROUND: 60 # 1분
-            })
-        elif time_slot == TradingTimeSlot.LUNCH_TIME:
-            # 점심시간: 느린 폴링
-            self._update_polling_intervals({
-                DataPriority.MEDIUM: 60,     # 1분
-                DataPriority.LOW: 120,       # 2분
-                DataPriority.BACKGROUND: 300 # 5분
-            })
-        else:
-            # 기본 주기
-            self._update_polling_intervals({
-                DataPriority.MEDIUM: 30,    # 30초
-                DataPriority.LOW: 60,       # 1분
-                DataPriority.BACKGROUND: 300 # 5분
-            })
+    def upgrade_to_realtime(self, stock_code: str) -> bool:
+        """실시간으로 업그레이드"""
+        with self.subscription_lock:
+            if stock_code not in self.subscriptions:
+                return False
 
-    def _update_polling_intervals(self, new_intervals: Dict[DataPriority, int]):
-        """폴링 주기 업데이트"""
-        # 기존 태스크들 취소하고 새로운 주기로 재시작
-        # 실제 구현시에는 더 정교한 방식 필요
-        logger.debug(f"폴링 주기 업데이트: {new_intervals}")
+            subscription = self.subscriptions[stock_code]
+            if subscription['use_realtime']:
+                return True  # 이미 실시간
 
-    def get_system_status(self) -> Dict:
-        """시스템 상태 조회"""
-        with self.request_lock:
-            # 우선순위별 요청 수 계산
-            priority_counts = defaultdict(int)
-            for request in self.data_requests.values():
-                priority_counts[request.priority.name] += 1
+            subscription['preferred_realtime'] = True
 
-            # WebSocket 상태
-            ws_status = self.websocket_manager.get_subscription_status()
+            if self._can_add_realtime():
+                return self._add_to_realtime(stock_code)
+            else:
+                # 우선순위 대기열에 추가
+                self._add_to_priority_queue(stock_code)
+                self._try_promote_to_realtime(stock_code)
+                return subscription['use_realtime']
 
-            # REST 폴링 상태
-            rest_pool_sizes = {
-                priority.name: len(pool)
-                for priority, pool in self.rest_polling_pools.items()
-            }
+    def downgrade_to_polling(self, stock_code: str) -> bool:
+        """폴링으로 다운그레이드"""
+        with self.subscription_lock:
+            if stock_code not in self.subscriptions:
+                return False
 
+            subscription = self.subscriptions[stock_code]
+            if not subscription['use_realtime']:
+                return True  # 이미 폴링
+
+            subscription['preferred_realtime'] = False
+            self._remove_from_realtime(stock_code)
+            self._add_to_polling(stock_code)
+
+            # 대기열에서 승격
+            self._promote_from_queue()
+
+            logger.info(f"폴링 다운그레이드: {stock_code}")
+            return True
+
+    # === 상태 조회 ===
+
+    def get_status(self) -> Dict:
+        """시스템 상태"""
+        with self.subscription_lock:
             return {
-                'total_stocks': len(self.data_requests),
-                'priority_breakdown': dict(priority_counts),
-                'websocket_status': ws_status,
-                'rest_polling_pools': rest_pool_sizes,
+                'total_subscriptions': len(self.subscriptions),
+                'realtime_subscriptions': len(self.realtime_stocks),
+                'polling_subscriptions': len(self.polling_stocks),
+                'realtime_capacity': f"{len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS}",
+                'websocket_usage': f"{self.stats['websocket_usage']}/{self.WEBSOCKET_LIMIT}",
+                'priority_queue_size': len(self.realtime_priority_queue),
                 'polling_active': self.polling_active,
-                'cache_size': len(self.data_cache),
-                'statistics': self.stats.copy(),
-                'api_stats': KISRestAPIManager.get_api_stats()
+                'polling_interval': self.polling_interval,
+                'stats': self.stats.copy(),
+                'collector_stats': self.collector.get_stats(),
+                'cache_stats': cache.get_all_cache_stats()
             }
 
-    def cleanup(self):
+    def get_subscription_list(self) -> List[Dict]:
+        """구독 목록"""
+        with self.subscription_lock:
+            return [
+                {
+                    'stock_code': sub['stock_code'],
+                    'strategy_name': sub['strategy_name'],
+                    'use_realtime': sub['use_realtime'],
+                    'preferred_realtime': sub['preferred_realtime'],
+                    'priority': sub['priority'],
+                    'score': sub['score'],
+                    'update_count': sub['update_count'],
+                    'last_update': sub['last_update']
+                }
+                for sub in self.subscriptions.values()
+            ]
+
+    def get_realtime_stocks(self) -> List[str]:
+        """실시간 구독 종목 목록"""
+        return self.realtime_stocks.copy()
+
+    def get_priority_queue(self) -> List[str]:
+        """우선순위 대기열"""
+        return self.realtime_priority_queue.copy()
+
+    # === 정리 ===
+
+    def cleanup(self) -> None:
         """리소스 정리"""
+        logger.info("스마트 하이브리드 데이터 관리자 정리 중...")
+
+        # 폴링 중지
         self.stop_polling()
-        self.rest_executor.shutdown(wait=True)
 
-        with self.cache_lock:
-            self.data_cache.clear()
-            self.cache_timestamps.clear()
+        # 모든 구독 해제
+        with self.subscription_lock:
+            stock_codes = list(self.subscriptions.keys())
+            for stock_code in stock_codes:
+                self.remove_stock(stock_code)
 
-        logger.info("하이브리드 데이터 관리자 정리 완료")
+        # 캐시 정리
+        cache.clear_all_caches()
+
+        logger.info("스마트 하이브리드 데이터 관리자 정리 완료")
+
+
+# 하위 호환성을 위한 별칭
+HybridDataManager = SimpleHybridDataManager
