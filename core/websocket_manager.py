@@ -263,6 +263,7 @@ class KISWebSocketManager:
         """구독 메시지 생성"""
         message = {
             "header": {
+                "appkey": self.app_key,           # ⭐ 누락된 필드 추가
                 "approval_key": self.approval_key,
                 "custtype": "P",
                 "tr_type": "1",
@@ -281,6 +282,7 @@ class KISWebSocketManager:
         """구독 해제 메시지 생성"""
         message = {
             "header": {
+                "appkey": self.app_key,           # ⭐ 누락된 필드 추가
                 "approval_key": self.approval_key,
                 "custtype": "P",
                 "tr_type": "2",
@@ -352,8 +354,8 @@ class KISWebSocketManager:
         else:
             return TradingTimeSlot.AFTER_MARKET
 
-    def switch_strategy(self, time_slot: TradingTimeSlot = None) -> bool:
-        """전략 전환 (시간대별 동적 구독 변경)"""
+    async def switch_strategy(self, time_slot: TradingTimeSlot = None) -> bool:
+        """⭐ 원자적 전략 전환 (구독 공백 방지)"""
         if time_slot is None:
             time_slot = self.get_current_time_slot()
 
@@ -364,22 +366,107 @@ class KISWebSocketManager:
         new_strategy = self.allocation_strategies[time_slot]
 
         with self.subscription_lock:
-            logger.info(f"전략 전환: {new_strategy.name} ({time_slot.value})")
+            logger.info(f"🔄 전략 전환: {new_strategy.name} ({time_slot.value})")
 
-            # 기존 구독 해제
-            asyncio.create_task(self._unsubscribe_all())
+            # ⭐ Step 1: 새로운 구독 목록 생성 (기존 유지)
+            new_subscriptions = await self._prepare_new_subscriptions(new_strategy)
+            if not new_subscriptions:
+                logger.error("❌ 새 구독 준비 실패")
+                return False
 
-            # 새 전략 적용
+            # ⭐ Step 2: 중복되지 않는 기존 구독들만 해제
+            old_keys = set(self.current_subscriptions.keys())
+            new_keys = set(slot.subscription_key for slot in new_subscriptions)
+            
+            keys_to_remove = old_keys - new_keys  # 새로운 구독에 없는 것들만 해제
+            keys_to_keep = old_keys & new_keys    # 유지할 구독들
+            keys_to_add = new_keys - old_keys     # 새로 추가할 구독들
+
+            logger.info(f"📊 구독 변경: 제거 {len(keys_to_remove)}개, 유지 {len(keys_to_keep)}개, 추가 {len(keys_to_add)}개")
+
+            # ⭐ Step 3: 제거할 구독들만 해제 (공백 최소화)
+            for key in keys_to_remove:
+                await self.unsubscribe(key)
+                if key in self.current_subscriptions:
+                    del self.current_subscriptions[key]
+
+            # ⭐ Step 4: 새로운 구독들 추가
+            for slot in new_subscriptions:
+                if slot.subscription_key in keys_to_add:
+                    success = await self.subscribe(slot.subscription_key)
+                    if success:
+                        self.current_subscriptions[slot.subscription_key] = slot
+
+            # ⭐ Step 5: 전략 정보 업데이트
             self.current_strategy = new_strategy
+            self.stats['subscription_changes'] += 1
 
-            # 새로운 구독 설정
-            success = self._apply_strategy(new_strategy)
+            total_subs = len(self.current_subscriptions)
+            logger.info(f"✅ 원자적 전략 전환 완료: {total_subs}건 구독 활성")
 
-            if success:
-                self.stats['subscription_changes'] += 1
-                logger.info(f"전략 전환 완료: {len(self.current_subscriptions)}건 구독")
+            return True
 
-            return success
+    async def _prepare_new_subscriptions(self, strategy: AllocationStrategy) -> List[SubscriptionSlot]:
+        """⭐ 새로운 구독 목록 준비 (기존 _apply_strategy에서 분리)"""
+        try:
+            new_subscriptions = []
+
+            # 1. 시장 지수 구독 (최우선)
+            market_indices = self._get_market_indices()
+            for index_code in market_indices[:strategy.market_indices_count]:
+                slot = SubscriptionSlot(
+                    stock_code=index_code,
+                    subscription_type=SubscriptionType.MARKET_INDEX,
+                    priority=100,
+                    strategy_name="market_index"
+                )
+                new_subscriptions.append(slot)
+
+            # 2. 실시간 종목 (체결가 + 호가)
+            realtime_candidates = self._select_realtime_candidates(strategy)
+            for stock_code in realtime_candidates[:strategy.max_realtime_stocks]:
+                # 체결가 구독
+                price_slot = SubscriptionSlot(
+                    stock_code=stock_code,
+                    subscription_type=SubscriptionType.STOCK_PRICE,
+                    priority=90,
+                    strategy_name="realtime_core"
+                )
+                new_subscriptions.append(price_slot)
+
+                # 호가 구독
+                orderbook_slot = SubscriptionSlot(
+                    stock_code=stock_code,
+                    subscription_type=SubscriptionType.STOCK_ORDERBOOK,
+                    priority=85,
+                    strategy_name="realtime_core"
+                )
+                new_subscriptions.append(orderbook_slot)
+
+            # 3. 준실시간 종목 (체결가만)
+            semi_realtime_candidates = self._select_semi_realtime_candidates(strategy)
+            for stock_code in semi_realtime_candidates[:strategy.max_semi_realtime_stocks]:
+                slot = SubscriptionSlot(
+                    stock_code=stock_code,
+                    subscription_type=SubscriptionType.STOCK_PRICE,
+                    priority=70,
+                    strategy_name="semi_realtime"
+                )
+                new_subscriptions.append(slot)
+
+            # 4. 구독 수 제한 체크
+            if len(new_subscriptions) > self.MAX_SUBSCRIPTIONS:
+                logger.warning(f"⚠️ 구독 수 제한 초과: {len(new_subscriptions)} > {self.MAX_SUBSCRIPTIONS}")
+                # 우선순위 기준으로 정렬 후 상위만 선택
+                new_subscriptions.sort(key=lambda x: x.priority, reverse=True)
+                new_subscriptions = new_subscriptions[:self.MAX_SUBSCRIPTIONS]
+
+            logger.info(f"📋 새 구독 목록 준비: {len(new_subscriptions)}개")
+            return new_subscriptions
+
+        except Exception as e:
+            logger.error(f"새 구독 준비 실패: {e}")
+            return []
 
     def _apply_strategy(self, strategy: AllocationStrategy) -> bool:
         """전략 적용"""
@@ -821,6 +908,25 @@ class KISWebSocketManager:
 
         logger.info("실시간 데이터 수신 시작")
 
+        # ⭐ 구독 상태 최종 확인
+        subscription_count = len(self.current_subscriptions)
+        if subscription_count == 0:
+            logger.warning("⚠️ 활성 구독이 없습니다. 연결 유지를 위한 기본 구독을 시도합니다")
+            
+            # 긴급 시장지수 구독 (연결 유지 목적)
+            emergency_subscribed = False
+            for index_code in ["KOSPI", "KOSDAQ"]:
+                subscription_key = f"{SubscriptionType.MARKET_INDEX.value}|{index_code}"
+                if await self.subscribe(subscription_key):
+                    emergency_subscribed = True
+                    logger.info(f"🆘 긴급 구독 성공: {index_code} (연결 유지)")
+                    break
+            
+            if not emergency_subscribed:
+                logger.error("❌ 긴급 구독도 실패 - 연결이 즉시 끊어질 수 있습니다")
+        else:
+            logger.info(f"✅ 활성 구독 확인: {subscription_count}건")
+
         # 장외시간 체크
         kst = pytz.timezone('Asia/Seoul')
         now = datetime.now(kst)
@@ -855,7 +961,7 @@ class KISWebSocketManager:
             # 연결 끊김 원인 분석
             connection_duration = (datetime.now() - last_message_time).total_seconds()
             logger.info(f"⏱️ 연결 끊김까지 시간: {connection_duration:.1f}초")
-            ``
+            
             # 일반적인 연결 끊김 원인들 체크
             self._analyze_disconnect_reason(e, connection_duration, message_count)
             
