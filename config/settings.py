@@ -53,6 +53,20 @@ def validate_settings():
     print("✅ 모든 필수 설정값이 정상적으로 로드되었습니다")
     return True
 
-# 로드 시 자동 검증
+def check_critical_settings():
+    """중요 설정값 확인 (KIS API 키)"""
+    if not APP_KEY or not SECRET_KEY:
+        print(f"❌ KIS API 키가 설정되지 않았습니다!")
+        print(f"APP_KEY: {'설정됨' if APP_KEY else '미설정'}")
+        print(f"SECRET_KEY: {'설정됨' if SECRET_KEY else '미설정'}")
+        print("📝 .env 파일을 확인해주세요.")
+        return False
+    return True
+
+# import 시 중요 설정값 자동 확인
+if not check_critical_settings():
+    print("⚠️ 설정 오류로 인해 KIS API 인증이 실패할 수 있습니다.")
+
+# 직접 실행 시 전체 검증
 if __name__ == "__main__":
     validate_settings()

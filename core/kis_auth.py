@@ -158,8 +158,8 @@ def auth(svr: str = 'prod', product: str = '01') -> bool:
         }
 
         url = KIS_BASE_URL
-        if svr == 'vps':
-            url = 'https://openapivts.koreainvestment.com:29443'  # 모의투자 URL
+        #if svr == 'vps':
+        #    url = 'https://openapivts.koreainvestment.com:29443'  # 모의투자 URL
 
         url += '/oauth2/tokenP'
 
