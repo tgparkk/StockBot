@@ -37,6 +37,12 @@ _autoReAuth = False
 _DEBUG = False
 _isPaper = False
 
+# API 호출 속도 제어를 위한 전역 변수들 추가
+_last_api_call_time = None
+_min_api_interval = 0.06  # 최소 60ms 간격 (초당 16-17회로 안전하게 설정, KIS 제한: 1초당 20건)
+_max_retries = 3  # 최대 재시도 횟수
+_retry_delay_base = 1.0  # 기본 재시도 지연 시간(초) - 줄임
+
 # 기본 헤더
 _base_headers = {
     "Content-Type": "application/json",
@@ -292,48 +298,139 @@ class APIResp:
 def _url_fetch(api_url: str, ptr_id: str, tr_cont: str, params: Dict,
                appendHeaders: Optional[Dict] = None, postFlag: bool = False,
                hashFlag: bool = True) -> Optional[APIResp]:
-    """API 호출 공통 함수"""
+    """API 호출 공통 함수 (속도 제한 및 재시도 로직 포함)"""
     if not _TRENV:
         logger.error("인증되지 않음. auth() 호출 필요")
         return None
 
     url = f"{_TRENV.my_url}{api_url}"
-    headers = _getBaseHeader()
-
+    
     # TR ID 설정 (모의투자용 변환)
     tr_id = ptr_id
     if ptr_id[0] in ('T', 'J', 'C'):
         if isPaperTrading():
             tr_id = 'V' + ptr_id[1:]
 
-    headers["tr_id"] = tr_id
-    headers["custtype"] = "P"  # 개인
-    headers["tr_cont"] = tr_cont
+    # 재시도 로직
+    for attempt in range(_max_retries + 1):
+        try:
+            # API 호출 속도 제한 적용
+            _wait_for_api_limit()
+            
+            # 헤더 설정
+            headers = _getBaseHeader()
+            headers["tr_id"] = tr_id
+            headers["custtype"] = "P"  # 개인
+            headers["tr_cont"] = tr_cont
 
-    # 추가 헤더
-    if appendHeaders:
-        headers.update(appendHeaders)
+            # 추가 헤더
+            if appendHeaders:
+                headers.update(appendHeaders)
 
-    if _DEBUG:
-        logger.debug(f"API 호출: {url}, TR: {tr_id}")
-
-    try:
-        if postFlag:
-            if hashFlag:
-                set_order_hash_key(headers, params)
-            res = requests.post(url, headers=headers, data=json.dumps(params))
-        else:
-            res = requests.get(url, headers=headers, params=params)
-
-        if res.status_code == 200:
-            ar = APIResp(res)
             if _DEBUG:
-                logger.debug(f"API 응답: {ar.isOK()}")
-            return ar
-        else:
-            logger.error(f"API 오류: {res.status_code} - {res.text}")
-            return None
+                logger.debug(f"API 호출 ({attempt + 1}/{_max_retries + 1}): {url}, TR: {tr_id}")
 
-    except Exception as e:
-        logger.error(f"API 호출 오류: {e}")
-        return None
+            # API 호출
+            if postFlag:
+                if hashFlag:
+                    set_order_hash_key(headers, params)
+                res = requests.post(url, headers=headers, data=json.dumps(params))
+            else:
+                res = requests.get(url, headers=headers, params=params)
+
+            # 응답 처리
+            if res.status_code == 200:
+                ar = APIResp(res)
+                if ar.isOK():
+                    if _DEBUG:
+                        logger.debug(f"API 응답 성공: {tr_id}")
+                    return ar
+                else:
+                    # API 응답은 200이지만 비즈니스 오류
+                    if ar.getErrorCode() == 'EGW00201':  # 속도 제한 오류
+                        if attempt < _max_retries:
+                            wait_time = _retry_delay_base * (2 ** attempt)  # 지수 백오프
+                            logger.warning(f"속도 제한 오류 발생. {wait_time}초 후 재시도 ({attempt + 1}/{_max_retries + 1})")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            logger.error(f"API 오류: {res.status_code} - {ar.getErrorMessage()}")
+                            return ar
+                    else:
+                        # 다른 비즈니스 오류는 즉시 반환
+                        logger.error(f"API 비즈니스 오류: {ar.getErrorCode()} - {ar.getErrorMessage()}")
+                        return ar
+            else:
+                # HTTP 오류
+                if res.status_code == 500 and _is_rate_limit_error(res.text):
+                    if attempt < _max_retries:
+                        wait_time = _retry_delay_base * (2 ** attempt)  # 지수 백오프
+                        logger.warning(f"HTTP 500 속도 제한 오류. {wait_time}초 후 재시도 ({attempt + 1}/{_max_retries + 1})")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"API 오류: {res.status_code} - {res.text}")
+                        return None
+                else:
+                    logger.error(f"API 오류: {res.status_code} - {res.text}")
+                    return None
+
+        except Exception as e:
+            if attempt < _max_retries:
+                wait_time = _retry_delay_base * (2 ** attempt)
+                logger.warning(f"API 호출 예외 발생. {wait_time}초 후 재시도 ({attempt + 1}/{_max_retries + 1}): {e}")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"API 호출 오류: {e}")
+                return None
+
+    logger.error(f"API 호출 최대 재시도 횟수 초과: {tr_id}")
+    return None
+
+
+def _wait_for_api_limit():
+    """API 호출 속도 제한을 위한 대기"""
+    global _last_api_call_time
+    
+    current_time = time.time()
+    
+    if _last_api_call_time is not None:
+        elapsed = current_time - _last_api_call_time
+        if elapsed < _min_api_interval:
+            wait_time = _min_api_interval - elapsed
+            if _DEBUG:
+                logger.debug(f"API 속도 제한: {wait_time:.3f}초 대기 (이전 호출로부터 {elapsed:.3f}초 경과)")
+            time.sleep(wait_time)
+    
+    _last_api_call_time = time.time()
+
+
+def _is_rate_limit_error(response_text: str) -> bool:
+    """응답이 속도 제한 오류인지 확인"""
+    try:
+        response_data = json.loads(response_text)
+        return (response_data.get('msg_cd') == 'EGW00201' or 
+                '초당 거래건수를 초과' in response_data.get('msg1', ''))
+    except:
+        return False
+
+
+def set_api_rate_limit(interval_seconds: float = 0.35, max_retries: int = 3, retry_delay: float = 2.0):
+    """API 호출 속도 제한 설정을 동적으로 변경"""
+    global _min_api_interval, _max_retries, _retry_delay_base
+    
+    _min_api_interval = interval_seconds
+    _max_retries = max_retries
+    _retry_delay_base = retry_delay
+    
+    logger.info(f"API 속도 제한 설정 변경: 간격={interval_seconds}초, 최대재시도={max_retries}회, 재시도지연={retry_delay}초")
+
+
+def get_api_rate_limit_info():
+    """현재 API 속도 제한 설정 정보 반환"""
+    return {
+        'min_interval': _min_api_interval,
+        'max_retries': _max_retries,
+        'retry_delay_base': _retry_delay_base
+    }
