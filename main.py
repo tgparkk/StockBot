@@ -103,9 +103,8 @@ class StockBot:
             self.is_running = True
             logger.info("🔄 StockBot 가동 시작...")
 
-            # 신호 처리기 등록
-            signal.signal(signal.SIGINT, self._signal_handler)
-            signal.signal(signal.SIGTERM, self._signal_handler)
+            # 신호 처리기 등록 (플랫폼별)
+            signal.signal(signal.SIGINT, self._signal_handler)  # Ctrl+C (모든 플랫폼)
 
             # 백그라운드 작업 시작
             self._start_background_workers()
@@ -289,7 +288,7 @@ class StockBot:
                     try:
                         logger.info(f"🚨 매도 조건 발생: {sell_signal['stock_code']} - {sell_signal['reason']}")
 
-                                                # 자동 매도용 지정가 계산
+                        # 자동 매도용 지정가 계산
                         current_price = sell_signal['current_price']
                         strategy_type = sell_signal['strategy_type']
                         auto_sell_price = self._calculate_sell_price(current_price, strategy_type, is_auto_sell=True)
@@ -316,10 +315,10 @@ class StockBot:
 
                             logger.info(f"✅ 자동 매도 주문 완료: {sell_signal['stock_code']} {sell_signal['quantity']:,}주 @ {auto_sell_price:,}원 (현재가: {current_price:,}원)")
 
-                            # 텔레그램 알림 (업데이트된 정보로)
-                            sell_signal['auto_sell_price'] = auto_sell_price
+                            # 텔레그램 알림 (직접 호출)
                             if self.telegram_bot:
-                                self._send_auto_sell_notification(sell_signal, order_no)
+                                sell_signal['auto_sell_price'] = auto_sell_price
+                                self.telegram_bot.send_auto_sell_notification(sell_signal, order_no)
 
                     except Exception as e:
                         logger.error(f"자동 매도 실행 오류: {sell_signal['stock_code']} - {e}")
@@ -401,9 +400,9 @@ class StockBot:
             report = self._generate_status_report()
             logger.info(f"📊 1시간 리포트:\n{report}")
 
-            # 텔레그램 전송
+            # 텔레그램 전송 (직접 호출)
             if self.telegram_bot:
-                self._send_telegram_notification(f"📊 1시간 리포트\n{report}")
+                self.telegram_bot.send_hourly_report(report)
 
         except Exception as e:
             logger.error(f"리포트 생성 오류: {e}")
@@ -453,14 +452,6 @@ class StockBot:
 
         except Exception as e:
             logger.error(f"최종 통계 출력 오류: {e}")
-
-    def _send_telegram_notification(self, message: str):
-        """텔레그램 알림 전송"""
-        if self.telegram_bot:
-            try:
-                self.telegram_bot.send_notification_sync(message)
-            except Exception as e:
-                logger.error(f"텔레그램 알림 전송 오류: {e}")
 
     def _calculate_buy_price(self, current_price: int, strategy: str = 'default') -> int:
         """매수 지정가 계산 (현재가 기준)"""
@@ -555,10 +546,6 @@ class StockBot:
             # 신호 통계 업데이트
             self.stats['signals_processed'] += 1
 
-            # 텔레그램 알림
-            if self.telegram_bot:
-                self._send_signal_notification(signal)
-
             # 실제 거래 로직
             if signal['signal_type'] == 'BUY':
                 success = self._execute_buy_signal(signal)
@@ -570,6 +557,10 @@ class StockBot:
                 if success:
                     self.stats['orders_executed'] += 1
                     self.stats['positions_closed'] += 1
+
+            # 텔레그램 알림 (직접 호출)
+            if self.telegram_bot:
+                self.telegram_bot.send_signal_notification(signal)
 
         except Exception as e:
             logger.error(f"거래 신호 처리 오류: {e}")
@@ -646,9 +637,9 @@ class StockBot:
 
                 logger.info(f"✅ 매수 주문 완료: {stock_code} {quantity:,}주 @ {buy_price:,}원 (현재가: {current_price:,}원, 주문번호: {order_no})")
 
-                # 텔레그램 알림
+                # 텔레그램 알림 (직접 호출)
                 if self.telegram_bot:
-                    self._send_order_notification('매수', stock_code, quantity, buy_price, strategy)
+                    self.telegram_bot.send_order_notification('매수', stock_code, quantity, buy_price, strategy)
 
                 return True
             else:
@@ -711,9 +702,9 @@ class StockBot:
 
                 logger.info(f"✅ 매도 주문 완료: {stock_code} {quantity:,}주 @ {sell_price:,}원 (현재가: {current_price:,}원, 수익률: {profit_rate:.2f}%, 주문번호: {order_no})")
 
-                # 텔레그램 알림
+                # 텔레그램 알림 (직접 호출)
                 if self.telegram_bot:
-                    self._send_order_notification('매도', stock_code, quantity, sell_price, strategy)
+                    self.telegram_bot.send_order_notification('매도', stock_code, quantity, sell_price, strategy)
 
                 return True
             else:
@@ -724,76 +715,57 @@ class StockBot:
             logger.error(f"매도 신호 실행 오류: {e}")
             return False
 
-    def _send_order_notification(self, order_type: str, stock_code: str, quantity: int, price: int, strategy: str):
-        """주문 알림 전송"""
-        try:
-            total_amount = quantity * price
-            message = (
-                f"🎯 {order_type} 주문 체결\n"
-                f"종목: {stock_code}\n"
-                f"수량: {quantity:,}주\n"
-                f"가격: {price:,}원\n"
-                f"금액: {total_amount:,}원\n"
-                f"전략: {strategy}\n"
-                f"시간: {datetime.now().strftime('%H:%M:%S')}"
-            )
-            self._send_telegram_notification(message)
-        except Exception as e:
-            logger.error(f"주문 알림 전송 오류: {e}")
-
-    def _send_auto_sell_notification(self, sell_signal: dict, order_no: str):
-        """자동 매도 알림 전송"""
-        try:
-            stock_code = sell_signal['stock_code']
-            quantity = sell_signal['quantity']
-            current_price = sell_signal['current_price']
-            auto_sell_price = sell_signal.get('auto_sell_price', current_price)
-            profit_rate = sell_signal['profit_rate']
-            reason = sell_signal['reason']
-
-            total_amount = quantity * auto_sell_price
-
-            message = (
-                f"🤖 자동 매도 주문 완료\n"
-                f"종목: {stock_code}\n"
-                f"수량: {quantity:,}주\n"
-                f"주문가: {auto_sell_price:,}원\n"
-                f"현재가: {current_price:,}원\n"
-                f"주문금액: {total_amount:,}원\n"
-                f"수익률: {profit_rate:.2f}%\n"
-                f"사유: {reason}\n"
-                f"주문번호: {order_no}\n"
-                f"시간: {datetime.now().strftime('%H:%M:%S')}"
-            )
-            self._send_telegram_notification(message)
-        except Exception as e:
-            logger.error(f"자동 매도 알림 전송 오류: {e}")
-
-    def _send_signal_notification(self, signal: dict):
-        """신호 알림 전송"""
-        message = (
-            f"📊 거래신호 감지\n"
-            f"종목: {signal['stock_code']}\n"
-            f"신호: {signal['signal_type']}\n"
-            f"전략: {signal['strategy']}\n"
-            f"가격: {signal.get('price', 'N/A')}\n"
-            f"시간: {datetime.now().strftime('%H:%M:%S')}"
-        )
-        self._send_telegram_notification(message)
-
     # === 텔레그램 봇용 인터페이스 메서드들 ===
 
     def get_balance(self) -> dict:
         """잔고 조회 (텔레그램용)"""
         return self.trading_manager.get_balance()
 
-    def get_positions(self) -> dict:
-        """포지션 조회 (텔레그램용)"""
-        return self.position_manager.get_position_summary()
+    def get_system_status(self) -> dict:
+        """시스템 상태 조회 (텔레그램용)"""
+        try:
+            # 포지션 요약
+            position_summary = self.position_manager.get_position_summary()
 
-    def get_strategy_status(self) -> dict:
-        """전략 상태 조회 (텔레그램용)"""
-        return self.strategy_scheduler.get_status()
+            # 전략 스케줄러 상태
+            scheduler_status = self.strategy_scheduler.get_status()
+
+            # 웹소켓 상태
+            websocket_connected = False
+            if self.websocket_manager:
+                websocket_connected = getattr(self.websocket_manager, 'is_connected', False)
+
+            return {
+                'bot_running': self.is_running,
+                'websocket_connected': websocket_connected,
+                'positions_count': position_summary.get('total_positions', 0),
+                'pending_orders_count': 0,  # 추후 구현
+                'order_history_count': 0,   # 추후 구현
+                'scheduler': {
+                    'current_slot': scheduler_status.get('current_phase', 'None'),
+                    'active_strategies': scheduler_status.get('active_strategies', {}),
+                    'total_active_stocks': len(scheduler_status.get('active_strategies', {}))
+                }
+            }
+        except Exception as e:
+            logger.error(f"시스템 상태 조회 오류: {e}")
+            return {
+                'bot_running': self.is_running,
+                'websocket_connected': False,
+                'positions_count': 0,
+                'pending_orders_count': 0,
+                'order_history_count': 0,
+                'scheduler': {
+                    'current_slot': 'Unknown',
+                    'active_strategies': {},
+                    'total_active_stocks': 0
+                }
+            }
+
+    @property
+    def trading_api(self):
+        """trading_api 속성 (텔레그램 봇 호환용)"""
+        return self.trading_manager
 
 
 def main():

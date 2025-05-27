@@ -312,8 +312,8 @@ class TelegramBot:
             return
 
         try:
-            if not self.stock_bot or not self.stock_bot.trading_api:
-                await update.message.reply_text("❌ 거래 API에 접근할 수 없습니다.")
+            if not self.stock_bot:
+                await update.message.reply_text("❌ StockBot 인스턴스에 접근할 수 없습니다.")
                 return
 
             # 로딩 메시지 전송
@@ -321,7 +321,7 @@ class TelegramBot:
 
             # 🔧 KIS API의 실제 메소드 사용: get_balance()
             try:
-                balance_data = self.stock_bot.trading_api.get_balance()
+                balance_data = self.stock_bot.get_balance()
 
                 if not balance_data:
                     raise Exception("잔고 조회 데이터가 비어있습니다")
@@ -743,3 +743,80 @@ class TelegramBot:
             loop.run_until_complete(self.send_notification(message))
         except Exception as e:
             logger.error(f"동기 알림 전송 실패: {e}")
+
+    # ========== 거래 알림 메서드들 (main.py에서 이동) ==========
+
+    def send_order_notification(self, order_type: str, stock_code: str, quantity: int, price: int, strategy: str):
+        """주문 알림 전송"""
+        try:
+            total_amount = quantity * price
+            message = (
+                f"🎯 {order_type} 주문 체결\n"
+                f"종목: {stock_code}\n"
+                f"수량: {quantity:,}주\n"
+                f"가격: {price:,}원\n"
+                f"금액: {total_amount:,}원\n"
+                f"전략: {strategy}\n"
+                f"시간: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            self.send_notification_sync(message)
+        except Exception as e:
+            logger.error(f"주문 알림 전송 오류: {e}")
+
+    def send_auto_sell_notification(self, sell_signal: dict, order_no: str):
+        """자동 매도 알림 전송"""
+        try:
+            stock_code = sell_signal['stock_code']
+            quantity = sell_signal['quantity']
+            current_price = sell_signal['current_price']
+            auto_sell_price = sell_signal.get('auto_sell_price', current_price)
+            profit_rate = sell_signal['profit_rate']
+            reason = sell_signal['reason']
+
+            total_amount = quantity * auto_sell_price
+
+            message = (
+                f"🤖 자동 매도 주문 완료\n"
+                f"종목: {stock_code}\n"
+                f"수량: {quantity:,}주\n"
+                f"주문가: {auto_sell_price:,}원\n"
+                f"현재가: {current_price:,}원\n"
+                f"주문금액: {total_amount:,}원\n"
+                f"수익률: {profit_rate:.2f}%\n"
+                f"사유: {reason}\n"
+                f"주문번호: {order_no}\n"
+                f"시간: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            self.send_notification_sync(message)
+        except Exception as e:
+            logger.error(f"자동 매도 알림 전송 오류: {e}")
+
+    def send_signal_notification(self, signal: dict):
+        """신호 알림 전송"""
+        try:
+            message = (
+                f"📊 거래신호 감지\n"
+                f"종목: {signal['stock_code']}\n"
+                f"신호: {signal['signal_type']}\n"
+                f"전략: {signal['strategy']}\n"
+                f"가격: {signal.get('price', 'N/A')}\n"
+                f"시간: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            self.send_notification_sync(message)
+        except Exception as e:
+            logger.error(f"신호 알림 전송 오류: {e}")
+
+    def send_general_notification(self, message: str):
+        """일반 알림 전송"""
+        try:
+            self.send_notification_sync(message)
+        except Exception as e:
+            logger.error(f"일반 알림 전송 오류: {e}")
+
+    def send_hourly_report(self, report: str):
+        """1시간 리포트 전송"""
+        try:
+            message = f"📊 1시간 리포트\n{report}"
+            self.send_notification_sync(message)
+        except Exception as e:
+            logger.error(f"리포트 전송 오류: {e}")

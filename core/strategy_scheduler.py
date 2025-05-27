@@ -12,6 +12,9 @@ from .time_slot_manager import TimeSlotManager, TimeSlotConfig
 from .stock_discovery import StockDiscovery, StockCandidate
 from core.rest_api_manager import KISRestAPIManager
 from core.hybrid_data_manager import SimpleHybridDataManager
+from core.technical_indicators import TechnicalIndicators
+from database.db_models import DataPriority
+import time as time_module  # time 모듈과 구분
 
 # 순환 import 방지
 if TYPE_CHECKING:
@@ -48,6 +51,11 @@ class StrategyScheduler:
 
         # 활성 종목 저장
         self.active_stocks: Dict[str, List[str]] = {}
+
+        # 🆕 신호 중복 방지를 위한 히스토리 관리
+        self.signal_history: Dict[str, Dict] = {}  # {stock_code: {last_signal_time, last_signal_type, cooldown_until}}
+        self.signal_cooldown = 300  # 5분 쿨다운
+        self.signal_lock = threading.Lock()
 
         logger.info("📅 간소화된 전략 스케줄러 초기화 완료")
 
@@ -230,41 +238,87 @@ class StrategyScheduler:
                 # 데이터 관리자에 종목 추가 (우선순위와 실시간 여부 설정)
                 callback = self._create_strategy_callback(strategy_name)
 
-                # 상위 13개는 실시간 시도, 나머지는 폴링
-                use_realtime = i < 13
-                priority = self._get_strategy_priority(strategy_name, i)
+                # 우선순위 결정 (DataPriority 사용)
+                priority = self._get_data_priority(strategy_name, i)
 
-                self.data_manager.add_stock(
+                # add_stock_request 사용 (DataPriority 기반)
+                self.data_manager.add_stock_request(
                     stock_code=stock_code,
+                    priority=priority,
                     strategy_name=strategy_name,
-                    use_realtime=use_realtime,
-                    callback=callback,
-                    priority=priority
+                    callback=callback
                 )
 
             logger.info(f"🎯 {strategy_name} 전략 활성화: {len(stock_codes)}개 종목")
 
+            # 활성화 직후 즉시 신호 체크 시작
+            asyncio.create_task(self._monitor_strategy_signals(strategy_name, stock_codes))
+
         except Exception as e:
             logger.error(f"단일 전략 활성화 오류 ({strategy_name}): {e}")
 
-    def _get_strategy_priority(self, strategy_name: str, stock_index: int) -> int:
-        """전략별 우선순위 결정"""
-        # 기본 전략 우선순위
+    def _get_data_priority(self, strategy_name: str, stock_index: int) -> DataPriority:
+        """전략별 데이터 우선순위 결정"""
+        # 전략별 기본 우선순위
         strategy_base_priority = {
-            'gap_trading': 1,      # 갭 트레이딩이 가장 높음
-            'momentum': 2,         # 모멘텀이 두번째
-            'volume_breakout': 3   # 거래량 돌파가 세번째
+            'gap_trading': DataPriority.CRITICAL,      # 갭 트레이딩이 가장 높음
+            'momentum': DataPriority.HIGH,             # 모멘텀이 두번째
+            'volume_breakout': DataPriority.HIGH       # 거래량 돌파가 세번째
         }
 
-        base = strategy_base_priority.get(strategy_name, 3)
+        base_priority = strategy_base_priority.get(strategy_name, DataPriority.MEDIUM)
 
-        # 같은 전략 내에서도 순위별 우선순위 (상위 5개는 우선순위 상승)
+        # 같은 전략 내에서도 순위별 우선순위 조정
         if stock_index < 5:
-            return base
+            return base_priority  # 상위 5개는 그대로
         elif stock_index < 10:
-            return base + 1
+            # 중간 5개는 한 단계 낮춤
+            if base_priority == DataPriority.CRITICAL:
+                return DataPriority.HIGH
+            elif base_priority == DataPriority.HIGH:
+                return DataPriority.MEDIUM
+            else:
+                return DataPriority.LOW
         else:
-            return base + 2
+            # 나머지는 두 단계 낮춤
+            if base_priority == DataPriority.CRITICAL:
+                return DataPriority.MEDIUM
+            elif base_priority == DataPriority.HIGH:
+                return DataPriority.LOW
+            else:
+                return DataPriority.BACKGROUND
+
+    async def _monitor_strategy_signals(self, strategy_name: str, stock_codes: list):
+        """전략 신호 모니터링 (주기적 체크)"""
+        try:
+            logger.info(f"🔍 {strategy_name} 신호 모니터링 시작: {len(stock_codes)}개 종목")
+
+            # 30초 간격으로 신호 체크 (총 30분간)
+            for cycle in range(60):  # 30초 * 60 = 30분
+                await asyncio.sleep(30)  # 30초 대기
+
+                logger.debug(f"🔄 {strategy_name} 신호 체크 사이클 {cycle + 1}/60")
+
+                for stock_code in stock_codes:
+                    try:
+                        # 최신 데이터 조회
+                        latest_data = self.data_manager.get_latest_data(stock_code)
+                        if latest_data and latest_data.get('status') == 'success':
+                            # 신호 생성 시도
+                                                    signal = self._generate_simple_signal(strategy_name, stock_code, latest_data)
+                        if signal:
+                            logger.info(f"✅ 주기적 체크에서 신호 발견: {stock_code}")
+                            self.send_signal_to_main_bot(signal, source="periodic_check")
+
+                    except Exception as e:
+                        logger.error(f"신호 체크 오류 ({stock_code}): {e}")
+
+                # 10개 종목마다 잠시 대기 (API 부하 방지)
+                if len(stock_codes) > 10:
+                    await asyncio.sleep(5)
+
+        except Exception as e:
+            logger.error(f"{strategy_name} 신호 모니터링 오류: {e}")
 
     def _create_strategy_callback(self, strategy_name: str):
         """전략별 콜백 생성"""
@@ -273,54 +327,116 @@ class StrategyScheduler:
                 # 간단한 신호 생성
                 signal = self._generate_simple_signal(strategy_name, stock_code, data)
                 if signal:
-                    # 봇에게 신호 전달
-                    asyncio.create_task(self._send_signal_to_bot(signal))
+                    # 봇에게 신호 전달 (통합 버전 사용)
+                    self.send_signal_to_main_bot(signal, source="realtime_callback")
             except Exception as e:
                 logger.error(f"콜백 오류: {strategy_name} {stock_code} - {e}")
 
         return callback
 
     def _generate_simple_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
-        """간단한 신호 생성"""
+        """간단한 신호 생성 (기술적 지표 통합 버전)"""
         try:
-            # 임시 신호 생성 로직 (실제로는 더 복잡한 분석 필요)
+            # 현재가 확인
             current_price = data.get('current_price', 0)
             if current_price <= 0:
                 return None
 
-            # 가격 변화율 기반 간단한 신호
+            # 가격 변화율 확인
             change_rate = data.get('change_rate', 0)
+            volume = data.get('volume', 0)
+
+            logger.debug(f"신호 생성 체크: {stock_code} 전략={strategy_name}, 현재가={current_price:,}, 변화율={change_rate:.2f}%, 거래량={volume:,}")
+
+            # 기술적 지표 확인을 위한 일봉 데이터 조회 (캐시 활용)
+            try:
+                daily_data = self.data_manager.collector.get_daily_prices(stock_code, "D", use_cache=True)
+                if daily_data and len(daily_data) >= 3:
+                    # 빠른 기술적 신호 분석
+                    tech_signal = TechnicalIndicators.get_quick_signals(daily_data)
+                    tech_score = tech_signal.get('strength', 0)
+                    tech_action = tech_signal.get('action', 'HOLD')
+
+                    logger.debug(f"기술적 지표: {stock_code} - {tech_action} (강도: {tech_score}) [캐시활용]")
+                else:
+                    tech_score = 0
+                    tech_action = 'HOLD'
+            except Exception as e:
+                logger.debug(f"기술적 지표 조회 실패: {stock_code} - {e}")
+                tech_score = 0
+                tech_action = 'HOLD'
 
             signal = None
-            if strategy_name == 'gap_trading' and change_rate > 3.0:
-                signal = {
-                    'stock_code': stock_code,
-                    'signal_type': 'BUY',
-                    'strategy': strategy_name,
-                    'price': current_price,
-                    'strength': min(change_rate / 10.0, 1.0),
-                    'reason': f'갭 상승 {change_rate:.1f}%'
-                }
-            elif strategy_name == 'volume_breakout' and change_rate > 2.0:
-                volume = data.get('volume', 0)
-                if volume > 0:  # 거래량 체크는 추후 개선
+
+            # 전략별 신호 생성 (기술적 지표 고려)
+            if strategy_name == 'gap_trading' and change_rate > 1.8:  # 2.0에서 1.8로 추가 완화
+                # 기술적 지표가 매수 신호이거나 중립일 때만
+                if tech_action in ['BUY', 'HOLD']:
+                    # 기술적 지표 점수에 따라 신호 강도 조정
+                    base_strength = min(change_rate / 8.0, 1.0)
+                    tech_bonus = tech_score / 200  # 최대 0.5 보너스
+                    final_strength = min(base_strength + tech_bonus, 1.0)
+
                     signal = {
                         'stock_code': stock_code,
                         'signal_type': 'BUY',
                         'strategy': strategy_name,
                         'price': current_price,
-                        'strength': min(change_rate / 8.0, 1.0),
-                        'reason': f'거래량 돌파 {change_rate:.1f}%'
+                        'strength': final_strength,
+                        'reason': f'갭 상승 {change_rate:.1f}% (기술: {tech_action})',
+                        'tech_score': tech_score
                     }
-            elif strategy_name == 'momentum' and change_rate > 1.0:
+                    logger.info(f"🎯 갭 트레이딩 신호 생성: {stock_code} {change_rate:.1f}% (기술점수: {tech_score})")
+
+            elif strategy_name == 'volume_breakout' and change_rate > 1.2:  # 1.5에서 1.2로 추가 완화
+                if volume > 0 and tech_action in ['BUY', 'HOLD']:
+                    base_strength = min(change_rate / 6.0, 1.0)
+                    tech_bonus = tech_score / 200
+                    final_strength = min(base_strength + tech_bonus, 1.0)
+
+                    signal = {
+                        'stock_code': stock_code,
+                        'signal_type': 'BUY',
+                        'strategy': strategy_name,
+                        'price': current_price,
+                        'strength': final_strength,
+                        'reason': f'거래량 돌파 {change_rate:.1f}% (기술: {tech_action})',
+                        'tech_score': tech_score
+                    }
+                    logger.info(f"🎯 볼륨 브레이크아웃 신호 생성: {stock_code} {change_rate:.1f}% (기술점수: {tech_score})")
+
+            elif strategy_name == 'momentum' and change_rate > 0.6:  # 0.8에서 0.6으로 추가 완화
+                if tech_action in ['BUY', 'HOLD']:
+                    base_strength = min(change_rate / 4.0, 1.0)
+                    tech_bonus = tech_score / 200
+                    final_strength = min(base_strength + tech_bonus, 1.0)
+
+                    signal = {
+                        'stock_code': stock_code,
+                        'signal_type': 'BUY',
+                        'strategy': strategy_name,
+                        'price': current_price,
+                        'strength': final_strength,
+                        'reason': f'모멘텀 {change_rate:.1f}% (기술: {tech_action})',
+                        'tech_score': tech_score
+                    }
+                    logger.info(f"🎯 모멘텀 신호 생성: {stock_code} {change_rate:.1f}% (기술점수: {tech_score})")
+
+            # 기술적 지표가 강력한 매수 신호일 때 추가 신호 생성
+            elif tech_action == 'BUY' and tech_score > 70 and change_rate > 0.5:
                 signal = {
                     'stock_code': stock_code,
                     'signal_type': 'BUY',
-                    'strategy': strategy_name,
+                    'strategy': f'{strategy_name}_tech',
                     'price': current_price,
-                    'strength': min(change_rate / 5.0, 1.0),
-                    'reason': f'모멘텀 {change_rate:.1f}%'
+                    'strength': min(tech_score / 100, 1.0),
+                    'reason': f'기술적 강세 신호 (점수: {tech_score})',
+                    'tech_score': tech_score
                 }
+                logger.info(f"🎯 기술적 신호 생성: {stock_code} 점수={tech_score}")
+
+            if signal:
+                logger.info(f"✅ 신호 생성 완료: {signal}")
 
             return signal
 
@@ -328,13 +444,94 @@ class StrategyScheduler:
             logger.error(f"신호 생성 오류: {strategy_name} {stock_code} - {e}")
             return None
 
-    async def _send_signal_to_bot(self, signal: Dict):
-        """봇에게 신호 전달"""
+    def send_signal_to_main_bot(self, signal: Dict, source: str = "unknown"):
+        """메인 봇에게 거래 신호 전달 (중복 방지 버전)"""
         try:
+            stock_code = signal.get('stock_code')
+            signal_type = signal.get('signal_type')
+
+            if not stock_code or not signal_type:
+                logger.error("❌ 유효하지 않은 신호 데이터")
+                return False
+
+            # 중복 신호 체크
+            if not self._is_signal_allowed(stock_code, signal_type, source):
+                logger.debug(f"⏰ 신호 쿨다운 중: {stock_code} ({source})")
+                return False
+
+            # 메인 봇에 신호 전달
             if self.bot_instance and hasattr(self.bot_instance, 'handle_trading_signal'):
+                logger.info(f"📤 거래신호 전달: {stock_code} {signal_type} ({source})")
+
+                # 신호 히스토리 업데이트
+                self._update_signal_history(stock_code, signal_type, source)
+
+                # 실제 신호 전달
                 self.bot_instance.handle_trading_signal(signal)
+                logger.info(f"✅ 거래신호 전달 완료: {stock_code}")
+                return True
+            else:
+                logger.error("❌ 메인 봇 인스턴스가 설정되지 않음")
+                return False
+
         except Exception as e:
-            logger.error(f"신호 전달 오류: {e}")
+            logger.error(f"거래신호 전달 오류: {e}")
+            return False
+
+    def _is_signal_allowed(self, stock_code: str, signal_type: str, source: str) -> bool:
+        """신호 허용 여부 체크 (중복 방지)"""
+        try:
+            with self.signal_lock:
+                current_time = time_module.time()
+
+                # 기존 히스토리 확인
+                if stock_code in self.signal_history:
+                    history = self.signal_history[stock_code]
+
+                    # 쿨다운 시간 체크
+                    cooldown_until = history.get('cooldown_until', 0)
+                    if current_time < cooldown_until:
+                        logger.debug(f"⏰ {stock_code} 쿨다운 중 (남은시간: {int(cooldown_until - current_time)}초)")
+                        return False
+
+                    # 같은 타입 신호 중복 체크 (1분 이내)
+                    last_signal_time = history.get('last_signal_time', 0)
+                    last_signal_type = history.get('last_signal_type', '')
+
+                    if (signal_type == last_signal_type and
+                        current_time - last_signal_time < 60):  # 1분 이내 같은 신호 차단
+                        logger.debug(f"⚠️ {stock_code} 1분 이내 중복 신호 차단: {signal_type}")
+                        return False
+
+                return True
+
+        except Exception as e:
+            logger.error(f"신호 허용 체크 오류: {e}")
+            return True  # 오류시 허용
+
+    def _update_signal_history(self, stock_code: str, signal_type: str, source: str):
+        """신호 히스토리 업데이트"""
+        try:
+            with self.signal_lock:
+                current_time = time_module.time()
+
+                # 매수 신호인 경우 쿨다운 설정
+                cooldown_until = 0
+                if signal_type == 'BUY':
+                    cooldown_until = current_time + self.signal_cooldown  # 5분 쿨다운
+
+                self.signal_history[stock_code] = {
+                    'last_signal_time': current_time,
+                    'last_signal_type': signal_type,
+                    'cooldown_until': cooldown_until,
+                    'source': source,
+                    'count': self.signal_history.get(stock_code, {}).get('count', 0) + 1
+                }
+
+                logger.debug(f"📝 신호 히스토리 업데이트: {stock_code} {signal_type} ({source})")
+
+        except Exception as e:
+            logger.error(f"신호 히스토리 업데이트 오류: {e}")
 
     def set_bot_instance(self, bot_instance: 'StockBot'):
         """봇 인스턴스 설정"""
