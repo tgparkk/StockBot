@@ -256,36 +256,22 @@ class KISRestAPIManager:
             logger.info(f"시장 스크리닝 시작: {screening_type}")
 
             if screening_type in ["all", "gap"]:
-                # 갭 트레이딩: 통합된 API 활용
+                # 갭 트레이딩: 등락률 상위 조회
                 logger.debug("갭 트레이딩 후보 탐색 중...")
-                gap_data = market_api.get_gap_trading_candidates(enhanced=True)
-                candidates['gap_candidates'] = self._parse_unified_gap_candidates(gap_data)
+                gap_data = market_api.get_gap_trading_candidates()
+                candidates['gap_candidates'] = self._parse_gap_candidates(gap_data)
 
             if screening_type in ["all", "volume"]:
-                # 거래량 돌파: 통합된 API + 호가잔량 활용
+                # 거래량 돌파: 거래량 증가율 상위 조회
                 logger.debug("거래량 돌파 후보 탐색 중...")
-                volume_data = market_api.get_volume_breakout_candidates(enhanced=True)
-
-                # 호가잔량 순매수 우세 종목 추가
-                quote_balance_data = market_api.get_quote_balance_rank(
-                    fid_rank_sort_cls_code="0",  # 순매수잔량순
-                    fid_vol_cnt="10000"  # 1만주 이상
-                )
-
-                candidates['volume_candidates'] = self._parse_unified_volume_candidates(volume_data, quote_balance_data)
+                volume_data = market_api.get_volume_breakout_candidates()
+                candidates['volume_candidates'] = self._parse_volume_candidates(volume_data)
 
             if screening_type in ["all", "momentum"]:
-                # 모멘텀: 통합된 API + 호가잔량 활용
+                # 모멘텀: 체결강도 상위 조회
                 logger.debug("모멘텀 후보 탐색 중...")
-                momentum_data = market_api.get_momentum_candidates(enhanced=True)
-
-                # 호가잔량 매수비율 우세 종목 추가
-                quote_balance_data = market_api.get_quote_balance_rank(
-                    fid_rank_sort_cls_code="2",  # 매수비율순
-                    fid_vol_cnt="5000"  # 5천주 이상
-                )
-
-                candidates['momentum_candidates'] = self._parse_unified_momentum_candidates(momentum_data, quote_balance_data)
+                momentum_data = market_api.get_momentum_candidates()
+                candidates['momentum_candidates'] = self._parse_momentum_candidates(momentum_data)
 
             # 총 후보 수 계산
             candidates['total_candidates'] = (
@@ -308,22 +294,31 @@ class KISRestAPIManager:
             return candidates
 
     def _parse_gap_candidates(self, data: Optional[pd.DataFrame]) -> List[Dict]:
-        """갭 트레이딩 후보 파싱"""
+        """갭 트레이딩 후보 파싱 (실제 갭 데이터)"""
         candidates = []
 
         if data is not None and not data.empty:
             logger.debug(f"갭 후보 원본 데이터: {len(data)}건")
 
-            for _, row in data.head(20).iterrows():  # 상위 20개
+            for _, row in data.iterrows():  # 이미 필터링된 갭 데이터
                 try:
+                    gap_rate = float(row.get('gap_rate', 0))
                     change_rate = float(row.get('prdy_ctrt', 0))
-                    if change_rate >= 1.5:  # 1.5% 이상 상승
+                    volume_ratio = float(row.get('volume_ratio', 0))
+
+                    # 갭 트레이딩 후보 조건 재확인
+                    if gap_rate >= 2.0 and change_rate > 0 and volume_ratio >= 1.5:
                         candidates.append({
                             'stock_code': row.get('stck_shrn_iscd', ''),
                             'stock_name': row.get('hts_kor_isnm', ''),
                             'current_price': int(row.get('stck_prpr', 0)),
+                            'open_price': int(row.get('stck_oprc', 0)),
+                            'prev_close': int(row.get('stck_sdpr', 0)),
+                            'gap_size': int(row.get('gap_size', 0)),
+                            'gap_rate': gap_rate,
                             'change_rate': change_rate,
                             'volume': int(row.get('acml_vol', 0)),
+                            'volume_ratio': volume_ratio,
                             'strategy': 'gap_trading',
                             'rank': int(row.get('data_rank', 0))
                         })
