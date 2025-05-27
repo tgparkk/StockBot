@@ -11,6 +11,9 @@ from . import kis_data_cache as cache
 from .kis_data_collector import KISDataCollector
 from .kis_websocket_manager import KISWebSocketManager
 
+# DataPriority import 추가
+from database.db_models import DataPriority
+
 logger = setup_logger(__name__)
 
 
@@ -61,6 +64,112 @@ class SimpleHybridDataManager:
         logger.info(f"웹소켓 제한: {self.WEBSOCKET_LIMIT}건, 최대 실시간 종목: {self.MAX_REALTIME_STOCKS}개")
 
     # === 구독 관리 ===
+
+    def add_stock_request(self, stock_code: str, priority: DataPriority,
+                         strategy_name: str, callback: Optional[Callable] = None) -> bool:
+        """
+        종목 구독 요청 (우선순위 기반) - StrategyScheduler 호환용
+
+        Args:
+            stock_code: 종목코드 (6자리, 예: '005930')
+            priority: 데이터 우선순위 (DataPriority enum)
+            strategy_name: 전략명
+            callback: 콜백 함수
+
+        Returns:
+            구독 성공 여부
+        """
+        try:
+            # 입력값 검증
+            if not stock_code or len(stock_code) != 6:
+                logger.error(f"유효하지 않은 종목코드: {stock_code}")
+                return False
+
+            if not isinstance(priority, DataPriority):
+                logger.error(f"유효하지 않은 우선순위 타입: {type(priority)}")
+                return False
+
+            # DataPriority를 숫자 우선순위로 변환
+            priority_mapping = {
+                DataPriority.CRITICAL: 1,     # 최고 우선순위 (실시간)
+                DataPriority.HIGH: 2,         # 높음 (실시간 시도)
+                DataPriority.MEDIUM: 3,       # 보통 (폴링)
+                DataPriority.LOW: 4,          # 낮음 (폴링)
+                DataPriority.BACKGROUND: 5    # 배경 (폴링)
+            }
+
+            numeric_priority = priority_mapping.get(priority, 3)
+
+            # 실시간 사용 여부 결정 (CRITICAL, HIGH만 실시간 시도)
+            use_realtime = priority in [DataPriority.CRITICAL, DataPriority.HIGH]
+
+            # 웹소켓 연결 상태 확인 및 연결 시도
+            if use_realtime and not self.websocket_running:
+                logger.info("실시간 데이터 요청 - 웹소켓 연결 시도")
+                if not self._start_websocket_if_needed():
+                    logger.warning(f"웹소켓 연결 실패 - {stock_code}를 폴링으로 대체")
+                    use_realtime = False
+
+            # 기존 add_stock 메서드 호출
+            success = self.add_stock(
+                stock_code=stock_code,
+                strategy_name=strategy_name,
+                use_realtime=use_realtime,
+                callback=callback,
+                priority=numeric_priority
+            )
+
+            if success:
+                logger.info(f"📊 종목 구독 요청 성공: {stock_code} [{priority.value}] {strategy_name}")
+
+                # 실시간 구독 시 웹소켓 연결 확인
+                if use_realtime:
+                    realtime_success = self._verify_realtime_subscription(stock_code)
+                    if not realtime_success:
+                        logger.warning(f"실시간 구독 확인 실패 - {stock_code}를 폴링으로 대체")
+                        # 실시간에서 폴링으로 다운그레이드
+                        self.downgrade_to_polling(stock_code)
+            else:
+                logger.warning(f"⚠️ 종목 구독 요청 실패: {stock_code} [{priority.value}] {strategy_name}")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"종목 구독 요청 오류: {stock_code} - {e}")
+            return False
+
+    def upgrade_priority(self, stock_code: str, new_priority: DataPriority) -> bool:
+        """
+        종목 우선순위 승격 - StrategyScheduler 호환용
+
+        Args:
+            stock_code: 종목코드
+            new_priority: 새로운 우선순위
+
+        Returns:
+            승격 성공 여부
+        """
+        try:
+            # DataPriority를 숫자 우선순위로 변환
+            priority_mapping = {
+                DataPriority.CRITICAL: 1,
+                DataPriority.HIGH: 2,
+                DataPriority.MEDIUM: 3,
+                DataPriority.LOW: 4,
+                DataPriority.BACKGROUND: 5
+            }
+
+            numeric_priority = priority_mapping.get(new_priority, 3)
+
+            # 기존 update_stock_priority 메서드 호출
+            self.update_stock_priority(stock_code, numeric_priority)
+
+            logger.info(f"📈 우선순위 승격: {stock_code} → {new_priority.value}")
+            return True
+
+        except Exception as e:
+            logger.error(f"우선순위 승격 오류: {stock_code} - {e}")
+            return False
 
     def add_stock(self, stock_code: str, strategy_name: str,
                   use_realtime: bool = False, callback: Optional[Callable] = None,
@@ -164,44 +273,41 @@ class SimpleHybridDataManager:
     def _add_to_realtime(self, stock_code: str) -> bool:
         """실시간 구독 추가"""
         if not self._can_add_realtime():
+            logger.warning(f"실시간 구독 한계 도달: {len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS}")
             return False
 
         try:
-            # 웹소켓 구독 시도
-            if self.websocket_running:
-                # 비동기 구독을 동기적으로 처리
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # 이미 실행 중인 루프에서는 create_task 사용
-                    asyncio.create_task(
-                        self.websocket_manager.subscribe_stock(stock_code, self._websocket_callback)
-                    )
+            success = False
+
+            # 웹소켓 매니저 연결 상태 확인
+            if not self.websocket_manager:
+                logger.error("웹소켓 매니저가 없습니다")
+                return False
+
+            # 웹소켓 연결 확인
+            if not getattr(self.websocket_manager, 'is_connected', False):
+                logger.warning(f"웹소켓이 연결되지 않음 - 연결 시도: {stock_code}")
+                if not self._start_websocket_if_needed():
+                    logger.error(f"웹소켓 연결 실패: {stock_code}")
+                    return False
+
+            # 이미 구독 중인지 확인
+            if hasattr(self.websocket_manager, 'subscribed_stocks'):
+                if stock_code in self.websocket_manager.subscribed_stocks:
+                    logger.info(f"이미 웹소켓 구독 중: {stock_code}")
                     success = True
                 else:
-                    # 새 루프에서 실행
-                    success = loop.run_until_complete(
-                        self.websocket_manager.subscribe_stock(stock_code, self._websocket_callback)
-                    )
+                    # 새로운 구독 시도
+                    success = self._execute_websocket_subscription(stock_code)
             else:
-                # 웹소켓이 실행 중이 아니면 시작
-                if self._start_websocket_if_needed():
-                    # 웹소켓 시작 후 구독 시도
-                    time.sleep(0.5)  # 연결 대기
-                    try:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        success = loop.run_until_complete(
-                            self.websocket_manager.subscribe_stock(stock_code, self._websocket_callback)
-                        )
-                        loop.close()
-                    except Exception as e:
-                        logger.error(f"웹소켓 구독 오류: {stock_code} - {e}")
-                        success = False
-                else:
-                    success = False
+                # 웹소켓 매니저가 구독 정보를 제공하지 않는 경우
+                success = self._execute_websocket_subscription(stock_code)
 
             if success:
-                self.realtime_stocks.append(stock_code)
+                # 구독 성공 처리
+                if stock_code not in self.realtime_stocks:
+                    self.realtime_stocks.append(stock_code)
+
                 self.subscriptions[stock_code]['use_realtime'] = True
                 self._remove_from_polling(stock_code)
 
@@ -210,14 +316,56 @@ class SimpleHybridDataManager:
                     self.realtime_priority_queue.remove(stock_code)
 
                 self._update_stats()
-                logger.info(f"실시간 구독 추가: {stock_code} ({len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS})")
+                logger.info(f"✅ 실시간 구독 추가: {stock_code} ({len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS})")
                 return True
             else:
-                logger.error(f"실시간 구독 실패: {stock_code}")
+                logger.error(f"❌ 실시간 구독 실패: {stock_code}")
                 return False
 
         except Exception as e:
             logger.error(f"실시간 구독 오류: {stock_code} - {e}")
+            return False
+
+    def _execute_websocket_subscription(self, stock_code: str) -> bool:
+        """웹소켓 구독 실행 (비동기 처리)"""
+        try:
+            import threading
+            result_container = []
+            exception_container = []
+
+            def run_subscription():
+                try:
+                    # 새로운 이벤트 루프 생성
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+
+                    try:
+                        # 웹소켓 구독 실행
+                        result = new_loop.run_until_complete(
+                            self.websocket_manager.subscribe_stock(stock_code, self._websocket_callback)
+                        )
+                        result_container.append(result)
+                    finally:
+                        new_loop.close()
+
+                except Exception as e:
+                    exception_container.append(e)
+
+            # 별도 스레드에서 실행
+            thread = threading.Thread(target=run_subscription, daemon=True)
+            thread.start()
+            thread.join(timeout=15)  # 15초 타임아웃
+
+            if exception_container:
+                raise exception_container[0]
+            elif result_container:
+                return result_container[0]
+            else:
+                logger.error(f"웹소켓 구독 타임아웃: {stock_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"웹소켓 구독 실행 오류: {stock_code} - {e}")
             return False
 
     def _remove_from_realtime(self, stock_code: str):
@@ -380,61 +528,111 @@ class SimpleHybridDataManager:
     def _start_websocket_if_needed(self) -> bool:
         """필요시 웹소켓 시작"""
         try:
-            if self.websocket_running:
+            # 이미 실행 중이면 연결 상태만 확인
+            if self.websocket_running and getattr(self.websocket_manager, 'is_connected', False):
+                logger.debug("웹소켓이 이미 실행 중이고 연결됨")
                 return True
 
+            if not self.websocket_manager:
+                logger.error("웹소켓 매니저가 없습니다")
+                return False
+
+            logger.info("웹소켓 연결 시작...")
+
             # 웹소켓 연결 시작
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            success = self._execute_websocket_connection()
 
-            async def start_websocket():
-                try:
-                    # 웹소켓 연결
-                    if await self.websocket_manager.connect():
-                        self.websocket_running = True
-                        logger.info("✅ 웹소켓 연결 성공")
+            if success:
+                self.websocket_running = True
+                logger.info("✅ 웹소켓 연결 성공")
 
-                        # 백그라운드에서 메시지 처리 시작
-                        self.websocket_task = asyncio.create_task(
-                            self.websocket_manager.start_listening()
-                        )
-                        return True
-                    else:
-                        logger.error("❌ 웹소켓 연결 실패")
-                        return False
-                except Exception as e:
-                    logger.error(f"웹소켓 시작 오류: {e}")
-                    return False
+                # 연결 후 메시지 핸들러 시작
+                self._start_websocket_message_handler()
+            else:
+                self.websocket_running = False
+                logger.error("❌ 웹소켓 연결 실패")
 
-            # 새 스레드에서 웹소켓 실행
-            def run_websocket():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    success = loop.run_until_complete(start_websocket())
-                    if success:
-                        # 연결 후 메시지 처리 루프 시작
-                        loop.run_until_complete(self.websocket_manager._message_handler())
-                except Exception as e:
-                    logger.error(f"웹소켓 루프 오류: {e}")
-                finally:
-                    loop.close()
-
-            websocket_thread = threading.Thread(
-                target=run_websocket,
-                name="WebSocketManager",
-                daemon=True
-            )
-            websocket_thread.start()
-
-            # 짧은 대기 후 연결 상태 확인
-            import time
-            time.sleep(1)
-            return self.websocket_running
+            return success
 
         except Exception as e:
-            logger.error(f"웹소켓 시작 실패: {e}")
+            logger.error(f"웹소켓 시작 중 예외: {e}")
+            self.websocket_running = False
             return False
+
+    def _execute_websocket_connection(self) -> bool:
+        """웹소켓 연결 실행"""
+        try:
+            import threading
+            result_container = []
+            exception_container = []
+
+            def run_connection():
+                try:
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+
+                    try:
+                        # 웹소켓 연결 실행
+                        if hasattr(self.websocket_manager, 'connect'):
+                            result = new_loop.run_until_complete(
+                                self.websocket_manager.connect()
+                            )
+                        else:
+                            # 웹소켓 매니저가 connect 메서드가 없는 경우
+                            # 접속키 발급 및 기본 연결 처리
+                            approval_key = self.websocket_manager.get_approval_key()
+                            self.websocket_manager.approval_key = approval_key
+
+                            # 연결 상태를 True로 설정
+                            self.websocket_manager.is_connected = True
+                            result = True
+
+                        result_container.append(result)
+                    finally:
+                        new_loop.close()
+
+                except Exception as e:
+                    exception_container.append(e)
+
+            # 별도 스레드에서 실행
+            thread = threading.Thread(target=run_connection, daemon=True)
+            thread.start()
+            thread.join(timeout=20)  # 20초 타임아웃
+
+            if exception_container:
+                logger.error(f"웹소켓 연결 오류: {exception_container[0]}")
+                return False
+            elif result_container:
+                return result_container[0]
+            else:
+                logger.error("웹소켓 연결 타임아웃")
+                return False
+
+        except Exception as e:
+            logger.error(f"웹소켓 연결 실행 오류: {e}")
+            return False
+
+    def _start_websocket_message_handler(self):
+        """웹소켓 메시지 핸들러 시작"""
+        try:
+            if hasattr(self.websocket_manager, 'start_listening'):
+                # 메시지 핸들러를 별도 스레드에서 실행
+                def run_message_handler():
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self.websocket_manager.start_listening())
+                    except Exception as e:
+                        logger.error(f"메시지 핸들러 오류: {e}")
+
+                handler_thread = threading.Thread(target=run_message_handler, daemon=True)
+                handler_thread.start()
+                logger.info("웹소켓 메시지 핸들러 시작")
+            else:
+                logger.info("웹소켓 매니저에 메시지 핸들러가 없음")
+
+        except Exception as e:
+            logger.error(f"메시지 핸들러 시작 오류: {e}")
 
     def _process_data_update(self, stock_code: str, data: Dict) -> None:
         """데이터 업데이트 처리"""
@@ -563,6 +761,24 @@ class SimpleHybridDataManager:
     def get_priority_queue(self) -> List[str]:
         """우선순위 대기열"""
         return self.realtime_priority_queue.copy()
+
+    def _verify_realtime_subscription(self, stock_code: str) -> bool:
+        """실시간 구독 상태 검증"""
+        try:
+            if not self.websocket_manager:
+                return False
+
+            # 웹소켓 매니저에서 구독 상태 확인
+            if hasattr(self.websocket_manager, 'subscribed_stocks'):
+                return stock_code in self.websocket_manager.subscribed_stocks
+
+            # 구독 정보가 있는지 확인
+            subscription = self.subscriptions.get(stock_code, {})
+            return subscription.get('use_realtime', False)
+
+        except Exception as e:
+            logger.error(f"실시간 구독 검증 오류: {stock_code} - {e}")
+            return False
 
     # === 정리 ===
 

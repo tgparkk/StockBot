@@ -158,7 +158,12 @@ class KISDataCollector:
             cached_data = cache.get_cached_daily_data(cache_key)
             if cached_data:
                 self.stats['cache_hits'] += 1
-                return cached_data
+                # cached_data가 이미 List[Dict] 형태인지 확인하고 반환
+                if isinstance(cached_data, list):
+                    return cached_data
+                else:
+                    # Dict인 경우 List로 감싸서 반환
+                    return [cached_data]
 
         # 2. REST API 호출
         try:
