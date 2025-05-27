@@ -382,19 +382,29 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
     }
 
     try:
+        logger.debug(f"등락률 순위 API 호출 - 파라미터: {params}")
         res = kis._url_fetch(url, tr_id, tr_cont, params)
 
         if res and res.isOK():
-            output_data = res.getBody().output
-            if output_data:
-                current_data = pd.DataFrame(output_data)
-                logger.info(f"등락률 순위 조회 성공: {len(current_data)}건")
-                return current_data
-            else:
-                logger.warning("등락률 순위 조회: 데이터 없음")
+            try:
+                output_data = res.getBody().output
+                if output_data:
+                    current_data = pd.DataFrame(output_data)
+                    logger.info(f"등락률 순위 조회 성공: {len(current_data)}건")
+                    return current_data
+                else:
+                    logger.warning("등락률 순위 조회: output 데이터 없음")
+                    return pd.DataFrame()
+            except AttributeError as e:
+                logger.error(f"등락률 순위 응답 구조 오류: {e}")
+                logger.debug(f"응답 구조: {type(res.getBody())}")
                 return pd.DataFrame()
         else:
-            logger.error("등락률 순위 조회 실패")
+            if res:
+                logger.error(f"등락률 순위 조회 실패 - 응답코드: {getattr(res, 'rt_cd', 'Unknown')}")
+                logger.error(f"오류 메시지: {getattr(res, 'msg1', 'Unknown')}")
+            else:
+                logger.error("등락률 순위 조회 실패 - 응답 없음")
             return None
     except Exception as e:
         logger.error(f"등락률 순위 조회 오류: {e}")
@@ -405,69 +415,133 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
 # 통합된 전략별 후보 조회 함수들
 # =============================================================================
 
-def get_gap_trading_candidates(market: str = "0000", enhanced: bool = True) -> Dict[str, Optional[pd.DataFrame]]:
-    """갭 트레이딩 후보 조회 (기본 + 이격도 조합)"""
-    result: Dict[str, Optional[pd.DataFrame]] = {"basic": None, "enhanced": None}
+def get_gap_trading_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
+    """갭 트레이딩 후보 조회 (실제 갭 계산)"""
+    try:
+        # 1단계: 상승률 상위 종목을 1차 필터링 (조건 완화)
+        logger.info("갭 트레이딩 후보 1차 필터링 중...")
 
-    # 기본 등락률 상위
-    result["basic"] = get_fluctuation_rank(
-        fid_input_iscd=market,
-        fid_rank_sort_cls_code="0",  # 상승률순
-        fid_rsfl_rate1="1.5"  # 1.5% 이상
-    )
-
-    # 향상된 버전: 이격도 과매도 종목
-    if enhanced:
-        result["enhanced"] = get_disparity_rank(
+        # 먼저 조건 없이 상승률 상위 종목 조회
+        candidate_data = get_fluctuation_rank(
             fid_input_iscd=market,
-            fid_rank_sort_cls_code="1",  # 이격도 하위순 (과매도)
-            fid_hour_cls_code="20"  # 20일 이격도
+            fid_rank_sort_cls_code="0",  # 상승률순
+            fid_rsfl_rate1=""  # 조건 없음 (모든 상승 종목)
         )
 
-    return result
+        if candidate_data is None or candidate_data.empty:
+            logger.warning("갭 트레이딩 1차 필터링에서 데이터 없음 - 조건 완화하여 재시도")
+
+            # 조건을 더 완화하여 재시도 (전체 종목)
+            candidate_data = get_fluctuation_rank(
+                fid_input_iscd=market,
+                fid_rank_sort_cls_code="0",  # 상승률순
+                fid_rsfl_rate1="",           # 비율 조건 없음
+                fid_rsfl_rate2=""            # 완전 조건 없음
+            )
+
+            if candidate_data is None or candidate_data.empty:
+                logger.error("갭 트레이딩: 모든 조건에서 데이터 없음")
+                return pd.DataFrame()
+
+        logger.info(f"1차 필터링 완료: {len(candidate_data)}개 종목")
+
+        # 2단계: 각 종목의 실제 갭 계산
+        gap_candidates = []
+
+        for idx, row in candidate_data.head(50).iterrows():  # 상위 50개만 체크 (API 제한 고려)
+            try:
+                stock_code = row.get('stck_shrn_iscd', '')
+                if not stock_code:
+                    continue
+
+                # 현재가 정보 조회 (시가, 전일종가 포함)
+                current_data = get_inquire_price("J", stock_code)
+                if current_data is None or current_data.empty:
+                    continue
+
+                current_info = current_data.iloc[0]
+
+                # 갭 계산에 필요한 데이터 추출
+                current_price = int(current_info.get('stck_prpr', 0))      # 현재가
+                open_price = int(current_info.get('stck_oprc', 0))         # 시가
+                prev_close = int(current_info.get('stck_sdpr', 0))         # 전일종가
+
+                if open_price <= 0 or prev_close <= 0:
+                    continue
+
+                # 갭 크기 계산
+                gap_size = open_price - prev_close
+                gap_rate = (gap_size / prev_close) * 100  # 갭 비율 (%)
+
+                # 갭 트레이딩 조건 확인
+                if abs(gap_rate) >= 2.0:  # 2% 이상 갭 (상향갭 또는 하향갭)
+                    # 상향갭일 때만 (갭업)
+                    if gap_rate > 0:
+                        volume = int(current_info.get('acml_vol', 0))
+                        change_rate = float(current_info.get('prdy_ctrt', 0))
+
+                        # 갭 후 거래량 확인 (평소보다 많아야 함)
+                        avg_volume = int(current_info.get('avrg_vol', 1))  # 평균 거래량
+                        volume_ratio = volume / max(avg_volume, 1)
+
+                        # 갭 트레이딩 후보 조건
+                        # 1. 상향갭 2% 이상
+                        # 2. 거래량이 평균의 1.5배 이상
+                        # 3. 현재 상승률 유지 중
+                        if volume_ratio >= 1.5 and change_rate > 0:
+                            gap_candidates.append({
+                                'stck_shrn_iscd': stock_code,
+                                'hts_kor_isnm': row.get('hts_kor_isnm', ''),
+                                'stck_prpr': current_price,
+                                'stck_oprc': open_price,
+                                'stck_sdpr': prev_close,
+                                'gap_size': gap_size,
+                                'gap_rate': round(gap_rate, 2),
+                                'prdy_ctrt': change_rate,
+                                'acml_vol': volume,
+                                'volume_ratio': round(volume_ratio, 2),
+                                'data_rank': len(gap_candidates) + 1
+                            })
+
+                            logger.debug(f"갭 후보 발견: {stock_code} 갭{gap_rate:.1f}% 거래량{volume_ratio:.1f}배")
+
+                # API 제한 고려 대기
+                time.sleep(0.05)  # 50ms 대기
+
+            except Exception as e:
+                logger.warning(f"종목 {stock_code} 갭 계산 오류: {e}")
+                continue
+
+        # 3단계: 갭 크기 기준 정렬
+        if gap_candidates:
+            gap_df = pd.DataFrame(gap_candidates)
+            gap_df = gap_df.sort_values('gap_rate', ascending=False)  # 갭 크기 내림차순
+            logger.info(f"갭 트레이딩 후보 {len(gap_df)}개 발견")
+            return gap_df
+        else:
+            logger.info("갭 트레이딩 조건을 만족하는 종목 없음")
+            return pd.DataFrame()
+
+    except Exception as e:
+        logger.error(f"갭 트레이딩 후보 조회 오류: {e}")
+        return None
 
 
-def get_volume_breakout_candidates(market: str = "0000", enhanced: bool = True) -> Dict[str, Optional[pd.DataFrame]]:
-    """거래량 돌파 후보 조회 (기본 + 대량체결건수 조합)"""
-    result: Dict[str, Optional[pd.DataFrame]] = {"basic": None, "enhanced": None}
-
-    # 기본 거래량 순위
-    result["basic"] = get_volume_rank(
+def get_volume_breakout_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
+    """거래량 돌파 후보 조회 (거래량 증가율 상위)"""
+    return get_volume_rank(
         fid_input_iscd=market,
         fid_blng_cls_code="1",  # 거래증가율
         fid_vol_cnt="10000"  # 1만주 이상
     )
 
-    # 향상된 버전: 대량체결건수 상위
-    if enhanced:
-        result["enhanced"] = get_bulk_trans_num_rank(
-            fid_input_iscd=market,
-            fid_rank_sort_cls_code="0",  # 매수상위
-            fid_vol_cnt="10000"  # 1만주 이상
-        )
 
-    return result
-
-
-def get_momentum_candidates(market: str = "0000", enhanced: bool = True) -> Dict[str, Optional[pd.DataFrame]]:
-    """모멘텀 후보 조회 (기본 + 대량체결건수 조합)"""
-    result: Dict[str, Optional[pd.DataFrame]] = {"basic": None, "enhanced": None}
-
-    # 기본 체결강도 상위
-    result["basic"] = get_volume_power_rank(
+def get_momentum_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
+    """모멘텀 후보 조회 (체결강도 상위)"""
+    return get_volume_power_rank(
         fid_input_iscd=market,
         fid_vol_cnt="5000"  # 5천주 이상
     )
-
-    # 향상된 버전: 대량체결건수 교차검증
-    if enhanced:
-        result["enhanced"] = get_bulk_trans_num_rank(
-            fid_input_iscd=market,
-            fid_rank_sort_cls_code="0",  # 매수상위
-            fid_vol_cnt="5000"  # 5천주 이상
-        )
-
-    return result
 
 
 def get_bulk_trans_num_rank(fid_cond_mrkt_div_code: str = "J",
@@ -676,46 +750,3 @@ def get_quote_balance_rank(fid_cond_mrkt_div_code: str = "J",
         logger.error(f"호가잔량 순위 조회 오류: {e}")
         return None
 
-
-# =============================================================================
-# 호가잔량 기반 헬퍼 함수들
-# =============================================================================
-
-def get_net_buy_candidates(market: str = "0000", enhanced: bool = True) -> Dict[str, Optional[pd.DataFrame]]:
-    """순매수잔량 우세 후보 조회 (호가잔량 + 매수비율 조합)"""
-    result: Dict[str, Optional[pd.DataFrame]] = {"basic": None, "enhanced": None}
-
-    # 기본 순매수잔량 순위
-    result["basic"] = get_quote_balance_rank(
-        fid_input_iscd=market,
-        fid_rank_sort_cls_code="0",  # 순매수잔량순
-        fid_vol_cnt="10000"  # 1만주 이상
-    )
-
-    # 향상된 버전: 매수비율 우세 종목
-    if enhanced:
-        result["enhanced"] = get_quote_balance_rank(
-            fid_input_iscd=market,
-            fid_rank_sort_cls_code="2",  # 매수비율순
-            fid_vol_cnt="5000"  # 5천주 이상
-        )
-
-    return result
-
-
-def get_quote_imbalance_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """호가 불균형 종목 조회 (순매도잔량 상위 - 반전 기회)"""
-    return get_quote_balance_rank(
-        fid_input_iscd=market,
-        fid_rank_sort_cls_code="1",  # 순매도잔량순 (매도 우세)
-        fid_vol_cnt="10000"  # 1만주 이상
-    )
-
-
-def get_balanced_quote_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """균형잡힌 호가잔량 종목 조회 (매도비율순 - 안정성)"""
-    return get_quote_balance_rank(
-        fid_input_iscd=market,
-        fid_rank_sort_cls_code="3",  # 매도비율순
-        fid_vol_cnt="5000"  # 5천주 이상
-    )
