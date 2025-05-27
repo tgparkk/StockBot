@@ -7,18 +7,16 @@ from .kis_data_models import (
     KISCurrentPrice, KISHistoricalData, KISOrderBook, KISMinuteData,
     GapTradingData, VolumeBreakoutData, MomentumData
 )
-from core.rest_api_manager import KISRestAPIManager as KISAPIManager
 from .strategy_data_adapter import StrategyDataAdapter, KISDataValidator
 
 __all__ = [
     'KISCurrentPrice',
-    'KISHistoricalData', 
+    'KISHistoricalData',
     'KISOrderBook',
     'KISMinuteData',
     'GapTradingData',
     'VolumeBreakoutData',
     'MomentumData',
-    'KISAPIManager',
     'StrategyDataAdapter',
     'KISDataValidator'
-] 
+]

@@ -14,6 +14,8 @@ from . import kis_order_api as order_api
 from . import kis_account_api as account_api
 from . import kis_market_api as market_api
 
+# 데이터 모델은 필요할 때 지연 import (순환 import 방지)
+
 # 설정 import (settings.py에서 .env 파일을 읽어서 제공)
 from config.settings import (
     KIS_BASE_URL, APP_KEY, SECRET_KEY,
@@ -360,20 +362,23 @@ class KISRestAPIManager:
         return candidates
 
     def _parse_momentum_candidates(self, data: Optional[pd.DataFrame]) -> List[Dict]:
-        """모멘텀 후보 파싱"""
+        """모멘텀 후보 파싱 (기술적 분석 포함)"""
         candidates = []
 
         if data is not None and not data.empty:
             logger.debug(f"모멘텀 후보 원본 데이터: {len(data)}건")
 
-            for _, row in data.head(25).iterrows():  # 상위 25개
+            for _, row in data.head(8).iterrows():  # 상위 8개로 제한 (API 제한 고려)
                 try:
                     execution_strength = float(row.get('tday_rltv', 0))
                     change_rate = float(row.get('prdy_ctrt', 0))
 
-                    if execution_strength >= 80 and change_rate > 0:  # 체결강도 80 이상 + 상승
-                        candidates.append({
-                            'stock_code': row.get('stck_shrn_iscd', ''),
+                    if execution_strength >= 70 and change_rate > 0:  # 체결강도 70 이상 + 상승
+                        stock_code = row.get('stck_shrn_iscd', '')
+
+                        # 기본 정보
+                        basic_info = {
+                            'stock_code': stock_code,
                             'stock_name': row.get('hts_kor_isnm', ''),
                             'current_price': int(row.get('stck_prpr', 0)),
                             'change_rate': change_rate,
@@ -381,13 +386,175 @@ class KISRestAPIManager:
                             'execution_strength': execution_strength,
                             'strategy': 'momentum',
                             'rank': int(row.get('data_rank', 0))
-                        })
+                        }
+
+                        # 높은 체결강도 종목만 기술적 분석 수행 (API 제한 고려)
+                        if execution_strength >= 90:  # 높은 체결강도 종목만
+                            technical_analysis = self._get_technical_analysis(stock_code)
+                            if technical_analysis:
+                                # 기술적 분석 결과 병합
+                                basic_info.update(technical_analysis)
+
+                                # 종합 모멘텀 점수 계산
+                                momentum_score = self._calculate_momentum_score(
+                                    execution_strength, change_rate, technical_analysis
+                                )
+                                basic_info['momentum_score'] = momentum_score
+                                basic_info['has_technical_analysis'] = True
+                            else:
+                                # 기술적 분석 실패시 기본 점수 사용
+                                basic_info['momentum_score'] = execution_strength
+                                basic_info['has_technical_analysis'] = False
+                        else:
+                            # 기술적 분석 없이 기본 점수만 사용
+                            basic_info['momentum_score'] = execution_strength
+                            basic_info['has_technical_analysis'] = False
+
+                        # 최소 점수 이상만 추가
+                        if basic_info['momentum_score'] >= 70:
+                            candidates.append(basic_info)
+
                 except (ValueError, TypeError) as e:
                     logger.warning(f"모멘텀 후보 파싱 오류: {e}")
                     continue
 
-        logger.debug(f"모멘텀 후보: {len(candidates)}개")
+                # 모멘텀 점수 기준으로 정렬
+        candidates.sort(key=lambda x: x.get('momentum_score', x.get('execution_strength', 0)), reverse=True)
+
+        logger.debug(f"모멘텀 후보 (기술적 분석 포함): {len(candidates)}개")
         return candidates
+
+    def _get_technical_analysis(self, stock_code: str) -> Optional[Dict]:
+        """종목의 기술적 분석 수행"""
+        try:
+            # 지연 import로 순환 import 방지
+            from .data.kis_data_models import MomentumData
+
+            # API 제한 방지를 위한 대기
+            self.wait_for_rate_limit(0.2)  # 200ms 대기
+
+            # 현재가 정보 조회
+            current_data = self.get_current_price(stock_code)
+            if current_data.get('status') != 'success':
+                return None
+
+            # API 제한 방지를 위한 추가 대기
+            self.wait_for_rate_limit(0.2)  # 200ms 대기
+
+            # 일봉 데이터 조회 (최근 60일)
+            historical_data = self.get_daily_prices(stock_code, "D")
+            if len(historical_data) < 20:  # 최소 20일 데이터 필요
+                return None
+
+            # KIS 데이터 모델로 변환
+            kis_current = self._convert_to_kis_current(current_data)
+            kis_historical = self._convert_to_kis_historical(historical_data)
+
+            # MomentumData 생성
+            momentum_data = MomentumData.from_kis_data(
+                current=kis_current,
+                historical=kis_historical,
+                minute_data=[]  # 분봉 데이터는 생략 (API 부하 고려)
+            )
+
+            if momentum_data:
+                return {
+                    'ma_5': round(momentum_data.ma_5, 2),
+                    'ma_20': round(momentum_data.ma_20, 2),
+                    'ma_60': round(momentum_data.ma_60, 2),
+                    'rsi_9': round(momentum_data.rsi_9, 2),
+                    'macd_line': round(momentum_data.macd_line, 4),
+                    'macd_signal': round(momentum_data.macd_signal, 4),
+                    'macd_histogram': round(momentum_data.macd_histogram, 4),
+                    'return_1d': round(momentum_data.return_1d, 2),
+                    'return_5d': round(momentum_data.return_5d, 2),
+                    'trend_strength': round(momentum_data.trend_strength, 2),
+                    'ma_trend': 'bullish' if momentum_data.ma_5 > momentum_data.ma_20 > momentum_data.ma_60 else 'bearish',
+                    'macd_bullish': momentum_data.macd_line > momentum_data.macd_signal
+                }
+
+        except Exception as e:
+            logger.warning(f"기술적 분석 오류 {stock_code}: {e}")
+            return None
+
+    def _convert_to_kis_current(self, current_data: Dict):
+        """현재가 데이터를 KISCurrentPrice로 변환"""
+        # 지연 import로 순환 import 방지
+        from .data.kis_data_models import KISCurrentPrice
+
+        return KISCurrentPrice(
+            stck_shrn_iscd=current_data.get('stock_code', ''),
+            stck_prpr=current_data.get('current_price', 0),
+            prdy_vrss=0,  # 전일대비 (간소화)
+            prdy_vrss_sign='',
+            prdy_ctrt=current_data.get('change_rate', 0),
+            stck_oprc=current_data.get('open_price', 0),
+            stck_hgpr=current_data.get('high_price', 0),
+            stck_lwpr=current_data.get('low_price', 0),
+            stck_clpr=current_data.get('current_price', 0),  # 임시로 현재가 사용
+            acml_vol=current_data.get('volume', 0),
+            acml_tr_pbmn=0,
+            seln_cntg_qty=0,
+            shnu_cntg_qty=0,
+            ntby_cntg_qty=0,
+            stck_cntg_hour=''
+        )
+
+    def _convert_to_kis_historical(self, historical_data: List[Dict]):
+        """일봉 데이터를 KISHistoricalData 리스트로 변환"""
+        # 지연 import로 순환 import 방지
+        from .data.kis_data_models import KISHistoricalData
+
+        result = []
+        for data in historical_data:
+            result.append(KISHistoricalData(
+                stck_bsop_date=data.get('date', ''),
+                stck_oprc=data.get('open', 0),
+                stck_hgpr=data.get('high', 0),
+                stck_lwpr=data.get('low', 0),
+                stck_clpr=data.get('close', 0),
+                acml_vol=data.get('volume', 0),
+                prdy_vrss_vol_rate=0  # 간소화
+            ))
+        return result
+
+    def _calculate_momentum_score(self, execution_strength: float, change_rate: float,
+                                technical_data: Dict) -> float:
+        """종합 모멘텀 점수 계산 (0-100)"""
+        try:
+            # 기본 점수 (체결강도 + 변화율)
+            base_score = (execution_strength * 0.6) + (abs(change_rate) * 10)
+
+            # 기술적 지표 점수
+            technical_score = 0
+
+            # 이동평균 점수 (추세 방향)
+            if technical_data.get('ma_trend') == 'bullish':
+                technical_score += 15
+
+            # RSI 점수 (과매수/과매도 확인)
+            rsi = technical_data.get('rsi_9', 50)
+            if 30 <= rsi <= 70:  # 적정 범위
+                technical_score += 10
+            elif rsi < 30:  # 과매도 (반등 기대)
+                technical_score += 5
+
+            # MACD 점수
+            if technical_data.get('macd_bullish', False):
+                technical_score += 10
+
+            # 수익률 점수
+            return_5d = technical_data.get('return_5d', 0)
+            if return_5d > 0:
+                technical_score += min(return_5d, 15)  # 최대 15점
+
+            # 종합 점수
+            total_score = base_score + technical_score
+            return min(max(total_score, 0), 100)  # 0-100 범위 제한
+
+        except Exception as e:
+            logger.warning(f"모멘텀 점수 계산 오류: {e}")
+            return execution_strength  # 기본값으로 체결강도 반환
 
     def _parse_enhanced_gap_candidates(self, gap_data: Optional[pd.DataFrame], disparity_data: Optional[pd.DataFrame]) -> List[Dict]:
         """향상된 갭 트레이딩 후보 파싱 (등락률 + 이격도 조합)"""
