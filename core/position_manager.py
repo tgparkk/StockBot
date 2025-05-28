@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 from utils.logger import setup_logger
 from .kis_data_collector import KISDataCollector
 from .trading_manager import TradingManager
+from core.kis_market_api import get_disparity_rank, get_multi_period_disparity
 
 logger = setup_logger(__name__)
 
@@ -36,6 +37,12 @@ class PositionManager:
             'existing_holding': {
                 'stop_loss': -5.5, 'take_profit': 8.0, 'min_holding_minutes': 90,
                 'trailing_stop_trigger': 4.0, 'trailing_stop_gap': 2.5  # 4% 수익 후 2.5% 하락시 매도
+            },
+            
+            # 🆕 이격도 반등: 과매도 반등 기대하며 여유 있게
+            'disparity_reversal': {
+                'stop_loss': -3.5, 'take_profit': 7.0, 'min_holding_minutes': 60,
+                'trailing_stop_trigger': 4.0, 'trailing_stop_gap': 2.0  # 4% 수익 후 2% 하락시 매도
             },
             
             # 갭 거래: 빠른 수익 실현, 하지만 여유 있게
@@ -436,3 +443,180 @@ class PositionManager:
                 logger.info(f"- {stock_code}: {position['quantity']}주, 수익률 {profit_rate:.2f}%")
 
         logger.info("포지션 관리자 정리 완료")
+
+    def _check_disparity_sell_signal(self, position: Dict) -> Optional[Dict]:
+        """🆕 고도화된 다중 이격도 기반 매도 신호 확인"""
+        try:
+            stock_code = position['stock_code']
+            current_price = position.get('current_price', position['buy_price'])
+            profit_rate = position.get('profit_rate', 0)
+            
+            # 🎯 다중 기간 이격도 데이터 조회 (5일, 20일, 60일)
+            d5_data = get_disparity_rank(
+                fid_input_iscd="0000",
+                fid_hour_cls_code="5",
+                fid_vol_cnt="10000"
+            )
+            d20_data = get_disparity_rank(
+                fid_input_iscd="0000",
+                fid_hour_cls_code="20",
+                fid_vol_cnt="10000"
+            )
+            d60_data = get_disparity_rank(
+                fid_input_iscd="0000",
+                fid_hour_cls_code="60",
+                fid_vol_cnt="10000"
+            )
+            
+            # 해당 종목의 이격도 추출
+            d5_val = d20_val = d60_val = None
+            
+            if d5_data is not None and not d5_data.empty:
+                d5_row = d5_data[d5_data['mksc_shrn_iscd'] == stock_code]
+                if not d5_row.empty:
+                    d5_val = float(d5_row.iloc[0].get('d5_dsrt', 100))
+            
+            if d20_data is not None and not d20_data.empty:
+                d20_row = d20_data[d20_data['mksc_shrn_iscd'] == stock_code]
+                if not d20_row.empty:
+                    d20_val = float(d20_row.iloc[0].get('d20_dsrt', 100))
+            
+            if d60_data is not None and not d60_data.empty:
+                d60_row = d60_data[d60_data['mksc_shrn_iscd'] == stock_code]
+                if not d60_row.empty:
+                    d60_val = float(d60_row.iloc[0].get('d60_dsrt', 100))
+            
+            # 🎯 다중 이격도 기반 매도 전략
+            if all(val is not None for val in [d5_val, d20_val, d60_val]):
+                
+                # 1. 🔥 극도 과매수 구간: 즉시 매도
+                if d5_val >= 125 and d20_val >= 120:
+                    if profit_rate >= 0.5:  # 0.5% 이상 수익시 즉시 매도
+                        return {
+                            'signal_type': 'SELL',
+                            'reason': f'극도과매수 즉시매도 (D5:{d5_val:.1f}, D20:{d20_val:.1f}, 수익:{profit_rate:.1f}%)',
+                            'urgency': 'URGENT',
+                            'suggested_price': int(current_price * 0.992)  # 0.8% 할인 매도
+                        }
+                
+                # 2. 🎯 과매수 구간: 수익 조건부 매도
+                elif d5_val >= 115 and d20_val >= 110:
+                    if profit_rate >= 1.5:  # 1.5% 이상 수익시 매도
+                        return {
+                            'signal_type': 'SELL',
+                            'reason': f'다중과매수 수익매도 (D5:{d5_val:.1f}, D20:{d20_val:.1f}, 수익:{profit_rate:.1f}%)',
+                            'urgency': 'HIGH',
+                            'suggested_price': int(current_price * 0.995)  # 0.5% 할인 매도
+                        }
+                
+                # 3. 🎯 Divergence 매도 신호: 장기 과열 + 단기 조정
+                elif d60_val >= 110 and d20_val >= 105 and d5_val <= 100:
+                    if profit_rate >= 2.0:  # 2% 이상 수익시 매도
+                        return {
+                            'signal_type': 'SELL',
+                            'reason': f'하향Divergence 매도 (D60:{d60_val:.1f}↑ D5:{d5_val:.1f}↓, 수익:{profit_rate:.1f}%)',
+                            'urgency': 'MEDIUM',
+                            'suggested_price': int(current_price * 0.997)  # 0.3% 할인 매도
+                        }
+                
+                # 4. 🛡️ 과매도 구간: 손절 완화 & 보유 연장
+                elif d20_val <= 85 and d60_val <= 90:
+                    # 과매도 구간에서는 보유 연장
+                    targets = self.profit_targets.get(position.get('strategy_type', 'default'), {})
+                    stop_loss = targets.get('stop_loss', -3.0)
+                    
+                    if profit_rate <= stop_loss and profit_rate >= stop_loss - 2.0:  # 손절 2% 완화
+                        logger.info(f"🛡️ 다중과매도로 손절 완화: {stock_code} "
+                                  f"D20:{d20_val:.1f} D60:{d60_val:.1f} 손실:{profit_rate:.1f}%")
+                        return None  # 매도 신호 무시
+                    
+                    # 익절 기준도 상향 조정 (40% 완화)
+                    take_profit = targets.get('take_profit', 5.0)
+                    if profit_rate >= take_profit * 0.6:  # 익절 기준 40% 완화
+                        logger.info(f"🛡️ 다중과매도로 익절 연장: {stock_code} "
+                                  f"D20:{d20_val:.1f} D60:{d60_val:.1f} 수익:{profit_rate:.1f}%")
+                        return None  # 익절 신호 무시하고 더 보유
+                
+                # 5. 🎯 특수 패턴: 단기 급등 후 조정 징후
+                elif d5_val >= 110 and d20_val <= 105 and profit_rate >= 3.0:
+                    return {
+                        'signal_type': 'SELL',
+                        'reason': f'단기급등 조정매도 (D5:{d5_val:.1f}↑ D20:{d20_val:.1f}, 수익:{profit_rate:.1f}%)',
+                        'urgency': 'MEDIUM',
+                        'suggested_price': int(current_price * 0.996)  # 0.4% 할인 매도
+                    }
+            
+            # 단일 이격도 백업 로직 (20일 이격도만 확인 가능한 경우)
+            elif d20_val is not None:
+                if d20_val >= 120 and profit_rate >= 1.0:
+                    return {
+                        'signal_type': 'SELL',
+                        'reason': f'20일과매수 매도 (D20:{d20_val:.1f}, 수익:{profit_rate:.1f}%)',
+                        'urgency': 'HIGH',
+                        'suggested_price': int(current_price * 0.995)
+                    }
+                elif d20_val <= 80:
+                    # 과매도 구간에서는 보유 연장
+                    logger.info(f"🛡️ 20일과매도로 보유연장: {stock_code} D20:{d20_val:.1f}%")
+                    return None
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"다중 이격도 매도 신호 확인 오류 ({position.get('stock_code', 'Unknown')}): {e}")
+            return None
+
+    def check_sell_signals(self) -> List[Dict]:
+        """매도 신호 확인"""
+        sell_signals = []
+        
+        with self.position_lock:
+            for position in list(self.positions.values()):
+                if position['status'] != 'active':
+                    continue
+                
+                # 🆕 이격도 기반 매도 신호 우선 확인
+                disparity_signal = self._check_disparity_sell_signal(position)
+                if disparity_signal:
+                    sell_signals.append({
+                        'stock_code': position['stock_code'],
+                        'signal': disparity_signal,
+                        'position': position
+                    })
+                    continue  # 이격도 신호가 있으면 다른 신호 체크 생략
+                
+                # 기존 매도 신호 체크
+                try:
+                    # 손익 기반 매도 신호
+                    profit_signal = self._check_profit_loss_signal(position)
+                    if profit_signal:
+                        sell_signals.append({
+                            'stock_code': position['stock_code'],
+                            'signal': profit_signal,
+                            'position': position
+                        })
+                        continue
+                    
+                    # 시간 기반 매도 신호
+                    time_signal = self._check_time_based_signal(position)
+                    if time_signal:
+                        sell_signals.append({
+                            'stock_code': position['stock_code'],
+                            'signal': time_signal,
+                            'position': position
+                        })
+                        continue
+                    
+                    # 트레일링 스톱 신호
+                    trailing_signal = self._check_trailing_stop_signal(position)
+                    if trailing_signal:
+                        sell_signals.append({
+                            'stock_code': position['stock_code'],
+                            'signal': trailing_signal,
+                            'position': position
+                        })
+                
+                except Exception as e:
+                    logger.error(f"매도 신호 확인 오류 ({position['stock_code']}): {e}")
+        
+        return sell_signals

@@ -137,7 +137,7 @@ class StockBot:
             return None
             
         try:
-            telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+            telegram_bot = TelegramBot()  # 🆕 파라미터 제거 (설정에서 직접 가져옴)
             telegram_bot.set_main_bot_reference(self)
             logger.info("✅ 텔레그램 봇 초기화 완료")
             return telegram_bot

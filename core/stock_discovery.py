@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from utils.logger import setup_logger
 from core.rest_api_manager import KISRestAPIManager
+from core.kis_market_api import get_disparity_rank, get_multi_period_disparity, get_disparity_trading_signals
 
 logger = setup_logger(__name__)
 
@@ -254,6 +255,8 @@ class StockDiscovery:
             return self._discover_volume_candidates()
         elif strategy_name == "momentum":
             return self._discover_momentum_candidates()
+        elif strategy_name == "disparity_reversal":
+            return self._discover_disparity_reversal_candidates()
         else:
             logger.warning(f"알 수 없는 전략: {strategy_name}")
             return []
@@ -388,6 +391,149 @@ class StockDiscovery:
 
         except Exception as e:
             logger.error(f"🎯 모멘텀 후보 탐색 오류: {e}")
+            return []
+
+    def _discover_disparity_reversal_candidates(self) -> List[StockCandidate]:
+        """🆕 고도화된 다중 이격도 기반 반등 후보 탐색"""
+        try:
+            # 🎯 다중 기간 이격도 종합 분석 사용
+            disparity_signals = get_disparity_trading_signals()
+            
+            if not disparity_signals or not disparity_signals.get('buy_signals'):
+                logger.warning("다중 이격도 분석: 매수 신호 없음")
+                return []
+            
+            candidates = []
+            buy_signals = disparity_signals['buy_signals']
+            
+            for signal in buy_signals[:15]:  # 상위 15개 신호
+                try:
+                    stock_code = signal['stock_code']
+                    signal_type = signal['signal_type']
+                    score = signal['score']
+                    reason = signal['reason']
+                    
+                    # 🎯 신호 타입별 점수 가중치
+                    if signal_type == 'STRONG_BUY':
+                        final_score = score * 1.5  # 강매수는 1.5배
+                        priority = 1
+                    elif signal_type == 'DIVERGENCE_BUY':
+                        final_score = score * 1.3  # Divergence는 1.3배  
+                        priority = 2
+                    else:  # BUY
+                        final_score = score * 1.0  # 일반 매수
+                        priority = 3
+                    
+                    # 🎯 현재가 추가 검증
+                    current_price = signal.get('current_price', 0)
+                    change_rate = signal.get('change_rate', 0)
+                    
+                    if (1000 <= current_price <= 300000 and  # 적정 가격대
+                        change_rate >= -2.0):  # 급락 제외
+                        
+                        candidate = StockCandidate(
+                            stock_code=stock_code,
+                            strategy_type='disparity_reversal',
+                            score=final_score,
+                            reason=f"[{signal_type}] {reason}",
+                            discovered_at=datetime.now(),
+                            data={
+                                'stock_code': stock_code,
+                                'stock_name': signal.get('stock_name', ''),
+                                'current_price': current_price,
+                                'change_rate': change_rate,
+                                'signal_type': signal_type,
+                                'disparity_score': score,
+                                'priority': priority,
+                                'reason': reason
+                            }
+                        )
+                        candidates.append(candidate)
+                        
+                        logger.info(f"🎯 다중이격도 후보: {stock_code}({signal.get('stock_name', '')}) "
+                                  f"{signal_type} 점수{final_score:.1f} {reason}")
+                
+                except Exception as e:
+                    logger.warning(f"다중이격도 후보 파싱 오류: {e}")
+                    continue
+            
+            # 최종 점수 기준 정렬
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            
+            # 시장 상태 로깅
+            market_status = disparity_signals.get('market_status', {})
+            logger.info(f"🎯 다중이격도 시장분석: "
+                       f"전체{market_status.get('total_analyzed_stocks', 0)}종목 "
+                       f"과매도{market_status.get('oversold_count', 0)} "
+                       f"과매수{market_status.get('overbought_count', 0)} "
+                       f"Divergence{market_status.get('divergence_count', 0)} "
+                       f"시장상태{market_status.get('market_sentiment', 'UNKNOWN')}")
+            
+            logger.info(f"🎯 고도화 이격도 반등 후보: {len(candidates)}개 발굴 완료")
+            return candidates[:10]  # 상위 10개
+            
+        except Exception as e:
+            logger.error(f"🎯 고도화 이격도 반등 후보 탐색 오류: {e}")
+            # 백업: 기존 단순 이격도 분석
+            return self._discover_simple_disparity_candidates()
+
+    def _discover_simple_disparity_candidates(self) -> List[StockCandidate]:
+        """🔄 백업용 단순 이격도 반등 후보 탐색"""
+        try:
+            # 기존 20일 이격도 방식 유지 (백업용)
+            disparity_data = get_disparity_rank(
+                fid_input_iscd="0000",
+                fid_rank_sort_cls_code="1",  # 하위순
+                fid_hour_cls_code="20",
+                fid_vol_cnt="50000"
+            )
+            
+            if disparity_data is None or disparity_data.empty:
+                logger.warning("백업 이격도 반등 후보: 데이터 없음")
+                return []
+            
+            candidates = []
+            
+            for _, row in disparity_data.head(20).iterrows():
+                try:
+                    stock_code = row.get('mksc_shrn_iscd', '')
+                    disparity_20 = float(row.get('d20_dsrt', 100))
+                    change_rate = float(row.get('prdy_ctrt', 0))
+                    current_price = int(row.get('stck_prpr', 0))
+                    volume = int(row.get('acml_vol', 0))
+                    
+                    if (disparity_20 <= 85 and change_rate >= 0.3 and
+                        1000 <= current_price <= 200000 and volume >= 50000):
+                        
+                        reversal_score = max(0, (85 - disparity_20) / 20) * min(change_rate / 2.0, 1.0) * 100
+                        
+                        candidate = StockCandidate(
+                            stock_code=stock_code,
+                            strategy_type='disparity_reversal',
+                            score=reversal_score,
+                            reason=f"백업이격도반등 {disparity_20:.1f}% 상승{change_rate:.1f}%",
+                            discovered_at=datetime.now(),
+                            data={
+                                'stock_code': stock_code,
+                                'stock_name': row.get('hts_kor_isnm', ''),
+                                'current_price': current_price,
+                                'change_rate': change_rate,
+                                'disparity_20': disparity_20,
+                                'volume': volume
+                            }
+                        )
+                        candidates.append(candidate)
+                
+                except Exception as e:
+                    logger.warning(f"백업 이격도 후보 파싱 오류: {e}")
+                    continue
+            
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            logger.info(f"🔄 백업 이격도 반등 후보: {len(candidates)}개")
+            return candidates[:5]  # 백업이므로 5개만
+            
+        except Exception as e:
+            logger.error(f"🔄 백업 이격도 반등 후보 탐색 오류: {e}")
             return []
 
     def _validate_profit_potential(self, stock_data: Dict) -> bool:
@@ -577,9 +723,9 @@ class StockDiscovery:
     def get_discovery_progress(self) -> float:
         """탐색 진행률 계산"""
         with self.discovery_lock:
-            total_strategies = 3  # gap, volume, momentum
+            total_strategies = 4  # gap, volume, momentum, disparity_reversal
             strategies_with_candidates = len([
-                s for s in ['gap_trading', 'volume_breakout', 'momentum']
+                s for s in ['gap_trading', 'volume_breakout', 'momentum', 'disparity_reversal']
                 if s in self.candidates and self.candidates[s]
             ])
 
