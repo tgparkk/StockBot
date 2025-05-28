@@ -1027,7 +1027,7 @@ class TradeDatabase:
                 logger.debug(f"기존 보유 종목 이미 기록됨: {stock_code}")
                 return -1
             
-            # 새로 기록
+            # 🆕 순수 기존 보유 종목으로 기록
             total_amount = quantity * avg_price
             trade_id = self.record_buy_trade(
                 stock_code=stock_code,
@@ -1035,15 +1035,16 @@ class TradeDatabase:
                 quantity=quantity,
                 price=avg_price,
                 total_amount=total_amount,
-                strategy_type="existing_holding",
+                strategy_type="existing_holding",  # 🆕 단순히 기존 보유로 기록
                 order_id="EXISTING_POSITION",
                 status='SUCCESS',
                 market_conditions={
                     'current_price': current_price,
                     'source': 'existing_position_setup',
-                    'setup_time': datetime.now().isoformat()
+                    'setup_time': datetime.now().isoformat(),
+                    'avg_price': avg_price
                 },
-                notes=f"프로그램 시작 시 기존 보유 종목 등록 (평균가: {avg_price:,}원, 현재가: {current_price:,}원)"
+                notes=f"프로그램 시작시 기존 보유 종목 등록 (평균가: {avg_price:,}원, 현재가: {current_price:,}원)"
             )
             
             return trade_id

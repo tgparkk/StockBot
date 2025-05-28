@@ -38,11 +38,11 @@ class TradeConfig:
         
         if self.buy_premiums is None:
             self.buy_premiums = {
-                'gap_trading': 0.003,      # 갭 거래: 0.3% 위
-                'volume_breakout': 0.005,  # 거래량 돌파: 0.5% 위
-                'momentum': 0.007,         # 모멘텀: 0.7% 위
-                'existing_holding': 0.002, # 기존 보유: 0.2% 위
-                'default': 0.003           # 기본: 0.3% 위
+                'gap_trading': 0.001,      # 갭 거래: 0.1% 위 (기존 0.3%)
+                'volume_breakout': 0.001,  # 거래량 돌파: 0.1% 위 (기존 0.5%)
+                'momentum': 0.001,         # 모멘텀: 0.1% 위 (기존 0.7%)
+                'existing_holding': 0.001, # 기존 보유: 0.1% 위 (기존 0.2%)
+                'default': 0.001           # 기본: 0.1% 위 (기존 0.3%)
             }
         
         if self.sell_discounts is None:
@@ -639,6 +639,9 @@ class TradeExecutor:
             # 매수 거래 ID 찾기
             buy_trade_id = self.trade_db.find_buy_trade_for_sell(stock_code, quantity)
             
+            # 🆕 포지션에서 전략 타입 직접 사용 (더 이상 복원 로직 불필요)
+            strategy_type = position.get('strategy_type', 'unknown')
+            
             # 수익률 계산
             buy_price = position.get('buy_price', sell_price)
             profit_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
@@ -651,7 +654,7 @@ class TradeExecutor:
                 quantity=quantity,
                 price=sell_price,
                 total_amount=quantity * sell_price,
-                strategy_type=position.get('strategy_type', 'unknown'),
+                strategy_type=strategy_type,  # 🆕 포지션의 전략 타입 직접 사용
                 buy_trade_id=buy_trade_id,
                 order_id=sell_result.get('order_no', ''),
                 status='SUCCESS',
@@ -660,9 +663,9 @@ class TradeExecutor:
                     'profit_rate': profit_rate,
                     'sell_reason': f"{sell_type}: {condition_reason}"
                 },
-                notes=f"매도사유: {sell_type}, 조건: {condition_reason}"
+                notes=f"매도사유: {sell_type}, 조건: {condition_reason}, 전략: {strategy_type}"
             )
-            logger.info(f"💾 매도 기록 저장 완료 (ID: {trade_id})")
+            logger.info(f"💾 매도 기록 저장 완료 - 전략: {strategy_type} (ID: {trade_id})")
             
         except Exception as e:
             logger.error(f"💾 매도 기록 저장 실패: {e}")
@@ -673,6 +676,9 @@ class TradeExecutor:
         try:
             # 매수 거래 ID 찾기
             buy_trade_id = self.trade_db.find_buy_trade_for_sell(stock_code, quantity)
+            
+            # 🆕 매도 신호에서 전략 타입 직접 사용 (포지션 매니저에서 전달됨)
+            strategy_type = sell_signal.get('strategy_type', 'unknown')
             
             # 수익률 계산
             current_price = sell_signal.get('current_price', sell_price)
@@ -685,7 +691,7 @@ class TradeExecutor:
                 quantity=quantity,
                 price=sell_price,
                 total_amount=quantity * sell_price,
-                strategy_type=sell_signal.get('strategy_type', 'auto_sell'),
+                strategy_type=strategy_type,  # 🆕 신호의 전략 타입 직접 사용
                 buy_trade_id=buy_trade_id,
                 order_id=order_result,
                 status='SUCCESS',
@@ -694,9 +700,9 @@ class TradeExecutor:
                     'profit_rate': profit_rate,
                     'sell_reason': f"자동매도: {reason}"
                 },
-                notes=f"자동매도 - {reason}, 현재가: {current_price:,}원"
+                notes=f"자동매도 - {reason}, 현재가: {current_price:,}원, 전략: {strategy_type}"
             )
-            logger.info(f"💾 자동매도 기록 저장 완료 (ID: {trade_id})")
+            logger.info(f"💾 자동매도 기록 저장 완료 - 전략: {strategy_type} (ID: {trade_id})")
             
         except Exception as e:
             logger.error(f"💾 자동매도 기록 저장 실패: {e}") 
