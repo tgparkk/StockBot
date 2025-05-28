@@ -60,6 +60,19 @@ echo.
 echo 🚀 StockBot 테스트 모드 시작 중...
 echo.
 
+:: 데이터베이스 초기화 확인
+if not exist "data\trades.db" (
+    echo.
+    echo 📊 데이터베이스 초기화 중...
+    python database\init_db.py
+    if errorlevel 1 (
+        echo ❌ 데이터베이스 초기화 실패
+        pause
+        exit /b 1
+    )
+    echo ✅ 데이터베이스 초기화 완료
+)
+
 :: main.py 실행
 python main.py
 

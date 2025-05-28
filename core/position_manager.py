@@ -166,26 +166,52 @@ class PositionManager:
                 return False
 
     def update_position_prices(self, force_rest_api: bool = False) -> None:
-        """포지션별 현재가 및 수익률 업데이트"""
+        """포지션별 현재가 및 수익률 업데이트 - 🎯 웹소켓 우선 사용 정책"""
         with self.position_lock:
             active_positions = [code for code, pos in self.positions.items() if pos['status'] == 'active']
 
             if not active_positions:
                 return
 
-            # 웹소켓 상태 확인 및 백업 전략 결정
+            # 🎯 웹소켓 우선 사용 정책
             websocket_available = False
+            websocket_retry_needed = False
+            
             if hasattr(self.data_collector, 'websocket') and self.data_collector.websocket:
                 websocket_available = getattr(self.data_collector.websocket, 'is_connected', False)
+                
+                # 🎯 웹소켓이 연결되지 않은 경우 재연결 시도
+                if not websocket_available and not force_rest_api:
+                    logger.info("🔄 웹소켓 연결 끊김 감지 - 재연결 시도 중...")
+                    websocket_retry_needed = True
+                    
+                    # 웹소켓 재연결 시도
+                    if hasattr(self.data_collector, 'data_manager') and self.data_collector.data_manager:
+                        try:
+                            reconnect_success = self._attempt_websocket_reconnection()
+                            if reconnect_success:
+                                websocket_available = True
+                                logger.info("✅ 웹소켓 재연결 성공 - 웹소켓으로 가격 조회")
+                            else:
+                                logger.warning("⚠️ 웹소켓 재연결 실패 - REST API로 백업")
+                        except Exception as e:
+                            logger.error(f"웹소켓 재연결 시도 오류: {e}")
 
+            # 데이터 수집 방식 결정
             if force_rest_api or not websocket_available:
-                logger.info(f"REST API 강제 사용: force={force_rest_api}, websocket_connected={websocket_available}")
+                if websocket_retry_needed:
+                    logger.info(f"💾 REST API 백업 사용: 웹소켓 재연결{'시도했으나 실패' if websocket_retry_needed else '불가'}")
+                else:
+                    logger.info(f"💾 REST API 강제 사용: force={force_rest_api}, websocket_connected={websocket_available}")
+                
                 # REST API 강제 사용 - 캐시 비활성화
                 price_data = {}
                 for stock_code in active_positions:
                     price_data[stock_code] = self.data_collector.get_fresh_price(stock_code)
                     time.sleep(0.05)  # API 호출 간격
             else:
+                # 🎯 웹소켓 우선 사용
+                logger.info(f"📡 웹소켓 우선 사용: {len(active_positions)}개 종목 실시간 조회")
                 # 배치로 현재가 조회 (캐시 우선, 웹소켓→REST API 자동 백업)
                 price_data = self.data_collector.get_multiple_prices(active_positions, use_cache=True)
 
@@ -234,6 +260,49 @@ class PositionManager:
                         time.sleep(0.05)
                     except Exception as e:
                         logger.error(f"REST API 백업 실패: {stock_code} - {e}")
+
+    def _attempt_websocket_reconnection(self) -> bool:
+        """🎯 웹소켓 재연결 시도"""
+        try:
+            # 데이터 매니저를 통한 웹소켓 재연결
+            if hasattr(self.data_collector, 'data_manager'):
+                data_manager = self.data_collector.data_manager
+                
+                # 웹소켓 매니저 확인
+                if hasattr(data_manager, 'websocket_manager') and data_manager.websocket_manager:
+                    websocket_manager = data_manager.websocket_manager
+                    
+                    # 현재 연결 상태 확인
+                    is_connected = getattr(websocket_manager, 'is_connected', False)
+                    
+                    if not is_connected:
+                        logger.info("🔄 웹소켓 재연결 시도...")
+                        
+                        # 웹소켓 재시작 시도
+                        if hasattr(data_manager, '_start_websocket_if_needed'):
+                            success = data_manager._start_websocket_if_needed()
+                            if success:
+                                logger.info("✅ 웹소켓 재연결 성공")
+                                return True
+                            else:
+                                logger.warning("⚠️ 웹소켓 재연결 실패")
+                                return False
+                        else:
+                            logger.warning("웹소켓 재시작 메서드 없음")
+                            return False
+                    else:
+                        logger.debug("웹소켓이 이미 연결되어 있음")
+                        return True
+                else:
+                    logger.warning("웹소켓 매니저 없음")
+                    return False
+            else:
+                logger.warning("데이터 매니저 없음")
+                return False
+                
+        except Exception as e:
+            logger.error(f"웹소켓 재연결 시도 중 오류: {e}")
+            return False
 
     def force_price_update_via_rest_api(self) -> int:
         """모든 포지션 현재가를 REST API로 강제 업데이트"""
@@ -620,3 +689,41 @@ class PositionManager:
                     logger.error(f"매도 신호 확인 오류 ({position['stock_code']}): {e}")
         
         return sell_signals
+
+    def check_auto_sell(self) -> List[str]:
+        """자동 매도 체크 및 실행 - worker_manager 호환용"""
+        try:
+            executed_orders = []
+            
+            # 1. 포지션 현재가 업데이트
+            self.update_position_prices()
+            
+            # 2. 매도 조건 확인
+            sell_signals = self.check_exit_conditions()
+            
+            # 3. 매도 신호 실행
+            for sell_signal in sell_signals:
+                try:
+                    order_no = self.execute_auto_sell(sell_signal)
+                    if order_no:
+                        executed_orders.append(order_no)
+                        
+                        # 포지션에서 제거
+                        stock_code = sell_signal['stock_code']
+                        quantity = sell_signal['quantity']
+                        current_price = sell_signal['current_price']
+                        
+                        self.remove_position(stock_code, quantity, current_price)
+                        
+                        logger.info(f"✅ 자동 매도 완료: {stock_code} - {sell_signal['reason']}")
+                    else:
+                        logger.warning(f"⚠️ 자동 매도 주문 실패: {sell_signal['stock_code']}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ 자동 매도 실행 오류: {sell_signal['stock_code']} - {e}")
+            
+            return executed_orders
+            
+        except Exception as e:
+            logger.error(f"❌ 자동 매도 체크 오류: {e}")
+            return []

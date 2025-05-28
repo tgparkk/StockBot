@@ -11,7 +11,7 @@ import asyncio
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, List
 
 # 프로젝트 루트 경로 설정
 project_root = Path(__file__).parent
@@ -31,7 +31,7 @@ from core.data_priority import DataPriority
 from core.stock_discovery import StockDiscovery
 from core.trade_database import TradeDatabase
 from core.trade_executor import TradeExecutor, TradeConfig
-from core.worker_manager import WorkerManager, WorkerConfig
+from core.worker_manager import WorkerManager
 
 # 설정
 from config.settings import (
@@ -95,7 +95,17 @@ class StockBot:
         try:
             self.websocket_manager = KISWebSocketManager()
             self.data_manager.websocket_manager = self.websocket_manager
-            logger.info("✅ WebSocket 관리자 초기화 및 연결 완료")
+            logger.info("✅ WebSocket 관리자 초기화 완료")
+            
+            # 🎯 웹소켓 우선 사용 정책 - 즉시 연결 시도
+            if self._should_prefer_websocket():
+                logger.info("🚀 웹소켓 우선 사용 설정 - 즉시 연결 시도")
+                websocket_connected = self.data_manager.ensure_websocket_connection()
+                if websocket_connected:
+                    logger.info("🎉 웹소켓 즉시 연결 성공")
+                else:
+                    logger.warning("⚠️ 웹소켓 즉시 연결 실패 - 백그라운드에서 재시도 예정")
+            
         except Exception as e:
             logger.warning(f"⚠️ WebSocket 관리자 초기화 실패: {e}")
 
@@ -147,61 +157,13 @@ class StockBot:
             return None
 
     def _register_workers(self):
-        """워커들을 WorkerManager에 등록"""
+        """워커 시스템은 새로운 WorkerManager가 자동으로 처리"""
         try:
-            # 1. 포지션 관리 워커
-            position_config = WorkerConfig(
-                name="PositionWorker",
-                target_function=self._position_worker,
-                daemon=True,
-                auto_restart=True,
-                restart_delay=10.0,
-                max_restart_attempts=5,
-                heartbeat_interval=60.0
-            )
-            self.worker_manager.register_worker(position_config)
-
-            # 2. 통계 수집 워커
-            stats_config = WorkerConfig(
-                name="StatsWorker", 
-                target_function=self._stats_worker,
-                daemon=True,
-                auto_restart=True,
-                restart_delay=5.0,
-                max_restart_attempts=3,
-                heartbeat_interval=300.0
-            )
-            self.worker_manager.register_worker(stats_config)
-
-            # 3. 텔레그램 봇 워커 (조건부)
-            if self.telegram_bot:
-                telegram_config = WorkerConfig(
-                    name="TelegramBot",
-                    target_function=self._telegram_worker,
-                    daemon=True,
-                    auto_restart=True,
-                    restart_delay=15.0,
-                    max_restart_attempts=3,
-                    heartbeat_interval=120.0
-                )
-                self.worker_manager.register_worker(telegram_config)
-
-            # 4. 전략 스케줄러 워커
-            scheduler_config = WorkerConfig(
-                name="StrategyScheduler",
-                target_function=self._strategy_scheduler_worker,
-                daemon=True,
-                auto_restart=False,  # 전략 스케줄러는 자동 재시작하지 않음
-                restart_delay=30.0,
-                max_restart_attempts=1,
-                heartbeat_interval=180.0
-            )
-            self.worker_manager.register_worker(scheduler_config)
-
-            logger.info("✅ 모든 워커 등록 완료")
+            # 새로운 워커 시스템은 start() 메서드에서 자동으로 시작됨
+            logger.info("✅ 새로운 워커 시스템 준비 완료")
             
         except Exception as e:
-            logger.error(f"❌ 워커 등록 실패: {e}")
+            logger.error(f"❌ 워커 준비 실패: {e}")
 
     async def _setup_existing_positions(self):
         """보유 종목 자동 모니터링 설정"""
@@ -329,7 +291,7 @@ class StockBot:
             signal.signal(signal.SIGINT, self._signal_handler)
             
             # 🆕 워커 매니저를 통한 백그라운드 작업 시작
-            self.worker_manager.start_all_workers()
+            self.worker_manager.start_all_workers(self)
             
             logger.info("✅ StockBot 완전 가동!")
             self._main_loop()
@@ -420,454 +382,142 @@ class StockBot:
 
         logger.info("🛑 메인 루프 종료")
 
-    # === 🆕 워커 함수들 (WorkerManager 호환) ===
-
-    def _position_worker(self, shutdown_event: threading.Event, worker_manager: WorkerManager):
-        """포지션 관리 백그라운드 작업 - WorkerManager 호환"""
-        logger.info("🏃 포지션 관리 워커 시작")
-        worker_manager.update_heartbeat("PositionWorker")
-
-        while self.is_running and not shutdown_event.is_set():
-            try:
-                # 포지션별 현재가 업데이트
-                self.position_manager.update_position_prices()
-
-                # 매도 조건 확인 및 자동 매도 실행
-                sell_signals = self.position_manager.check_exit_conditions()
-                for sell_signal in sell_signals:
-                    self._handle_auto_sell_signal(sell_signal)
-
-                # 하트비트 업데이트
-                worker_manager.update_heartbeat("PositionWorker")
-
-                shutdown_event.wait(timeout=60)  # 1분마다
-
-            except Exception as e:
-                logger.error(f"포지션 관리 작업 오류: {e}")
-                shutdown_event.wait(timeout=120)
-
-        logger.info("🏁 포지션 관리 워커 종료")
-
-    def _stats_worker(self, shutdown_event: threading.Event, worker_manager: WorkerManager):
-        """통계 수집 백그라운드 작업 - WorkerManager 호환"""
-        logger.info("🏃 통계 수집 워커 시작")
-        worker_manager.update_heartbeat("StatsWorker")
-
-        while self.is_running and not shutdown_event.is_set():
-            try:
-                self._update_stats()
-
-                if int(time.time()) % 3600 < 300:  # 1시간마다
-                    self._generate_hourly_report()
-
-                # 하트비트 업데이트
-                worker_manager.update_heartbeat("StatsWorker")
-
-                shutdown_event.wait(timeout=300)  # 5분 간격
-
-            except Exception as e:
-                logger.error(f"통계 수집 작업 오류: {e}")
-                shutdown_event.wait(timeout=300)
-
-        logger.info("🏁 통계 수집 워커 종료")
-
-    def _telegram_worker(self, shutdown_event: threading.Event, worker_manager: WorkerManager):
-        """텔레그램 봇 워커 - WorkerManager 호환"""
-        if not self.telegram_bot:
-            logger.warning("텔레그램 봇이 없어 워커를 종료합니다.")
-            return
-
-        logger.info("🏃 텔레그램 봇 워커 시작")
-        worker_manager.update_heartbeat("TelegramBot")
-
-        try:
-            # 텔레그램 봇 시작 (블로킹)
-            self.telegram_bot.start_bot()
-            
-            # 주기적으로 하트비트 업데이트
-            while self.is_running and not shutdown_event.is_set():
-                worker_manager.update_heartbeat("TelegramBot")
-                shutdown_event.wait(timeout=60)  # 1분마다 하트비트
-                
-        except Exception as e:
-            logger.error(f"텔레그램 봇 워커 오류: {e}")
-        finally:
-            if self.telegram_bot:
-                try:
-                    self.telegram_bot.stop_bot()
-                except Exception as e:
-                    logger.error(f"텔레그램 봇 중지 오류: {e}")
-            
-            logger.info("🏁 텔레그램 봇 워커 종료")
-
-    def _strategy_scheduler_worker(self, shutdown_event: threading.Event, worker_manager: WorkerManager):
-        """전략 스케줄러 워커 - WorkerManager 호환"""
-        logger.info("🏃 전략 스케줄러 워커 시작")
-        worker_manager.update_heartbeat("StrategyScheduler")
-
-        try:
-            def run_strategy_scheduler():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(self._setup_existing_positions())
-                    loop.run_until_complete(self.strategy_scheduler.start_scheduler())
-                except Exception as e:
-                    logger.error(f"전략 스케줄러 실행 오류: {e}")
-                finally:
-                    loop.close()
-
-            # 별도 스레드에서 비동기 스케줄러 실행
-            scheduler_thread = threading.Thread(
-                target=run_strategy_scheduler,
-                name="AsyncScheduler",
-                daemon=True
-            )
-            scheduler_thread.start()
-
-            # 주기적으로 하트비트 업데이트 및 스케줄러 상태 확인
-            while self.is_running and not shutdown_event.is_set():
-                worker_manager.update_heartbeat("StrategyScheduler")
-                
-                # 스케줄러 스레드가 죽었는지 확인
-                if not scheduler_thread.is_alive():
-                    logger.error("전략 스케줄러 스레드가 예상치 못하게 종료됨")
-                    break
-                
-                shutdown_event.wait(timeout=180)  # 3분마다 하트비트
-
-            # 스케줄러 스레드 종료 대기
-            scheduler_thread.join(timeout=10)
-
-        except Exception as e:
-            logger.error(f"전략 스케줄러 워커 오류: {e}")
-        finally:
-            logger.info("🏁 전략 스케줄러 워커 종료")
-
-    def _handle_auto_sell_signal(self, sell_signal: Dict):
-        """자동 매도 신호 처리 - TradeExecutor 사용"""
-        try:
-            stock_code = sell_signal['stock_code']
-            
-            # 중복 매도 방지 체크
-            if stock_code in self.pending_sell_orders:
-                logger.warning(f"⚠️ 이미 매도 주문 진행 중: {stock_code}")
-                return
-
-            logger.info(f"🚨 매도 조건 발생: {stock_code} - {sell_signal['reason']}")
-
-            # 중복 방지용 등록
-            self.pending_sell_orders.add(stock_code)
-
-            try:
-                # TradeExecutor를 통한 자동 매도 실행
-                trade_result = self.trade_executor.execute_auto_sell(sell_signal)
-                
-                if trade_result.success:
-                    # 포지션에서 제거
-                    self.position_manager.remove_position(
-                        stock_code,
-                        trade_result.quantity,
-                        trade_result.price
-                    )
-
-                    self.stats['orders_executed'] += 1
-                    self.stats['positions_closed'] += 1
-
-                    logger.info(f"✅ 자동 매도 완료: {stock_code} {trade_result.quantity:,}주 @ {trade_result.price:,}원")
-
-                    # 텔레그램 알림 (조건부)
-                    if self.telegram_bot:
-                        sell_signal['auto_sell_price'] = trade_result.price
-                        self.telegram_bot.send_auto_sell_notification(sell_signal, trade_result.order_no)
-                else:
-                    logger.error(f"❌ 자동 매도 실패: {trade_result.error_message}")
-
-            finally:
-                # 중복 방지용 해제
-                self.pending_sell_orders.discard(stock_code)
-
-        except Exception as e:
-            logger.error(f"자동 매도 신호 처리 오류: {sell_signal.get('stock_code', 'UNKNOWN')} - {e}")
-            self.pending_sell_orders.discard(sell_signal.get('stock_code', 'UNKNOWN'))
-
-    # === 전략 스케줄러에서 호출되는 메서드들 (간소화됨) ===
-
     def handle_trading_signal(self, signal: dict):
-        """거래 신호 처리 - TradeExecutor 위임"""
+        """거래 신호 처리 - TradeExecutor 사용"""
         try:
-            logger.info(f"📊 거래신호 수신: {signal['stock_code']} {signal['signal_type']}")
-
-            self.stats['signals_processed'] += 1
-
-            # TradeExecutor를 통한 거래 실행
-            if signal['signal_type'] == 'BUY':
-                trade_result = self.trade_executor.execute_buy_signal(signal)
-                if trade_result.success:
+            logger.info(f"📊 거래 신호 수신: {signal.get('stock_code', 'UNKNOWN')}")
+            
+            # TradeExecutor를 통한 신호 처리
+            result = self.trade_executor.handle_signal(signal)
+            
+            if result.get('success'):
+                logger.info(f"✅ 거래 신호 처리 성공: {result.get('message', '')}")
+                
+                # 통계 업데이트
+                self.stats['signals_processed'] += 1
+                if result.get('order_executed'):
                     self.stats['orders_executed'] += 1
-                    self.stats['positions_opened'] += 1
-                    logger.info(f"✅ 매수 완료: {trade_result.stock_code}")
-                else:
-                    logger.warning(f"⚠️ 매수 실패: {trade_result.error_message}")
-
-            elif signal['signal_type'] == 'SELL':
-                trade_result = self.trade_executor.execute_sell_signal(signal)
-                if trade_result.success:
-                    self.stats['orders_executed'] += 1
-                    self.stats['positions_closed'] += 1
-                    logger.info(f"✅ 매도 완료: {trade_result.stock_code}")
-                else:
-                    logger.warning(f"⚠️ 매도 실패: {trade_result.error_message}")
-
-            # 텔레그램 알림 (조건부)
-            if self.telegram_bot:
-                self.telegram_bot.send_signal_notification(signal)
-
+                    if signal.get('action') == 'BUY':
+                        self.stats['positions_opened'] += 1
+                    elif signal.get('action') == 'SELL':
+                        self.stats['positions_closed'] += 1
+            else:
+                logger.warning(f"⚠️ 거래 신호 처리 실패: {result.get('message', '')}")
+                
         except Exception as e:
-            logger.error(f"거래 신호 처리 오류: {e}")
-
-    # === 헬퍼 메서드들 ===
+            logger.error(f"❌ 거래 신호 처리 오류: {e}")
 
     def _check_market_status(self) -> dict:
         """시장 상태 확인"""
         try:
-            current_time = time.localtime()
-            hour = current_time.tm_hour
-            minute = current_time.tm_min
-            weekday = current_time.tm_wday
-
-            if weekday >= 5:  # 주말
-                return {'is_open': False, 'reason': '주말'}
-
-            current_minutes = hour * 60 + minute
-            market_open = 9 * 60
-            market_close = 15 * 60 + 30
-
-            if market_open <= current_minutes <= market_close:
-                return {'is_open': True, 'session': 'regular'}
-            else:
-                return {'is_open': False, 'reason': '장외시간'}
-
+            from datetime import datetime
+            now = datetime.now()
+            
+            # 간단한 장시간 체크 (평일 9-15시)
+            is_weekday = now.weekday() < 5
+            is_market_hours = 9 <= now.hour < 15
+            is_open = is_weekday and is_market_hours
+            
+            return {
+                'is_open': is_open,
+                'current_time': now.strftime('%H:%M:%S'),
+                'status': '개장' if is_open else '휴장'
+            }
         except Exception as e:
             logger.error(f"시장 상태 확인 오류: {e}")
-            return {'is_open': False, 'reason': '오류'}
+            return {'is_open': False, 'status': '확인불가'}
 
     def _update_stats(self):
-        """통계 정보 업데이트"""
+        """통계 업데이트"""
         try:
-            current_time = time.time()
-            runtime = current_time - self.stats['start_time']
-
-            position_summary = self.position_manager.get_position_summary()
-            scheduler_status = self.strategy_scheduler.get_status()
-
-            websocket_info = {
-                'connected': False,
-                'subscriptions': 0,
-                'usage': '0/41',
-                'stocks': []
-            }
+            uptime = time.time() - self.stats['start_time']
+            self.stats['uptime'] = uptime
             
-            if self.websocket_manager:
-                websocket_info['connected'] = getattr(self.websocket_manager, 'is_connected', False)
-                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
-                    websocket_info['stocks'] = self.websocket_manager.get_subscribed_stocks()
-                    websocket_info['subscriptions'] = len(websocket_info['stocks'])
-                if hasattr(self.websocket_manager, 'get_websocket_usage'):
-                    websocket_info['usage'] = self.websocket_manager.get_websocket_usage()
-
-            # 🆕 워커 상태 정보 추가
-            worker_status = self.worker_manager.get_all_status()
-            running_workers = sum(1 for w in worker_status['workers'].values() if w['is_alive'])
-            total_workers = len(worker_status['workers'])
-            worker_info = f"✅ {running_workers}/{total_workers}개 실행중"
-
-            self.stats.update({
-                'runtime_hours': runtime / 3600,
-                'positions_count': position_summary.get('total_positions', 0),
-                'total_value': position_summary.get('total_value', 0),
-                'current_slot': scheduler_status.get('current_phase', 'Unknown'),
-                'active_strategies': len(scheduler_status.get('active_strategies', {})),
-                'websocket_connected': websocket_info['connected'],
-                'websocket_subscriptions': websocket_info['subscriptions'],
-                'websocket_usage': websocket_info['usage'],
-                'worker_stats': worker_status,
-                'last_update': current_time
-            })
-
-            if int(current_time) % 300 < 5:  # 5분마다
-                logger.info(
-                    f"📊 시스템 통계 - "
-                    f"실행시간: {self.stats['runtime_hours']:.1f}h, "
-                    f"포지션: {self.stats['positions_count']}개, "
-                    f"현재전략: {self.stats['current_slot']}, "
-                    f"웹소켓: {'✅' if websocket_info['connected'] else '❌'} ({websocket_info['subscriptions']}종목), "
-                    f"워커: {worker_info}, "
-                    f"처리신호: {self.stats['signals_processed']}개"
-                )
-
+            # 포지션 현황 업데이트
+            positions = self.position_manager.get_positions('active')
+            self.stats['active_positions'] = len(positions)
+            
         except Exception as e:
             logger.error(f"통계 업데이트 오류: {e}")
-
-    def _generate_hourly_report(self):
-        """1시간마다 상세 리포트 생성"""
-        try:
-            report = self._generate_status_report()
-            logger.info(f"📊 1시간 리포트:\n{report}")
-
-            if self.telegram_bot:
-                self.telegram_bot.send_hourly_report(report)
-
-        except Exception as e:
-            logger.error(f"리포트 생성 오류: {e}")
-
-    def _generate_status_report(self) -> str:
-        """상태 리포트 생성"""
-        try:
-            runtime = time.time() - self.stats['start_time']
-            runtime_hours = runtime / 3600
-
-            scheduler_status = self.strategy_scheduler.get_status()
-            position_summary = self.position_manager.get_position_summary()
-
-            websocket_info = "❌ 연결 안됨"
-            if self.websocket_manager and getattr(self.websocket_manager, 'is_connected', False):
-                subscriptions = 0
-                usage = "0/41"
-                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
-                    subscriptions = len(self.websocket_manager.get_subscribed_stocks())
-                if hasattr(self.websocket_manager, 'get_websocket_usage'):
-                    usage = self.websocket_manager.get_websocket_usage()
-                websocket_info = f"✅ 연결됨 ({subscriptions}종목, {usage})"
-
-            # 🆕 워커 상태 정보 추가
-            worker_status = self.worker_manager.get_all_status()
-            running_workers = sum(1 for w in worker_status['workers'].values() if w['is_alive'])
-            total_workers = len(worker_status['workers'])
-            worker_info = f"✅ {running_workers}/{total_workers}개 실행중"
-
-            report = (
-                f"🕐 실행시간: {runtime_hours:.1f}시간\n"
-                f"📈 활성포지션: {position_summary.get('total_positions', 0)}개\n"
-                f"💰 총평가금액: {position_summary.get('total_value', 0):,}원\n"
-                f"📊 수익률: {position_summary.get('total_profit_rate', 0):.2f}%\n"
-                f"🎯 현재전략: {scheduler_status.get('current_phase', 'N/A')}\n"
-                f"📋 활성전략수: {len(scheduler_status.get('active_strategies', {}))}\n"
-                f"📡 웹소켓: {websocket_info}\n"
-                f"🤖 워커: {worker_info}\n"
-                f"🎰 처리신호: {self.stats['signals_processed']}개"
-            )
-
-            return report
-
-        except Exception as e:
-            logger.error(f"리포트 생성 오류: {e}")
-            return "리포트 생성 실패"
 
     def _print_final_stats(self):
         """최종 통계 출력"""
         try:
-            runtime = time.time() - self.stats['start_time']
-            worker_status = self.worker_manager.get_all_status()
-
-            logger.info("=" * 50)
-            logger.info("📊 StockBot 최종 통계")
-            logger.info("=" * 50)
-            logger.info(f"🕐 총 실행시간: {runtime/3600:.2f}시간")
-            logger.info(f"📊 처리한 신호: {self.stats['signals_processed']}개")
-            logger.info(f"📋 실행한 주문: {self.stats['orders_executed']}개")
-            logger.info(f"📈 열린 포지션: {self.stats['positions_opened']}개")
-            logger.info(f"📉 닫힌 포지션: {self.stats['positions_closed']}개")
-            logger.info(f"🤖 워커 재시작: {worker_status['stats']['total_restarts']}회")
-            logger.info("=" * 50)
-
+            uptime = time.time() - self.stats['start_time']
+            hours = int(uptime // 3600)
+            minutes = int((uptime % 3600) // 60)
+            
+            print("\n" + "="*50)
+            print("📊 StockBot 실행 통계")
+            print("="*50)
+            print(f"⏱️ 총 실행 시간: {hours}시간 {minutes}분")
+            print(f"📈 처리된 신호: {self.stats['signals_processed']}개")
+            print(f"💰 실행된 주문: {self.stats['orders_executed']}개")
+            print(f"📊 열린 포지션: {self.stats['positions_opened']}개")
+            print(f"💵 닫힌 포지션: {self.stats['positions_closed']}개")
+            print("="*50)
+            
         except Exception as e:
             logger.error(f"최종 통계 출력 오류: {e}")
 
     def _signal_handler(self, signum, frame):
-        """시스템 신호 처리"""
-        logger.info(f"🛑 종료 신호 수신: {signum}")
+        """시그널 핸들러"""
+        logger.info("⌨️ 종료 신호 받음")
         self.stop()
 
-    # === 텔레그램 봇용 인터페이스 메서드들 ===
-
     def get_balance(self) -> dict:
-        """잔고 조회 (텔레그램용)"""
+        """잔고 조회"""
         return self.trading_manager.get_balance()
 
     def get_system_status(self) -> dict:
-        """시스템 상태 조회 (텔레그램용)"""
+        """시스템 상태 조회"""
         try:
-            position_summary = self.position_manager.get_position_summary()
-            scheduler_status = self.strategy_scheduler.get_status()
-            worker_status = self.worker_manager.get_all_status()
-
-            websocket_connected = False
-            websocket_subscriptions = 0
-            websocket_usage = "0/41"
-            subscribed_stocks = []
-            
-            if self.websocket_manager:
-                websocket_connected = getattr(self.websocket_manager, 'is_connected', False)
-                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
-                    subscribed_stocks = self.websocket_manager.get_subscribed_stocks()
-                    websocket_subscriptions = len(subscribed_stocks)
-                if hasattr(self.websocket_manager, 'get_websocket_usage'):
-                    websocket_usage = self.websocket_manager.get_websocket_usage()
-
             return {
-                'bot_running': self.is_running,
-                'websocket_connected': websocket_connected,
-                'websocket_subscriptions': websocket_subscriptions,
-                'websocket_usage': websocket_usage,
-                'subscribed_stocks': subscribed_stocks[:10],
-                'positions_count': position_summary.get('total_positions', 0),
-                'pending_orders_count': 0,
-                'order_history_count': 0,
-                'scheduler': {
-                    'current_slot': scheduler_status.get('current_phase', 'None'),
-                    'active_strategies': scheduler_status.get('active_strategies', {}),
-                    'total_active_stocks': len(scheduler_status.get('active_strategies', {}))
-                },
-                'workers': worker_status
+                'is_running': self.is_running,
+                'uptime': time.time() - self.stats['start_time'],
+                'stats': self.stats.copy(),
+                'market_status': self._check_market_status(),
+                'positions': len(self.position_manager.get_positions('active')),
+                'websocket_connected': (
+                    self.websocket_manager.is_connected 
+                    if self.websocket_manager else False
+                )
             }
         except Exception as e:
             logger.error(f"시스템 상태 조회 오류: {e}")
-            return {
-                'bot_running': self.is_running,
-                'websocket_connected': False,
-                'websocket_subscriptions': 0,
-                'websocket_usage': "0/41",
-                'subscribed_stocks': [],
-                'positions_count': 0,
-                'pending_orders_count': 0,
-                'order_history_count': 0,
-                'scheduler': {
-                    'current_slot': 'Unknown',
-                    'active_strategies': {},
-                    'total_active_stocks': 0
-                },
-                'workers': {'workers': {}, 'stats': {}, 'manager_running': False}
-            }
+            return {'error': str(e)}
 
-    @property
-    def trading_api(self):
-        """trading_api 속성 (텔레그램 봇 호환용)"""
-        return self.trading_manager
+    def _should_prefer_websocket(self) -> bool:
+        """웹소켓 우선 사용 여부 확인"""
+        try:
+            # config.json에서 웹소켓 설정 확인
+            import json
+            config_path = Path(__file__).parent / "config" / "config.json"
+            if config_path.exists():
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    websocket_config = config.get('websocket', {})
+                    return websocket_config.get('prefer_websocket', True)
+            return True  # 기본값
+        except:
+            return True
 
 
 def main():
-    """메인 실행 함수"""
+    """메인 함수"""
     try:
+        print("🚀 StockBot 시작...")
+        
         bot = StockBot()
         bot.start()
-
+        
     except KeyboardInterrupt:
-        logger.info("⌨️ 사용자 중단")
+        print("⌨️ 사용자가 중단했습니다.")
     except Exception as e:
-        logger.error(f"❌ 메인 실행 오류: {e}")
+        print(f"❌ 예상치 못한 오류: {e}")
+        logger.error(f"메인 함수 오류: {e}")
     finally:
-        logger.info("🏁 프로그램 종료")
+        print("👋 StockBot 종료")
 
 
 if __name__ == "__main__":
