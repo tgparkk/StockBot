@@ -6,6 +6,7 @@ StockBot의 거래 실행 로직을 분리하여 단일 책임 원칙을 적용
 import logging
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
+from core.kis_market_api import get_disparity_rank, get_multi_period_disparity
 
 logger = logging.getLogger(__name__)
 
@@ -29,28 +30,31 @@ class TradeConfig:
     def __post_init__(self):
         if self.strategy_multipliers is None:
             self.strategy_multipliers = {
-                'gap_trading': 0.7,      # 갭 거래: 보수적 (5.6%)
-                'volume_breakout': 0.9,  # 거래량: 적극적 (7.2%)
-                'momentum': 1.2,         # 모멘텀: 공격적 (9.6%)
-                'existing_holding': 0.5, # 기존 보유: 매우 보수적 (4%)
-                'default': 1.0           # 기본: 8%
+                'gap_trading': 0.7,           # 갭 거래: 보수적 (5.6%)
+                'volume_breakout': 0.9,       # 거래량: 적극적 (7.2%)
+                'momentum': 1.2,              # 모멘텀: 공격적 (9.6%)
+                'disparity_reversal': 0.8,    # 🆕 이격도 반등: 적극적 (6.4%)
+                'existing_holding': 0.5,      # 기존 보유: 매우 보수적 (4%)
+                'default': 1.0                # 기본: 8%
             }
         
         if self.buy_premiums is None:
             self.buy_premiums = {
-                'gap_trading': 0.001,      # 갭 거래: 0.1% 위 (기존 0.3%)
-                'volume_breakout': 0.001,  # 거래량 돌파: 0.1% 위 (기존 0.5%)
-                'momentum': 0.001,         # 모멘텀: 0.1% 위 (기존 0.7%)
-                'existing_holding': 0.001, # 기존 보유: 0.1% 위 (기존 0.2%)
-                'default': 0.001           # 기본: 0.1% 위 (기존 0.3%)
+                'gap_trading': 0.001,         # 갭 거래: 0.1% 위
+                'volume_breakout': 0.001,     # 거래량 돌파: 0.1% 위
+                'momentum': 0.001,            # 모멘텀: 0.1% 위
+                'disparity_reversal': 0.001,  # 🆕 이격도 반등: 0.1% 위
+                'existing_holding': 0.001,    # 기존 보유: 0.1% 위
+                'default': 0.001              # 기본: 0.1% 위
             }
         
         if self.sell_discounts is None:
             self.sell_discounts = {
-                'gap_trading': 0.005,    # 갭 거래: 0.5% 아래
-                'volume_breakout': 0.006, # 거래량 돌파: 0.6% 아래
-                'momentum': 0.004,       # 모멘텀: 0.4% 아래
-                'default': 0.005         # 기본: 0.5% 아래
+                'gap_trading': 0.005,         # 갭 거래: 0.5% 아래
+                'volume_breakout': 0.006,     # 거래량 돌파: 0.6% 아래
+                'momentum': 0.004,            # 모멘텀: 0.4% 아래
+                'disparity_reversal': 0.004,  # 🆕 이격도 반등: 0.4% 아래
+                'default': 0.005              # 기본: 0.5% 아래
             }
 
 
@@ -101,8 +105,8 @@ class TradeExecutor:
             logger.info(f"🛒 매수 신호 처리 시작: {stock_code} (전략: {strategy}, 강도: {strength:.2f})")
             
             # 1. 기본 검증
-            validation_result = self._validate_buy_signal(signal)
-            if not validation_result[0]:
+            validation_result = self._validate_buy_signal_enhanced(signal, stock_code)
+            if not validation_result:
                 return TradeResult(
                     success=False,
                     stock_code=stock_code,
@@ -110,7 +114,7 @@ class TradeExecutor:
                     quantity=0,
                     price=0,
                     total_amount=0,
-                    error_message=validation_result[1]
+                    error_message=validation_result
                 )
             
             # 2. 현재가 조회
@@ -412,22 +416,128 @@ class TradeExecutor:
     
     # === 내부 헬퍼 메서드들 ===
     
-    def _validate_buy_signal(self, signal: Dict) -> Tuple[bool, str]:
+    def _validate_buy_signal(self, signal: Dict, stock_code: str) -> bool:
         """매수 신호 검증"""
-        stock_code = signal.get('stock_code')
         if not stock_code:
-            return False, "종목코드 누락"
+            return False
         
         # 포지션 중복 체크
         existing_positions = self.position_manager.get_positions('active')
         if stock_code in existing_positions:
-            return False, f"이미 보유 중인 종목: {stock_code}"
+            return False
         
         # 중복 주문 체크
         if stock_code in self.pending_orders:
-            return False, f"이미 주문 진행 중인 종목: {stock_code}"
+            return False
         
-        return True, "검증 통과"
+        return True
+    
+    def _validate_buy_signal_enhanced(self, signal: Dict, stock_code: str) -> bool:
+        """🆕 강화된 매수 신호 검증 (고도화된 다중 이격도 활용)"""
+        try:
+            # 기본 검증
+            if not self._validate_buy_signal(signal, stock_code):
+                return False
+            
+            # 🎯 다중 기간 이격도 종합 검증
+            try:
+                # 특정 종목에 대한 5일, 20일, 60일 이격도 확인
+                d5_data = get_disparity_rank(
+                    fid_input_iscd="0000",
+                    fid_hour_cls_code="5",
+                    fid_vol_cnt="10000"
+                )
+                d20_data = get_disparity_rank(
+                    fid_input_iscd="0000",
+                    fid_hour_cls_code="20", 
+                    fid_vol_cnt="10000"
+                )
+                d60_data = get_disparity_rank(
+                    fid_input_iscd="0000",
+                    fid_hour_cls_code="60",
+                    fid_vol_cnt="10000"
+                )
+                
+                # 해당 종목의 다중 이격도 검증
+                d5_val = d20_val = d60_val = None
+                
+                if d5_data is not None and not d5_data.empty:
+                    d5_row = d5_data[d5_data['mksc_shrn_iscd'] == stock_code]
+                    if not d5_row.empty:
+                        d5_val = float(d5_row.iloc[0].get('d5_dsrt', 100))
+                
+                if d20_data is not None and not d20_data.empty:
+                    d20_row = d20_data[d20_data['mksc_shrn_iscd'] == stock_code]
+                    if not d20_row.empty:
+                        d20_val = float(d20_row.iloc[0].get('d20_dsrt', 100))
+                
+                if d60_data is not None and not d60_data.empty:
+                    d60_row = d60_data[d60_data['mksc_shrn_iscd'] == stock_code]
+                    if not d60_row.empty:
+                        d60_val = float(d60_row.iloc[0].get('d60_dsrt', 100))
+                
+                # 🎯 다중 이격도 기반 매수 검증 로직
+                if all(val is not None for val in [d5_val, d20_val, d60_val]):
+                    # 전략별 차별화된 검증
+                    strategy = signal.get('strategy', 'default')
+                    
+                    if strategy == 'disparity_reversal':
+                        # 이격도 반등 전략: 과매도 구간에서만 매수
+                        if d20_val <= 90 and d60_val <= 95:
+                            logger.info(f"🎯 이격도반등 매수 허용: {stock_code} "
+                                      f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f}")
+                            return True
+                        else:
+                            logger.warning(f"🎯 이격도반등 매수 거부: {stock_code} "
+                                         f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매도 미달)")
+                            return False
+                    
+                    elif strategy in ['gap_trading', 'volume_breakout', 'momentum']:
+                        # 기존 전략들: 과매수 구간 매수 금지
+                        if d5_val >= 120 or d20_val >= 115:  # 단기/중기 과매수
+                            logger.warning(f"🎯 {strategy} 매수 거부: {stock_code} "
+                                         f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매수)")
+                            return False
+                        elif d20_val <= 90:  # 중기 과매도 구간 = 매수 우대
+                            logger.info(f"🎯 {strategy} 매수 우대: {stock_code} "
+                                       f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매도)")
+                            return True
+                        else:  # 중립 구간
+                            logger.debug(f"🎯 {strategy} 매수 중립: {stock_code} "
+                                        f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f}")
+                            return True
+                    
+                    else:
+                        # 기타 전략: 기본 검증
+                        if d20_val >= 115:  # 과매수 매수 금지
+                            logger.warning(f"🎯 기타전략 매수 거부: {stock_code} "
+                                         f"D20:{d20_val:.1f} (과매수)")
+                            return False
+                        else:
+                            return True
+                
+                elif d20_val is not None:
+                    # 20일 이격도만 확인 가능한 경우 (기존 로직)
+                    if d20_val <= 90:
+                        logger.info(f"🎯 20일 이격도 매수 허용: {stock_code} D20:{d20_val:.1f}% (과매도)")
+                        return True
+                    elif d20_val >= 115:
+                        logger.warning(f"🎯 20일 이격도 매수 거부: {stock_code} D20:{d20_val:.1f}% (과매수)")
+                        return False
+                    else:
+                        logger.debug(f"🎯 20일 이격도 중립: {stock_code} D20:{d20_val:.1f}%")
+                        return True
+                        
+            except Exception as e:
+                logger.debug(f"다중 이격도 확인 실패 ({stock_code}): {e}")
+                # 이격도 확인 실패시 기본 검증 결과 사용
+                pass
+            
+            return True  # 기본 검증 통과시 매수 허용
+            
+        except Exception as e:
+            logger.error(f"강화된 매수 신호 검증 오류 ({stock_code}): {e}")
+            return False
     
     def _get_current_price(self, stock_code: str) -> int:
         """현재가 조회"""

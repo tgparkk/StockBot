@@ -780,3 +780,284 @@ def get_quote_balance_rank(fid_cond_mrkt_div_code: str = "J",
         logger.error(f"호가잔량 순위 조회 오류: {e}")
         return None
 
+
+def get_multi_period_disparity(stock_code: str = "0000") -> Optional[Dict]:
+    """
+    🆕 다중 기간 이격도 종합 분석
+    
+    Args:
+        stock_code: 종목코드 (특정 종목 분석시 사용)
+    
+    Returns:
+        {
+            'short_term': DataFrame,   # 5일 이격도
+            'medium_term': DataFrame,  # 20일 이격도  
+            'long_term': DataFrame,    # 60일 이격도
+            'analysis': Dict          # 종합 분석 결과
+        }
+    """
+    try:
+        result = {
+            'short_term': None,
+            'medium_term': None,
+            'long_term': None,
+            'analysis': {}
+        }
+        
+        # 5일 이격도 (단기 과열/침체)
+        d5_data = get_disparity_rank(
+            fid_input_iscd="0000",
+            fid_hour_cls_code="5",
+            fid_vol_cnt="30000"  # 3만주 이상
+        )
+        
+        # 20일 이격도 (중기 트렌드)
+        d20_data = get_disparity_rank(
+            fid_input_iscd="0000", 
+            fid_hour_cls_code="20",
+            fid_vol_cnt="30000"
+        )
+        
+        # 60일 이격도 (장기 흐름)
+        d60_data = get_disparity_rank(
+            fid_input_iscd="0000",
+            fid_hour_cls_code="60", 
+            fid_vol_cnt="30000"
+        )
+        
+        result['short_term'] = d5_data
+        result['medium_term'] = d20_data
+        result['long_term'] = d60_data
+        
+        # 🎯 종합 분석: 이격도 divergence 포착
+        if all(data is not None and not data.empty for data in [d5_data, d20_data, d60_data]):
+            analysis = _analyze_disparity_divergence(d5_data, d20_data, d60_data)
+            result['analysis'] = analysis
+            
+        logger.info(f"다중 기간 이격도 분석 완료")
+        return result
+        
+    except Exception as e:
+        logger.error(f"다중 기간 이격도 분석 오류: {e}")
+        return None
+
+
+def _analyze_disparity_divergence(d5_data: pd.DataFrame, 
+                                 d20_data: pd.DataFrame, 
+                                 d60_data: pd.DataFrame) -> Dict:
+    """🎯 이격도 divergence 분석 (반전 시점 포착)"""
+    try:
+        analysis = {
+            'strong_buy_candidates': [],    # 강매수 후보
+            'buy_candidates': [],           # 매수 후보  
+            'sell_candidates': [],          # 매도 후보
+            'strong_sell_candidates': [],   # 강매도 후보
+            'divergence_signals': []        # divergence 신호
+        }
+        
+        # 공통 종목 찾기 (모든 기간 데이터에 포함된 종목)
+        common_stocks = set(d5_data['mksc_shrn_iscd']) & \
+                       set(d20_data['mksc_shrn_iscd']) & \
+                       set(d60_data['mksc_shrn_iscd'])
+        
+        for stock_code in list(common_stocks)[:50]:  # 상위 50개 종목만 분석
+            try:
+                # 각 기간별 이격도 추출
+                d5_row = d5_data[d5_data['mksc_shrn_iscd'] == stock_code].iloc[0]
+                d20_row = d20_data[d20_data['mksc_shrn_iscd'] == stock_code].iloc[0]
+                d60_row = d60_data[d60_data['mksc_shrn_iscd'] == stock_code].iloc[0]
+                
+                d5_val = float(d5_row.get('d5_dsrt', 100))
+                d20_val = float(d20_row.get('d20_dsrt', 100))
+                d60_val = float(d60_row.get('d60_dsrt', 100))
+                
+                stock_name = d20_row.get('hts_kor_isnm', '')
+                current_price = int(d20_row.get('stck_prpr', 0))
+                change_rate = float(d20_row.get('prdy_ctrt', 0))
+                
+                stock_info = {
+                    'stock_code': stock_code,
+                    'stock_name': stock_name,
+                    'current_price': current_price,
+                    'change_rate': change_rate,
+                    'd5_disparity': d5_val,
+                    'd20_disparity': d20_val,
+                    'd60_disparity': d60_val
+                }
+                
+                # 🎯 이격도 패턴 분석
+                
+                # 1. 강매수 신호: 모든 기간 과매도 + 단기 반등
+                if (d60_val <= 85 and d20_val <= 90 and d5_val <= 95 and 
+                    change_rate >= 0.5):  # 장기/중기 과매도 + 단기 회복 + 상승
+                    stock_info['signal_strength'] = 'STRONG_BUY'
+                    stock_info['reason'] = f'전기간 과매도 반등 (60일:{d60_val:.1f}, 20일:{d20_val:.1f}, 5일:{d5_val:.1f})'
+                    analysis['strong_buy_candidates'].append(stock_info)
+                
+                # 2. 매수 신호: 중장기 과매도 + 단기 정상
+                elif (d20_val <= 90 and d60_val <= 92 and d5_val >= 95 and
+                      change_rate >= 0):
+                    stock_info['signal_strength'] = 'BUY'
+                    stock_info['reason'] = f'중장기 과매도 (20일:{d20_val:.1f}, 60일:{d60_val:.1f})'
+                    analysis['buy_candidates'].append(stock_info)
+                
+                # 3. 매도 신호: 단기 과열 + 중기 고점
+                elif (d5_val >= 115 and d20_val >= 110 and change_rate >= 2.0):
+                    stock_info['signal_strength'] = 'SELL'
+                    stock_info['reason'] = f'단중기 과열 (5일:{d5_val:.1f}, 20일:{d20_val:.1f})'
+                    analysis['sell_candidates'].append(stock_info)
+                
+                # 4. 강매도 신호: 모든 기간 과열
+                elif (d5_val >= 120 and d20_val >= 115 and d60_val >= 110):
+                    stock_info['signal_strength'] = 'STRONG_SELL'
+                    stock_info['reason'] = f'전기간 과열 (60일:{d60_val:.1f}, 20일:{d20_val:.1f}, 5일:{d5_val:.1f})'
+                    analysis['strong_sell_candidates'].append(stock_info)
+                
+                # 5. 🎯 Divergence 신호 (추세 반전 신호)
+                # 장기상승 + 단기하락 = 조정 시작
+                if (d60_val >= 105 and d20_val >= 102 and d5_val <= 98):
+                    stock_info['signal_strength'] = 'DIVERGENCE_SELL'
+                    stock_info['reason'] = f'하향 Divergence (장기 과열, 단기 조정)'
+                    analysis['divergence_signals'].append(stock_info)
+                
+                # 장기하락 + 단기상승 = 반등 시작  
+                elif (d60_val <= 95 and d20_val <= 98 and d5_val >= 102):
+                    stock_info['signal_strength'] = 'DIVERGENCE_BUY'
+                    stock_info['reason'] = f'상향 Divergence (장기 침체, 단기 회복)'
+                    analysis['divergence_signals'].append(stock_info)
+                    
+            except Exception as e:
+                logger.warning(f"이격도 divergence 분석 오류 ({stock_code}): {e}")
+                continue
+        
+        # 신호 강도별 정렬
+        for category in ['strong_buy_candidates', 'buy_candidates', 'sell_candidates', 'strong_sell_candidates']:
+            analysis[category].sort(key=lambda x: abs(x['change_rate']), reverse=True)
+            analysis[category] = analysis[category][:10]  # 상위 10개
+        
+        logger.info(f"🎯 이격도 divergence 분석 완료: "
+                   f"강매수{len(analysis['strong_buy_candidates'])} "
+                   f"매수{len(analysis['buy_candidates'])} "
+                   f"매도{len(analysis['sell_candidates'])} "
+                   f"강매도{len(analysis['strong_sell_candidates'])} "
+                   f"divergence{len(analysis['divergence_signals'])}")
+        
+        return analysis
+        
+    except Exception as e:
+        logger.error(f"이격도 divergence 분석 오류: {e}")
+        return {}
+
+
+def get_disparity_trading_signals() -> Optional[Dict]:
+    """
+    🆕 이격도 기반 실시간 매매 신호 생성
+    
+    Returns:
+        {
+            'timestamp': str,
+            'buy_signals': List[Dict],
+            'sell_signals': List[Dict], 
+            'market_status': Dict
+        }
+    """
+    try:
+        from datetime import datetime
+        
+        # 다중 기간 이격도 분석 실행
+        multi_disparity = get_multi_period_disparity()
+        if not multi_disparity or not multi_disparity['analysis']:
+            return None
+        
+        analysis = multi_disparity['analysis']
+        
+        # 매매 신호 정리
+        buy_signals = []
+        sell_signals = []
+        
+        # 강매수 신호 (최우선)
+        for candidate in analysis.get('strong_buy_candidates', []):
+            buy_signals.append({
+                'stock_code': candidate['stock_code'],
+                'stock_name': candidate['stock_name'],
+                'signal_type': 'STRONG_BUY',
+                'strategy_type': 'disparity_reversal',
+                'score': 100 - candidate['d20_disparity'],  # 과매도 정도가 점수
+                'reason': candidate['reason'],
+                'current_price': candidate['current_price'],
+                'change_rate': candidate['change_rate'],
+                'priority': 1
+            })
+        
+        # 일반 매수 신호
+        for candidate in analysis.get('buy_candidates', []):
+            buy_signals.append({
+                'stock_code': candidate['stock_code'],
+                'stock_name': candidate['stock_name'],
+                'signal_type': 'BUY',
+                'strategy_type': 'disparity_reversal',
+                'score': 100 - candidate['d20_disparity'],
+                'reason': candidate['reason'],
+                'current_price': candidate['current_price'],
+                'change_rate': candidate['change_rate'],
+                'priority': 2
+            })
+        
+        # Divergence 매수 신호
+        for candidate in analysis.get('divergence_signals', []):
+            if candidate['signal_strength'] == 'DIVERGENCE_BUY':
+                buy_signals.append({
+                    'stock_code': candidate['stock_code'],
+                    'stock_name': candidate['stock_name'],
+                    'signal_type': 'DIVERGENCE_BUY',
+                    'strategy_type': 'disparity_reversal',
+                    'score': 100 - candidate['d60_disparity'],  # 장기 이격도 기준
+                    'reason': candidate['reason'],
+                    'current_price': candidate['current_price'],
+                    'change_rate': candidate['change_rate'],
+                    'priority': 3
+                })
+        
+        # 매도 신호들
+        for candidate in analysis.get('sell_candidates', []):
+            sell_signals.append({
+                'stock_code': candidate['stock_code'],
+                'stock_name': candidate['stock_name'],
+                'signal_type': 'SELL',
+                'reason': candidate['reason'],
+                'current_price': candidate['current_price'],
+                'disparity_level': candidate['d5_disparity']
+            })
+        
+        # 점수별 정렬 (높은 점수 = 더 과매도)
+        buy_signals.sort(key=lambda x: (x['priority'], -x['score']))
+        
+        # 시장 상태 요약
+        market_status = {
+            'total_analyzed_stocks': len(analysis.get('strong_buy_candidates', [])) + \
+                                   len(analysis.get('buy_candidates', [])) + \
+                                   len(analysis.get('sell_candidates', [])) + \
+                                   len(analysis.get('strong_sell_candidates', [])),
+            'oversold_count': len(analysis.get('strong_buy_candidates', [])) + len(analysis.get('buy_candidates', [])),
+            'overbought_count': len(analysis.get('sell_candidates', [])) + len(analysis.get('strong_sell_candidates', [])),
+            'divergence_count': len(analysis.get('divergence_signals', [])),
+            'market_sentiment': 'OVERSOLD' if len(analysis.get('strong_buy_candidates', [])) > 5 else 
+                              'OVERBOUGHT' if len(analysis.get('strong_sell_candidates', [])) > 5 else 'NEUTRAL'
+        }
+        
+        result = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'buy_signals': buy_signals[:15],  # 상위 15개 매수 신호
+            'sell_signals': sell_signals[:10], # 상위 10개 매도 신호
+            'market_status': market_status
+        }
+        
+        logger.info(f"🎯 이격도 매매 신호 생성: 매수{len(buy_signals)} 매도{len(sell_signals)} "
+                   f"시장상태{market_status['market_sentiment']}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"이격도 매매 신호 생성 오류: {e}")
+        return None
+
