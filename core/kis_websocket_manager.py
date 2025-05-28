@@ -49,15 +49,15 @@ class DataType(Enum):
 class KISWebSocketManager:
     """KIS API 통합 웹소켓 매니저"""
 
-    def __init__(self, is_demo: bool = False):
-        self.is_demo = is_demo
+    def __init__(self):
+        self.is_demo = False  # 실전투자 고정
 
         # 웹소켓 제한
         self.WEBSOCKET_LIMIT = 41
         self.MAX_STOCKS = 13  # 체결(13) + 호가(13) = 26건 + 여유분
 
-        # 연결 정보
-        self.ws_url = 'ws://ops.koreainvestment.com:31000' if is_demo else 'ws://ops.koreainvestment.com:21000'
+        # 연결 정보 (실전투자용 고정)
+        self.ws_url = 'ws://ops.koreainvestment.com:21000'
         self.approval_key: Optional[str] = None
         self.websocket: Optional[Any] = None
 
@@ -94,7 +94,7 @@ class KISWebSocketManager:
             'last_message_time': None
         }
 
-        logger.info(f"KIS 통합 웹소켓 매니저 초기화 ({'모의투자' if is_demo else '실전투자'})")
+        logger.info(f"KIS 통합 웹소켓 매니저 초기화 (실전투자)")
 
     def get_approval_key(self) -> str:
         """웹소켓 접속키 발급"""
@@ -357,12 +357,12 @@ class KISWebSocketManager:
             return False
 
     async def subscribe_notice(self, hts_id: str) -> bool:
-        """체결통보 구독"""
+        """체결통보 구독 (실전투자 고정)"""
         if not self.is_connected:
             return False
 
         try:
-            notice_type = KIS_WSReq.NOTICE_DEMO if self.is_demo else KIS_WSReq.NOTICE
+            notice_type = KIS_WSReq.NOTICE  # 실전투자용 고정
             notice_msg = self._build_message(notice_type.value, hts_id)
             await self.websocket.send(notice_msg)
 
@@ -477,11 +477,12 @@ class KISWebSocketManager:
                     await self._execute_callbacks(DataType.STOCK_ORDERBOOK.value, parsed_data)
 
             elif tr_id in [KIS_WSReq.NOTICE.value, KIS_WSReq.NOTICE_DEMO.value]:
-                # 체결통보
-                decrypted_data = self._decrypt_notice_data(raw_data)
-                if decrypted_data:
-                    logger.info(f"체결통보 수신: {decrypted_data}")
-                    await self._execute_callbacks(DataType.STOCK_EXECUTION.value, {'data': decrypted_data, 'timestamp': datetime.now()})
+                # 체결통보 (실전투자는 NOTICE만 사용)
+                if tr_id == KIS_WSReq.NOTICE.value:
+                    decrypted_data = self._decrypt_notice_data(raw_data)
+                    if decrypted_data:
+                        logger.info(f"체결통보 수신: {decrypted_data}")
+                        await self._execute_callbacks(DataType.STOCK_EXECUTION.value, {'data': decrypted_data, 'timestamp': datetime.now()})
 
         except Exception as e:
             logger.error(f"실시간 데이터 처리 오류: {e}")

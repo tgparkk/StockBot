@@ -170,16 +170,28 @@ class TradingManager:
         """계좌 잔고 조회"""
         try:
             balance = self.rest_api.get_balance()
-            if balance:
+            if balance and balance.get('status') == 'success':
+                summary = balance.get('summary', {})
+                holdings = balance.get('holdings', [])
+                
+                # KIS API 응답 구조에 맞게 매핑
+                total_evaluation = int(summary.get('tot_evlu_amt', 0))        # 총평가금액
+                available_cash = int(summary.get('nxdy_excc_amt', 0))        # 익일정산금액(가용현금)
+                stock_evaluation = int(summary.get('scts_evlu_amt', 0))      # 유가증권평가금액
+                profit_loss = int(summary.get('evlu_pfls_smtl_amt', 0))      # 평가손익합계금액
+                
+                logger.debug(f"잔고 조회 결과: 총평가={total_evaluation:,}원, 가용현금={available_cash:,}원, 주식평가={stock_evaluation:,}원")
+                
                 return {
                     'success': True,
-                    'total_assets': balance.get('total_evaluation', 0),
-                    'available_cash': balance.get('available_amount', 0),
-                    'stock_evaluation': balance.get('stock_evaluation', 0),
-                    'profit_loss': balance.get('evaluation_profit_loss', 0),
-                    'holdings': balance.get('holdings', [])
+                    'total_assets': total_evaluation,
+                    'available_cash': available_cash,
+                    'stock_evaluation': stock_evaluation,
+                    'profit_loss': profit_loss,
+                    'holdings': holdings
                 }
             else:
+                logger.error(f"잔고 조회 실패: {balance}")
                 return {'success': False, 'message': '잔고 조회 실패'}
 
         except Exception as e:

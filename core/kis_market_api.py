@@ -416,48 +416,45 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
 # =============================================================================
 
 def get_gap_trading_candidates(market: str = "0000", 
-                               min_gap_rate: float = 0.1,
-                               min_change_rate: float = -5.0,
-                               min_volume_ratio: float = 1.0) -> Optional[pd.DataFrame]:
-    """갭 트레이딩 후보 조회 (실제 갭 계산)"""
+                               min_gap_rate: float = 1.1,    # 🎯 1.1%로 상향 (기존 0.1%)
+                               min_change_rate: float = 1.0,  # 🎯 1.0%로 상향 (기존 -5.0%) 
+                               min_volume_ratio: float = 2.0) -> Optional[pd.DataFrame]: # 🎯 2.0배로 상향 (기존 1.0배)
+    """갭 트레이딩 후보 조회 - 🎯 수익성 중심 엄격한 기준"""
     try:
-        # 1단계: 상승률 상위 종목을 1차 필터링 (조건 완화)
-        logger.info("갭 트레이딩 후보 1차 필터링 중...")
+        # 1단계: 상승률 상위 종목을 1차 필터링 (🎯 더 엄격한 조건)
+        logger.info("🎯 갭 트레이딩 후보 엄격 필터링 중...")
 
-        # 먼저 조건 없이 상승률 상위 종목 조회
+        # 상승률 2% 이상 종목만 1차 필터링
         candidate_data = get_fluctuation_rank(
             fid_input_iscd=market,
             fid_rank_sort_cls_code="0",  # 상승률순
-            fid_rsfl_rate1=""  # 조건 없음 (모든 상승 종목)
+            fid_rsfl_rate1="2.0"  # 🎯 2% 이상 상승 종목만
         )
 
         if candidate_data is None or candidate_data.empty:
-            logger.warning("갭 트레이딩 1차 필터링에서 데이터 없음 - 조건 완화하여 재시도")
-
-            # 조건을 더 완화하여 재시도 (전체 종목)
+            logger.warning("🎯 엄격 필터링에서 데이터 없음 - 1% 이상으로 완화하여 재시도")
             candidate_data = get_fluctuation_rank(
                 fid_input_iscd=market,
-                fid_rank_sort_cls_code="0",  # 상승률순
-                fid_rsfl_rate1="",           # 비율 조건 없음
-                fid_rsfl_rate2=""            # 완전 조건 없음
+                fid_rank_sort_cls_code="0",  
+                fid_rsfl_rate1="1.0"  # 1% 이상으로 완화
             )
 
             if candidate_data is None or candidate_data.empty:
-                logger.error("갭 트레이딩: 모든 조건에서 데이터 없음")
+                logger.error("🎯 갭 트레이딩: 1% 이상 상승 종목도 없음")
                 return pd.DataFrame()
 
-        logger.info(f"1차 필터링 완료: {len(candidate_data)}개 종목")
+        logger.info(f"🎯 엄격 1차 필터링 완료: {len(candidate_data)}개 종목")
 
-        # 2단계: 각 종목의 실제 갭 계산
+        # 2단계: 각 종목의 실제 갭 계산 (🎯 더 엄격한 기준 적용)
         gap_candidates = []
 
-        for idx, row in candidate_data.head(30).iterrows():  # 상위 30개만 체크 (API 제한 고려)
+        for idx, row in candidate_data.head(20).iterrows():  # 🎯 상위 20개만 (기존 30개)
             try:
                 stock_code = row.get('stck_shrn_iscd', '')
                 if not stock_code:
                     continue
 
-                # 현재가 정보 조회 (시가, 전일종가 포함)
+                # 현재가 정보 조회
                 current_data = get_inquire_price("J", stock_code)
                 if current_data is None or current_data.empty:
                     continue
@@ -465,53 +462,25 @@ def get_gap_trading_candidates(market: str = "0000",
                 current_info = current_data.iloc[0]
 
                 # 갭 계산에 필요한 데이터 추출
-                current_price = int(current_info.get('stck_prpr', 0))      # 현재가
-                open_price = int(current_info.get('stck_oprc', 0))         # 시가
-                prev_close = int(current_info.get('stck_sdpr', 0))         # 전일종가
+                current_price = int(current_info.get('stck_prpr', 0))
+                open_price = int(current_info.get('stck_oprc', 0))
+                prev_close = int(current_info.get('stck_sdpr', 0))
 
-                # 장 시작 전 대응: 시가가 0이면 현재가를 예상 시가로 사용
-                if open_price <= 0 and current_price > 0:
-                    open_price = current_price  # 현재가를 예상 시가로 사용
-                    logger.debug(f"종목 {stock_code}: 장 시작 전 - 현재가{current_price}를 예상 시가로 사용")
-                elif open_price <= 0 and current_price <= 0:
-                    # 둘 다 0이면 호가 정보 조회 시도
-                    logger.debug(f"종목 {stock_code}: 시가와 현재가 모두 0 - 호가 정보 조회 시도")
-                    
-                    try:
-                        # 호가/예상체결 정보 조회
-                        asking_data = get_inquire_asking_price_exp_ccn("2", "J", stock_code)  # output_dv="2": 예상체결가
-                        if asking_data is not None and not asking_data.empty:
-                            exp_price = int(asking_data.iloc[0].get('antc_cnpr', 0))  # 예상 체결가
-                            if exp_price > 0:
-                                open_price = exp_price
-                                current_price = exp_price
-                                logger.debug(f"종목 {stock_code}: 예상체결가 {exp_price}원 사용")
-                            else:
-                                logger.debug(f"종목 {stock_code}: 예상체결가도 0원 - 건너뜀")
-                                continue
-                        else:
-                            logger.debug(f"종목 {stock_code}: 호가 정보 없음 - 건너뜀")
-                            continue
-                    except Exception as e:
-                        logger.debug(f"종목 {stock_code}: 호가 조회 오류 {e} - 건너뜀")
-                        continue
+                # 🎯 장 시작 전 종목 제외 (더 확실한 데이터만 사용)
+                if open_price <= 0:
+                    logger.debug(f"🎯 종목 {stock_code}: 시가 없음(장전) - 제외")
+                    continue
 
-                if prev_close <= 0:
-                    logger.debug(f"종목 {stock_code}: 전일종가 없음 - 건너뜀")
+                if prev_close <= 0 or current_price <= 0:
+                    logger.debug(f"🎯 종목 {stock_code}: 가격 정보 불완전 - 제외")
                     continue
 
                 # 갭 크기 계산
                 gap_size = open_price - prev_close
-                gap_rate = (gap_size / prev_close) * 100  # 갭 비율 (%)
+                gap_rate = (gap_size / prev_close) * 100
 
-                # 기본 정보 로그 (디버깅용)
-                logger.debug(f"종목 {stock_code}: 갭{gap_rate:.2f}%, 현재가{current_price}, 시가{open_price}, 전일종가{prev_close}")
-
-                # 갭 트레이딩 조건 확인 (조건 완화)
-                if abs(gap_rate) >= min_gap_rate:  # 0.1% 이상 갭 (더욱 완화 - 장전용)
-                    logger.debug(f"종목 {stock_code}: 갭 조건 통과 - {gap_rate:.2f}%")
-                    
-                    # 상향갭과 하향갭 모두 고려
+                # 🎯 엄격한 갭 트레이딩 조건
+                if gap_rate >= min_gap_rate:  # 상향갭만 (2% 이상)
                     volume = int(current_info.get('acml_vol', 0))
                     
                     # 안전한 변동률 변환
@@ -519,32 +488,35 @@ def get_gap_trading_candidates(market: str = "0000",
                     try:
                         change_rate = float(str(change_rate_raw))
                     except (ValueError, TypeError):
-                        logger.warning(f"종목 {stock_code}: 변동률 변환 오류 '{change_rate_raw}' -> 0.0으로 처리")
-                        change_rate = 0.0
+                        logger.debug(f"🎯 종목 {stock_code}: 변동률 변환 오류 - 제외")
+                        continue
 
-                    # 갭 후 거래량 확인 (평소보다 많아야 함)
-                    avg_volume = int(current_info.get('avrg_vol', 1))  # 평균 거래량
+                    # 거래량 비율 계산
+                    avg_volume = int(current_info.get('avrg_vol', 1))
                     volume_ratio = volume / max(avg_volume, 1)
 
-                    logger.debug(f"종목 {stock_code}: 거래량비율{volume_ratio:.1f}배, 변동률{change_rate:.1f}%")
-
-                    # 갭 트레이딩 후보 조건 (매우 완화)
-                    # 1. 갭 0.1% 이상 (상향/하향 모두)
-                    # 2. 거래량 조건: 장중이면 1.0배 이상, 장 시작 전이면 생략
-                    # 3. 현재 변동률 -5% 이상 (더 큰 하락도 허용)
+                    # 🎯 수익성 중심 엄격 조건
+                    # 1. 상향갭 2% 이상 (강한 갭)
+                    # 2. 현재 변동률 1% 이상 (지속적 상승)
+                    # 3. 거래량 2배 이상 (강한 관심)
+                    # 4. 최소 거래량 5만주 이상 (유동성 확보)
                     
-                    # 장 시작 전 여부 확인 (거래량이 매우 적으면 장 시작 전으로 간주)
-                    is_pre_market = volume < 1000  # 1000주 미만이면 장 시작 전으로 간주
+                    min_daily_volume = 50000  # 🎯 최소 5만주
                     
-                    if is_pre_market:
-                        # 장 시작 전: 거래량 조건 생략
-                        volume_condition = True
-                        logger.debug(f"종목 {stock_code}: 장 시작 전 모드 - 거래량 조건 생략")
-                    else:
-                        # 장중: 거래량 1.0배 이상
-                        volume_condition = volume_ratio >= min_volume_ratio
-                    
-                    if volume_condition and change_rate >= min_change_rate:  # -5%로 완화
+                    if (volume_ratio >= min_volume_ratio and 
+                        change_rate >= min_change_rate and 
+                        volume >= min_daily_volume):
+                        
+                        # 🎯 추가 수익성 필터
+                        # 가격대별 최소 기준 적용
+                        if current_price < 1000:  # 저가주 제외
+                            logger.debug(f"🎯 종목 {stock_code}: 저가주 제외 ({current_price}원)")
+                            continue
+                        
+                        if current_price > 500000:  # 고가주 제외 (유동성 문제)
+                            logger.debug(f"🎯 종목 {stock_code}: 고가주 제외 ({current_price}원)")
+                            continue
+                        
                         gap_candidates.append({
                             'stck_shrn_iscd': stock_code,
                             'hts_kor_isnm': row.get('hts_kor_isnm', ''),
@@ -556,51 +528,49 @@ def get_gap_trading_candidates(market: str = "0000",
                             'prdy_ctrt': change_rate,
                             'acml_vol': volume,
                             'volume_ratio': round(volume_ratio, 2),
+                            'profit_score': gap_rate * volume_ratio * change_rate,  # 🎯 수익성 점수
                             'data_rank': len(gap_candidates) + 1
                         })
 
-                        logger.info(f"갭 후보 발견: {stock_code}({row.get('hts_kor_isnm', '')}) 갭{gap_rate:.1f}% 거래량{volume_ratio:.1f}배 변동률{change_rate:.1f}% {'[장전]' if is_pre_market else '[장중]'}")
+                        logger.info(f"🎯 갭 후보: {stock_code}({row.get('hts_kor_isnm', '')}) 갭{gap_rate:.1f}% 거래량{volume_ratio:.1f}배 변동률{change_rate:.1f}%")
                     else:
-                        if is_pre_market:
-                            logger.debug(f"종목 {stock_code}: 장전 조건 미달 - 변동률{change_rate:.1f}%")
-                        else:
-                            logger.debug(f"종목 {stock_code}: 장중 조건 미달 - 거래량{volume_ratio:.1f}배 변동률{change_rate:.1f}%")
+                        logger.debug(f"🎯 종목 {stock_code}: 엄격 조건 미달 - 거래량{volume_ratio:.1f}배 변동률{change_rate:.1f}% 볼륨{volume:,}주")
                 else:
-                    logger.debug(f"종목 {stock_code}: 갭 조건 미달 - {gap_rate:.2f}%")
+                    logger.debug(f"🎯 종목 {stock_code}: 갭 부족 - {gap_rate:.2f}%")
 
             except Exception as e:
-                logger.warning(f"종목 {stock_code} 갭 계산 오류: {e}")
+                logger.warning(f"🎯 종목 {stock_code} 갭 계산 오류: {e}")
                 continue
 
-        # 3단계: 갭 크기 기준 정렬
+        # 3단계: 🎯 수익성 점수 기준 정렬
         if gap_candidates:
             gap_df = pd.DataFrame(gap_candidates)
-            gap_df = gap_df.sort_values('gap_rate', ascending=False)  # 갭 크기 내림차순
-            logger.info(f"갭 트레이딩 후보 {len(gap_df)}개 발견")
+            gap_df = gap_df.sort_values('profit_score', ascending=False)  # 🎯 수익성 점수 내림차순
+            logger.info(f"🎯 엄격 갭 트레이딩 후보 {len(gap_df)}개 발견 (수익성 중심)")
             return gap_df
         else:
-            logger.info("갭 트레이딩 조건을 만족하는 종목 없음")
+            logger.info("🎯 엄격한 갭 트레이딩 조건을 만족하는 종목 없음")
             return pd.DataFrame()
 
     except Exception as e:
-        logger.error(f"갭 트레이딩 후보 조회 오류: {e}")
+        logger.error(f"🎯 갭 트레이딩 후보 조회 오류: {e}")
         return None
 
 
 def get_volume_breakout_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """거래량 돌파 후보 조회 (거래량 증가율 상위)"""
+    """거래량 돌파 후보 조회 - 🎯 수익성 중심 엄격한 기준"""
     return get_volume_rank(
         fid_input_iscd=market,
         fid_blng_cls_code="1",  # 거래증가율
-        fid_vol_cnt="10000"  # 1만주 이상
+        fid_vol_cnt="100000"    # 🎯 10만주 이상 (기존 1만주)
     )
 
 
 def get_momentum_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """모멘텀 후보 조회 (체결강도 상위)"""
+    """모멘텀 후보 조회 - 🎯 수익성 중심 엄격한 기준"""
     return get_volume_power_rank(
         fid_input_iscd=market,
-        fid_vol_cnt="5000"  # 5천주 이상
+        fid_vol_cnt="50000"     # 🎯 5만주 이상 (기존 5천주)
     )
 
 

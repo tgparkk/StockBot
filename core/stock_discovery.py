@@ -29,6 +29,7 @@ class StockDiscovery:
     def __init__(self, trading_api: KISRestAPIManager):
         """초기화"""
         self.trading_api = trading_api
+        self.data_manager = None  # 외부에서 설정
 
         # 종목 후보 관리 (스레드 안전)
         self.candidates: Dict[str, List[StockCandidate]] = {}
@@ -51,6 +52,10 @@ class StockDiscovery:
         self.screening_active = False
 
         logger.info("종목 탐색 관리자 초기화 완료")
+
+    def set_data_manager(self, data_manager):
+        """데이터 매니저 설정"""
+        self.data_manager = data_manager
 
     def start_background_screening(self):
         """백그라운드 스크리닝 시작"""
@@ -189,7 +194,28 @@ class StockDiscovery:
                         )
                         self.candidates[strategy_name] = sorted_candidates[:20]
 
-                logger.info("📊 장중 후보 업데이트 완료")
+                # 데이터 매니저 상태 업데이트 후 구독 현황 로그
+                if self.data_manager:
+                    websocket_status = self.data_manager.get_status()
+                    websocket_details = websocket_status.get('websocket_details', {})
+                    
+                    logger.info(
+                        f"📡 웹소켓 구독 현황: "
+                        f"연결={websocket_details.get('connected', False)}, "
+                        f"구독={websocket_details.get('subscription_count', 0)}/13종목, "
+                        f"사용량={websocket_details.get('usage_ratio', '0/41')}"
+                    )
+                    
+                    # 구독 중인 종목 목록 (최대 5개만 표시)
+                    subscribed_stocks = websocket_details.get('subscribed_stocks', [])
+                    if subscribed_stocks:
+                        displayed_stocks = subscribed_stocks[:5]
+                        stocks_text = ', '.join(displayed_stocks)
+                        if len(subscribed_stocks) > 5:
+                            stocks_text += f" 외 {len(subscribed_stocks)-5}개"
+                        logger.info(f"📡 웹소켓 구독 종목: {stocks_text}")
+
+                logger.info(f"📊 장중 후보 업데이트 완료")
 
         except Exception as e:
             logger.error(f"장중 스크리닝 오류: {e}")
@@ -233,7 +259,7 @@ class StockDiscovery:
             return []
 
     def _discover_gap_candidates(self) -> List[StockCandidate]:
-        """갭 트레이딩 후보 탐색"""
+        """갭 트레이딩 후보 탐색 - 🎯 수익성 검증 강화"""
         try:
             screening_results = self.trading_api.get_market_screening_candidates("gap")
             if not screening_results or screening_results.get('status') != 'success':
@@ -242,27 +268,44 @@ class StockDiscovery:
             candidates = []
             gap_data = screening_results.get('gap_candidates', [])
 
-            for stock_data in gap_data[:15]:  # 상위 15개
-                if stock_data.get('change_rate', 0) >= 1.5:  # 1.5% 이상 상승
+            for stock_data in gap_data[:10]:  # 🎯 상위 10개로 제한 (기존 15개)
+                # 🎯 엄격한 수익성 기준 적용
+                gap_rate = stock_data.get('gap_rate', 0)
+                change_rate = stock_data.get('change_rate', 0)
+                volume_ratio = stock_data.get('volume_ratio', 0)
+                current_price = stock_data.get('current_price', 0)
+                
+                # 🎯 수익성 검증 조건
+                if (gap_rate >= 2.5 and           # 갭 2.5% 이상
+                    change_rate >= 1.5 and       # 지속 상승 1.5% 이상
+                    volume_ratio >= 2.5 and      # 거래량 2.5배 이상
+                    1000 <= current_price <= 300000 and  # 적정 가격대
+                    self._validate_profit_potential(stock_data)):  # 🎯 수익성 검증
+                    
+                    # 🎯 수익성 점수 계산
+                    profit_score = (gap_rate * change_rate * volume_ratio) / 10
+                    
                     candidate = StockCandidate(
                         stock_code=stock_data['stock_code'],
                         strategy_type='gap_trading',
-                        score=stock_data.get('change_rate', 0),
-                        reason=f"상승률 {stock_data.get('change_rate', 0):.1f}%",
+                        score=profit_score,  # 🎯 수익성 점수 사용
+                        reason=f"고수익갭 {gap_rate:.1f}% 상승{change_rate:.1f}% 거래량{volume_ratio:.1f}배",
                         discovered_at=datetime.now(),
                         data=stock_data
                     )
                     candidates.append(candidate)
 
-            logger.info(f"갭 후보 탐색: {len(candidates)}개")
+            # 🎯 수익성 점수 기준 정렬
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            logger.info(f"🎯 엄격 갭 후보 탐색: {len(candidates)}개 (수익성 검증 완료)")
             return candidates
 
         except Exception as e:
-            logger.error(f"갭 후보 탐색 오류: {e}")
+            logger.error(f"🎯 갭 후보 탐색 오류: {e}")
             return []
 
     def _discover_volume_candidates(self) -> List[StockCandidate]:
-        """거래량 돌파 후보 탐색"""
+        """거래량 돌파 후보 탐색 - 🎯 수익성 검증 강화"""
         try:
             screening_results = self.trading_api.get_market_screening_candidates("volume")
             if not screening_results or screening_results.get('status') != 'success':
@@ -271,28 +314,40 @@ class StockDiscovery:
             candidates = []
             volume_data = screening_results.get('volume_candidates', [])
 
-            for stock_data in volume_data[:15]:  # 상위 15개
+            for stock_data in volume_data[:10]:  # 🎯 상위 10개로 제한 (기존 15개)
                 volume_increase_rate = stock_data.get('volume_increase_rate', 0)
-                if volume_increase_rate >= 100:  # 100% 이상 증가
+                change_rate = stock_data.get('change_rate', 0)
+                current_price = stock_data.get('current_price', 0)
+                
+                # 🎯 엄격한 거래량 돌파 조건
+                if (volume_increase_rate >= 300 and    # 거래량 300% 이상 증가 (기존 100%)
+                    change_rate >= 2.0 and             # 상승률 2% 이상
+                    1000 <= current_price <= 500000 and  # 적정 가격대
+                    self._validate_profit_potential(stock_data)):
+                    
+                    # 🎯 수익성 점수 계산
+                    profit_score = (volume_increase_rate * change_rate) / 50
+                    
                     candidate = StockCandidate(
                         stock_code=stock_data['stock_code'],
                         strategy_type='volume_breakout',
-                        score=volume_increase_rate,
-                        reason=f"거래량 {volume_increase_rate:.1f}% 증가",
+                        score=profit_score,
+                        reason=f"대량돌파 거래량{volume_increase_rate:.0f}% 상승{change_rate:.1f}%",
                         discovered_at=datetime.now(),
                         data=stock_data
                     )
                     candidates.append(candidate)
 
-            logger.info(f"거래량 후보 탐색: {len(candidates)}개")
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            logger.info(f"🎯 엄격 거래량 후보 탐색: {len(candidates)}개")
             return candidates
 
         except Exception as e:
-            logger.error(f"거래량 후보 탐색 오류: {e}")
+            logger.error(f"🎯 거래량 후보 탐색 오류: {e}")
             return []
 
     def _discover_momentum_candidates(self) -> List[StockCandidate]:
-        """모멘텀 후보 탐색"""
+        """모멘텀 후보 탐색 - 🎯 수익성 검증 강화"""
         try:
             screening_results = self.trading_api.get_market_screening_candidates("momentum")
             if not screening_results or screening_results.get('status') != 'success':
@@ -301,25 +356,72 @@ class StockDiscovery:
             candidates = []
             momentum_data = screening_results.get('momentum_candidates', [])
 
-            for stock_data in momentum_data[:15]:  # 상위 15개
+            for stock_data in momentum_data[:8]:  # 🎯 상위 8개로 제한 (기존 15개)
                 execution_strength = stock_data.get('execution_strength', 0)
-                if execution_strength >= 60:  # 60 이상
+                change_rate = stock_data.get('change_rate', 0)
+                current_price = stock_data.get('current_price', 0)
+                volume = stock_data.get('volume', 0)
+                
+                # 🎯 엄격한 모멘텀 조건
+                if (execution_strength >= 120 and      # 체결강도 120 이상 (기존 60)
+                    change_rate >= 2.5 and             # 상승률 2.5% 이상
+                    volume >= 100000 and               # 거래량 10만주 이상
+                    1000 <= current_price <= 200000 and  # 적정 가격대
+                    self._validate_profit_potential(stock_data)):
+                    
+                    # 🎯 수익성 점수 계산
+                    profit_score = (execution_strength * change_rate) / 20
+                    
                     candidate = StockCandidate(
                         stock_code=stock_data['stock_code'],
                         strategy_type='momentum',
-                        score=execution_strength,
-                        reason=f"체결강도 {execution_strength:.0f}",
+                        score=profit_score,
+                        reason=f"강모멘텀 체결강도{execution_strength:.0f} 상승{change_rate:.1f}%",
                         discovered_at=datetime.now(),
                         data=stock_data
                     )
                     candidates.append(candidate)
 
-            logger.info(f"모멘텀 후보 탐색: {len(candidates)}개")
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            logger.info(f"🎯 엄격 모멘텀 후보 탐색: {len(candidates)}개")
             return candidates
 
         except Exception as e:
-            logger.error(f"모멘텀 후보 탐색 오류: {e}")
+            logger.error(f"🎯 모멘텀 후보 탐색 오류: {e}")
             return []
+
+    def _validate_profit_potential(self, stock_data: Dict) -> bool:
+        """🎯 종목의 수익 잠재력 검증"""
+        try:
+            # 기본 필터링
+            stock_code = stock_data.get('stock_code', '')
+            if not stock_code:
+                return False
+            
+            # 가격 안정성 체크 (너무 급등한 종목 제외)
+            change_rate = stock_data.get('change_rate', 0)
+            if change_rate > 15:  # 15% 이상 급등 종목 제외 (고점일 가능성)
+                logger.debug(f"🎯 {stock_code}: 과도한 급등 제외 ({change_rate:.1f}%)")
+                return False
+            
+            # 거래량 급증 확인 (관심도 높음)
+            volume_ratio = stock_data.get('volume_ratio', 1)
+            if volume_ratio < 1.5:  # 거래량이 평소의 1.5배 미만이면 제외
+                logger.debug(f"🎯 {stock_code}: 거래량 부족 ({volume_ratio:.1f}배)")
+                return False
+            
+            # 종목명 필터링 (리스크 높은 종목 제외)
+            stock_name = stock_data.get('stock_name', '').upper()
+            risky_keywords = ['ETN', 'ETF', 'SPAC', '스팩', '리츠', 'REIT']
+            if any(keyword in stock_name for keyword in risky_keywords):
+                logger.debug(f"🎯 {stock_code}: 리스크 종목 제외 ({stock_name})")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"🎯 수익성 검증 오류: {e}")
+            return False
 
     def _analyze_gap_potential(self, background_data: List[Dict]) -> List[StockCandidate]:
         """갭 잠재력 분석"""
