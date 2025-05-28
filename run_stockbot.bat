@@ -66,7 +66,7 @@ if errorlevel 1 (
 )
 
 :: 데이터베이스 초기화 확인
-if not exist "database\stockbot.db" (
+if not exist "data\stockbot.db" (
     echo.
     echo 📊 데이터베이스 초기화 중...
     python database\init_db.py

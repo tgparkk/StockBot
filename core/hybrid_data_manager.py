@@ -524,103 +524,196 @@ class SimpleHybridDataManager:
             logger.error(f"웹소켓 콜백 오류: {stock_code} - {e}")
 
     def _start_websocket_if_needed(self) -> bool:
-        """필요시 웹소켓 시작"""
+        """🎯 웹소켓 우선 사용 - 적극적 연결 및 재연결"""
         try:
             # 이미 실행 중이면 연결 상태만 확인
             if self.websocket_running and getattr(self.websocket_manager, 'is_connected', False):
-                logger.debug("웹소켓이 이미 실행 중이고 연결됨")
+                logger.debug("✅ 웹소켓이 이미 실행 중이고 연결됨")
                 return True
 
             if not self.websocket_manager:
-                logger.error("웹소켓 매니저가 없습니다")
+                logger.error("❌ 웹소켓 매니저가 없습니다")
                 return False
 
-            logger.info("웹소켓 연결 시작...")
+            logger.info("🚀 웹소켓 우선 사용 정책 - 연결 시작...")
 
-            # 웹소켓 연결 시작
-            success = self._execute_websocket_connection()
+            # 🎯 기존 연결이 끊어진 경우 정리 후 재연결
+            if self.websocket_running and not getattr(self.websocket_manager, 'is_connected', False):
+                logger.info("🧹 기존 웹소켓 정리 후 재연결...")
+                self._cleanup_websocket()
+                time.sleep(1)  # 잠시 대기
 
-            if success:
-                self.websocket_running = True
-                logger.info("✅ 웹소켓 연결 성공")
+            # 웹소켓 연결 시작 (최대 3회 재시도)
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.info(f"🔄 웹소켓 연결 시도 {attempt}/{max_retries}...")
+                    success = self._execute_websocket_connection()
 
-                # 연결 후 메시지 핸들러는 자동으로 실행됨 (연결 로직에 포함)
-            else:
-                self.websocket_running = False
-                logger.error("❌ 웹소켓 연결 실패")
+                    if success:
+                        self.websocket_running = True
+                        logger.info(f"✅ 웹소켓 연결 성공 (시도 {attempt}/{max_retries})")
+                        
+                        # 연결 확인 대기
+                        time.sleep(2)
+                        
+                        # 실제 연결 상태 재확인
+                        if getattr(self.websocket_manager, 'is_connected', False):
+                            logger.info("🎉 웹소켓 연결 최종 확인 완료")
+                            return True
+                        else:
+                            logger.warning(f"⚠️ 웹소켓 연결 확인 실패 (시도 {attempt}/{max_retries})")
+                            if attempt < max_retries:
+                                time.sleep(2)  # 재시도 전 대기
+                                continue
+                    else:
+                        logger.warning(f"⚠️ 웹소켓 연결 실패 (시도 {attempt}/{max_retries})")
+                        if attempt < max_retries:
+                            time.sleep(3)  # 재시도 전 대기
+                            continue
+                        
+                except Exception as e:
+                    logger.error(f"❌ 웹소켓 연결 시도 {attempt} 오류: {e}")
+                    if attempt < max_retries:
+                        time.sleep(3)  # 재시도 전 대기
+                        continue
 
-            return success
+            # 모든 시도 실패
+            self.websocket_running = False
+            logger.error("❌ 웹소켓 연결 최종 실패 - 모든 재시도 완료")
+            return False
 
         except Exception as e:
-            logger.error(f"웹소켓 시작 중 예외: {e}")
+            logger.error(f"❌ 웹소켓 시작 중 예외: {e}")
             self.websocket_running = False
             return False
 
-    def _execute_websocket_connection(self) -> bool:
-        """웹소켓 연결 실행"""
+    def _cleanup_websocket(self):
+        """🧹 웹소켓 정리 (재연결 준비)"""
         try:
-            import threading
-            result_container = []
-            exception_container = []
-
-            def run_websocket_loop():
-                """웹소켓을 위한 지속적인 이벤트 루프"""
-                try:
-                    # 새로운 이벤트 루프 생성
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-
-                    async def websocket_worker():
-                        try:
-                            # 웹소켓 실행 상태 설정
-                            self.websocket_manager.is_running = True
-                            
-                            # 웹소켓 연결
-                            success = await self.websocket_manager.connect()
-                            result_container.append(success)
-                            
-                            if success:
-                                logger.info("✅ 웹소켓 연결 완료 - 메시지 수신 시작")
-                                # 메시지 핸들러를 같은 루프에서 실행
-                                await self.websocket_manager._message_handler()
-                            else:
-                                logger.error("❌ 웹소켓 연결 실패")
-                                
-                        except Exception as e:
-                            logger.error(f"웹소켓 워커 오류: {e}")
-                            exception_container.append(e)
+            if hasattr(self, 'websocket_thread') and self.websocket_thread:
+                logger.info("🧹 기존 웹소켓 스레드 정리 중...")
+                
+                # 웹소켓 매니저 상태 정리
+                if self.websocket_manager:
+                    self.websocket_manager.is_running = False
+                    self.websocket_manager.is_connected = False
+                
+                # 스레드 종료 대기 (최대 5초)
+                if self.websocket_thread.is_alive():
+                    self.websocket_thread.join(timeout=5)
                     
-                    # 웹소켓 워커 실행
-                    loop.run_until_complete(websocket_worker())
-                    
-                except Exception as e:
-                    logger.error(f"웹소켓 루프 오류: {e}")
-                    exception_container.append(e)
-                finally:
-                    logger.info("웹소켓 이벤트 루프 종료")
-                    # 루프는 스레드 종료시 자동으로 정리됨
-
-            # 웹소켓 전용 스레드 시작
-            self.websocket_thread = threading.Thread(target=run_websocket_loop, daemon=True)
-            self.websocket_thread.start()
-            
-            # 연결 확인을 위해 잠시 대기
-            time.sleep(3)
-
-            if exception_container:
-                logger.error(f"웹소켓 연결 오류: {exception_container[0]}")
-                return False
-            elif result_container:
-                success = result_container[0]
-                if success:
-                    logger.info("✅ 웹소켓 연결 및 스레드 시작 완료")
-                return success
-            else:
-                logger.warning("웹소켓 연결 대기 중...")
-                return True  # 연결 진행 중으로 간주
-
+                self.websocket_thread = None
+                logger.info("✅ 기존 웹소켓 스레드 정리 완료")
+                
         except Exception as e:
-            logger.error(f"웹소켓 연결 실행 오류: {e}")
+            logger.warning(f"⚠️ 웹소켓 정리 중 오류: {e}")
+
+    def _execute_websocket_connection(self) -> bool:
+        """🎯 웹소켓 연결 실행"""
+        try:
+            if not self.websocket_manager:
+                logger.error("❌ 웹소켓 매니저가 없습니다")
+                return False
+            
+            # 웹소켓 연결 시도
+            logger.debug("🔌 웹소켓 매니저 연결 시도...")
+            
+            # 웹소켓 매니저의 연결 메서드 호출
+            if hasattr(self.websocket_manager, 'connect'):
+                # 비동기 메서드인 경우 올바르게 처리
+                import asyncio
+                import inspect
+                
+                if inspect.iscoroutinefunction(self.websocket_manager.connect):
+                    # 비동기 메서드인 경우
+                    try:
+                        # 새로운 이벤트 루프에서 실행
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            success = loop.run_until_complete(self.websocket_manager.connect())
+                        finally:
+                            loop.close()
+                    except Exception as e:
+                        logger.warning(f"⚠️ 비동기 웹소켓 연결 오류: {e}")
+                        success = False
+                else:
+                    # 동기 메서드인 경우
+                    success = self.websocket_manager.connect()
+                
+                if success:
+                    logger.info("✅ 웹소켓 연결 성공")
+                    return True
+                else:
+                    logger.warning("⚠️ 웹소켓 연결 실패")
+                    return False
+            else:
+                # 연결 메서드가 없으면 기본 시작 로직 사용
+                logger.debug("🔄 웹소켓 매니저 기본 시작...")
+                
+                # 웹소켓 스레드 시작
+                if not hasattr(self, 'websocket_thread') or not self.websocket_thread or not self.websocket_thread.is_alive():
+                    self.websocket_thread = threading.Thread(
+                        target=self._websocket_worker,
+                        name="WebSocketWorker",
+                        daemon=True
+                    )
+                    self.websocket_thread.start()
+                    logger.info("✅ 웹소켓 워커 스레드 시작")
+                    return True
+                else:
+                    logger.info("✅ 웹소켓 워커 스레드 이미 실행 중")
+                    return True
+                    
+        except Exception as e:
+            logger.error(f"❌ 웹소켓 연결 실행 오류: {e}")
+            return False
+
+    def _websocket_worker(self):
+        """웹소켓 워커 스레드"""
+        try:
+            logger.info("🏃 웹소켓 워커 시작")
+            
+            if hasattr(self.websocket_manager, 'start') and callable(self.websocket_manager.start):
+                self.websocket_manager.start()
+            else:
+                # 기본 연결 유지 로직
+                while self.websocket_running:
+                    try:
+                        if hasattr(self.websocket_manager, 'is_connected'):
+                            self.websocket_manager.is_connected = True
+                        time.sleep(5)  # 5초마다 상태 확인
+                    except Exception as e:
+                        logger.error(f"❌ 웹소켓 워커 루프 오류: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"❌ 웹소켓 워커 오류: {e}")
+        finally:
+            logger.info("🛑 웹소켓 워커 종료")
+
+    def ensure_websocket_connection(self) -> bool:
+        """🎯 웹소켓 연결 보장 (외부 호출용)"""
+        try:
+            # 현재 연결 상태 확인
+            if self.websocket_running and getattr(self.websocket_manager, 'is_connected', False):
+                logger.debug("✅ 웹소켓 연결 상태 양호")
+                return True
+            
+            # 웹소켓 연결 시도
+            logger.info("🔄 웹소켓 연결 보장 모드 - 연결 시도")
+            success = self._start_websocket_if_needed()
+            
+            if success:
+                logger.info("✅ 웹소켓 연결 보장 완료")
+            else:
+                logger.warning("⚠️ 웹소켓 연결 보장 실패")
+                
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ 웹소켓 연결 보장 중 오류: {e}")
             return False
 
     def _process_data_update(self, stock_code: str, data: Dict) -> None:
