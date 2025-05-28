@@ -152,7 +152,7 @@ D:\GIT\StockBot\
 │       └── ensemble.py     # 앙상블 매니저
 ├── telegram/
 │   ├── __init__.py
-│   └── bot.py             # 텔레그램 봇
+│   └── telegram_manager.py    # 텔레그램 봇 관리자
 ├── database/
 │   ├── __init__.py
 │   ├── db_models.py          # DB 모델
@@ -419,7 +419,7 @@ StockBot/
 │   ├── db_manager.py         # 데이터베이스 매니저
 │   └── init_db.py            # 초기화 스크립트
 ├── telegram_bot/             # 텔레그램 봇
-│   └── bot.py                # 봇 구현체
+│   └── telegram_manager.py    # 텔레그램 봇 관리자
 ├── utils/                     # 유틸리티
 │   └── logger.py             # 로깅 시스템
 └── logs/                      # 로그 파일들
