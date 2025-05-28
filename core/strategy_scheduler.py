@@ -5,15 +5,16 @@
 import asyncio
 import threading
 from datetime import datetime, time
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING, Callable
 from enum import Enum
 from utils.logger import setup_logger
 from .time_slot_manager import TimeSlotManager, TimeSlotConfig
 from .stock_discovery import StockDiscovery, StockCandidate
 from core.rest_api_manager import KISRestAPIManager
 from core.hybrid_data_manager import SimpleHybridDataManager
+from core.data_priority import DataPriority
 from core.technical_indicators import TechnicalIndicators
-from database.db_models import DataPriority
+from core.trade_database import TradeDatabase
 import time as time_module  # time 모듈과 구분
 
 # 순환 import 방지
@@ -39,6 +40,10 @@ class StrategyScheduler:
         # 관리자들
         self.time_manager = TimeSlotManager()
         self.stock_discovery = StockDiscovery(trading_api)
+        self.stock_discovery.set_data_manager(data_manager)  # 데이터 매니저 연결
+
+        # 🆕 거래 데이터베이스 (종목 선정 기록용)
+        self.trade_db = TradeDatabase()
 
         # 스케줄러 상태
         self.scheduler_running = False
@@ -81,6 +86,12 @@ class StrategyScheduler:
         """메인 스케줄링 루프"""
         logger.info("🔄 메인 스케줄링 루프 시작")
 
+        # 시작 시 현재 활성 시간대 확인 및 즉시 실행
+        current_slot = self.time_manager.get_current_time_slot()
+        if current_slot:
+            logger.info(f"🚀 시작 시 활성 시간대 발견: {current_slot.name} - 즉시 전략 실행")
+            await self._execute_time_slot_strategy()
+
         while self.scheduler_running:
             try:
                 # 다음 준비 시간 계산
@@ -99,15 +110,16 @@ class StrategyScheduler:
                             await asyncio.sleep(wait_time)
                             sleep_seconds -= wait_time
                     else:
+                        logger.info(f"⏰ 다음 전략 준비까지 {sleep_seconds}초 대기")
                         await asyncio.sleep(sleep_seconds)
 
                     # 전략 실행
                     if self.scheduler_running:
                         await self._execute_time_slot_strategy()
                 else:
-                    # 장외 시간 - 30분 대기
-                    logger.info("💤 장외 시간 - 30분 대기")
-                    await asyncio.sleep(1800)
+                    # 장외 시간 - 10분 대기 후 재확인
+                    logger.info("💤 장외 시간 - 10분 대기")
+                    await asyncio.sleep(600)
 
             except Exception as e:
                 logger.error(f"스케줄링 루프 오류: {e}")
@@ -201,6 +213,8 @@ class StrategyScheduler:
     async def _discover_single_strategy(self, strategy_name: str, weight: float):
         """단일 전략 종목 탐색"""
         try:
+            logger.info(f"🔍 {strategy_name} 전략 후보 탐색 시작 (가중치: {weight})")
+            
             # 별도 스레드에서 탐색 실행
             loop = asyncio.get_event_loop()
             candidates = await loop.run_in_executor(
@@ -213,9 +227,77 @@ class StrategyScheduler:
                 stock_codes = [c.stock_code for c in candidates]
                 self.active_stocks[strategy_name] = stock_codes
                 logger.info(f"✅ {strategy_name} 전략: {len(stock_codes)}개 종목 발견")
+                
+                # 후보 종목 상세 로그
+                for i, candidate in enumerate(candidates[:5]):  # 상위 5개만 로그
+                    logger.info(f"   {i+1}. {candidate.stock_code} - {candidate.reason} (점수: {candidate.score:.1f})")
+                    
+                if len(candidates) > 5:
+                    logger.info(f"   ... 외 {len(candidates)-5}개 종목")
+
+                # 🆕 데이터베이스에 종목 선정 기록 저장
+                await self._record_selected_stocks(strategy_name, candidates)
+            else:
+                logger.warning(f"⚠️ {strategy_name} 전략: 후보 없음")
 
         except Exception as e:
             logger.error(f"단일 전략 탐색 오류 ({strategy_name}): {e}")
+
+    async def _record_selected_stocks(self, strategy_name: str, candidates: List):
+        """선정된 종목들을 데이터베이스에 기록"""
+        try:
+            if not candidates or not self.current_slot:
+                return
+
+            # 시간대 정보 준비
+            slot_name = self.current_slot.name
+            slot_start = str(self.current_slot.start_time)
+            slot_end = str(self.current_slot.end_time)
+
+            # 후보 종목들을 딕셔너리 형태로 변환
+            stock_records = []
+            for candidate in candidates:
+                # StockCandidate 객체에서 필요한 정보 추출
+                record = {
+                    'stock_code': candidate.stock_code,
+                    'stock_name': getattr(candidate, 'stock_name', candidate.stock_code),
+                    'strategy_type': strategy_name,
+                    'score': candidate.score,
+                    'reason': candidate.reason,
+                    'current_price': getattr(candidate, 'current_price', 0),
+                    'change_rate': getattr(candidate, 'change_rate', 0.0),
+                    'volume': getattr(candidate, 'volume', 0),
+                    'volume_ratio': getattr(candidate, 'volume_ratio', 0.0),
+                    'market_cap': getattr(candidate, 'market_cap', 0),
+                    
+                    # 전략별 특화 지표
+                    'gap_rate': getattr(candidate, 'gap_rate', 0.0),
+                    'momentum_strength': getattr(candidate, 'momentum_strength', 0.0),
+                    'breakout_volume': getattr(candidate, 'breakout_volume', 0.0),
+                    
+                    # 기술적 신호 (있다면)
+                    'technical_signals': getattr(candidate, 'technical_signals', {}),
+                    
+                    # 메모
+                    'notes': f"가중치: {weight}, 전략: {strategy_name}"
+                }
+                stock_records.append(record)
+
+            # 별도 스레드에서 데이터베이스 기록 실행 (비동기 처리)
+            loop = asyncio.get_event_loop()
+            recorded_ids = await loop.run_in_executor(
+                None,
+                self.trade_db.record_selected_stocks,
+                slot_name, slot_start, slot_end, stock_records
+            )
+
+            if recorded_ids:
+                logger.info(f"💾 {strategy_name} 전략 종목 선정 기록 완료: {len(recorded_ids)}개")
+            else:
+                logger.warning(f"⚠️ {strategy_name} 전략 종목 선정 기록 실패")
+
+        except Exception as e:
+            logger.error(f"종목 선정 기록 오류 ({strategy_name}): {e}")
 
     async def _activate_strategies(self, slot: TimeSlotConfig):
         """전략 활성화"""
@@ -233,23 +315,67 @@ class StrategyScheduler:
         """단일 전략 활성화"""
         try:
             stock_codes = self.active_stocks.get(strategy_name, [])
+            
+            if not stock_codes:
+                logger.warning(f"⚠️ {strategy_name} 전략: 활성화할 종목 없음")
+                return
+                
+            logger.info(f"🎯 {strategy_name} 전략 활성화 시작: {len(stock_codes)}개 종목")
 
+            successful_subscriptions = 0
+            
             for i, stock_code in enumerate(stock_codes):
-                # 데이터 관리자에 종목 추가 (우선순위와 실시간 여부 설정)
-                callback = self._create_strategy_callback(strategy_name)
+                try:
+                    # 데이터 관리자에 종목 추가 (우선순위와 실시간 여부 설정)
+                    callback = self._create_strategy_callback(strategy_name)
 
-                # 우선순위 결정 (DataPriority 사용)
-                priority = self._get_data_priority(strategy_name, i)
+                    # 우선순위 결정 (DataPriority 사용)
+                    priority = self._get_data_priority(strategy_name, i)
 
-                # add_stock_request 사용 (DataPriority 기반)
-                self.data_manager.add_stock_request(
-                    stock_code=stock_code,
-                    priority=priority,
-                    strategy_name=strategy_name,
-                    callback=callback
+                    logger.info(f"   📊 {stock_code} 구독 시도 (우선순위: {priority.value})")
+
+                    # add_stock_request 사용 (DataPriority 기반)
+                    success = self.data_manager.add_stock_request(
+                        stock_code=stock_code,
+                        priority=priority,
+                        strategy_name=strategy_name,
+                        callback=callback
+                    )
+                    
+                    if success:
+                        successful_subscriptions += 1
+                        logger.info(f"   ✅ {stock_code} 구독 성공")
+                        
+                        # 🆕 데이터베이스에 활성화 상태 업데이트
+                        try:
+                            self.trade_db.update_stock_activation(stock_code, True, True)
+                        except Exception as e:
+                            logger.error(f"활성화 상태 업데이트 오류 ({stock_code}): {e}")
+                    else:
+                        logger.warning(f"   ❌ {stock_code} 구독 실패")
+                        
+                        # 🆕 데이터베이스에 활성화 실패 상태 업데이트
+                        try:
+                            self.trade_db.update_stock_activation(stock_code, True, False)
+                        except Exception as e:
+                            logger.error(f"활성화 실패 상태 업데이트 오류 ({stock_code}): {e}")
+                        
+                except Exception as e:
+                    logger.error(f"   ❌ {stock_code} 구독 중 오류: {e}")
+
+            logger.info(f"🎯 {strategy_name} 전략 활성화 완료: {successful_subscriptions}/{len(stock_codes)}개 성공")
+
+            # 전략 활성화 후 웹소켓 구독 상태 확인
+            if self.data_manager:
+                websocket_status = self.data_manager.get_status()
+                websocket_details = websocket_status.get('websocket_details', {})
+                
+                logger.info(
+                    f"📡 [{strategy_name}] 웹소켓 상태: "
+                    f"연결={websocket_details.get('connected', False)}, "
+                    f"구독={websocket_details.get('subscription_count', 0)}/13종목, "
+                    f"사용량={websocket_details.get('usage_ratio', '0/41')}"
                 )
-
-            logger.info(f"🎯 {strategy_name} 전략 활성화: {len(stock_codes)}개 종목")
 
             # 활성화 직후 즉시 신호 체크 시작
             asyncio.create_task(self._monitor_strategy_signals(strategy_name, stock_codes))
@@ -320,19 +446,56 @@ class StrategyScheduler:
         except Exception as e:
             logger.error(f"{strategy_name} 신호 모니터링 오류: {e}")
 
-    def _create_strategy_callback(self, strategy_name: str):
-        """전략별 콜백 생성"""
-        def callback(stock_code: str, data: Dict, source: str):
+    def _create_strategy_callback(self, strategy_name: str) -> Callable:
+        """전략별 콜백 함수 생성"""
+        def strategy_callback(stock_code: str, data: Dict, source: str = 'websocket') -> None:
+            """전략별 데이터 콜백"""
             try:
-                # 간단한 신호 생성
-                signal = self._generate_simple_signal(strategy_name, stock_code, data)
-                if signal:
-                    # 봇에게 신호 전달 (통합 버전 사용)
-                    self.send_signal_to_main_bot(signal, source="realtime_callback")
-            except Exception as e:
-                logger.error(f"콜백 오류: {strategy_name} {stock_code} - {e}")
+                # 기본 데이터 검증
+                if not data or data.get('status') != 'success':
+                    return
 
-        return callback
+                current_price = data.get('current_price', 0)
+                if current_price <= 0:
+                    return
+
+                # 신호 중복 방지 체크
+                if not self._should_process_signal(stock_code, strategy_name):
+                    return
+
+                # 기본 시장 데이터 생성
+                market_data = {
+                    'stock_code': stock_code,
+                    'current_price': current_price,
+                    'volume': data.get('volume', 0),
+                    'change_rate': data.get('change_rate', 0),
+                    'timestamp': data.get('timestamp', time_module.time()),
+                    'source': source
+                }
+
+                # 전략별 신호 생성 로직
+                signal = self._generate_strategy_signal(strategy_name, market_data)
+                
+                if signal:
+                    logger.info(f"🎯 {strategy_name} 신호 생성: {stock_code} {signal['signal_type']} @ {current_price:,}원")
+                    
+                    # 봇 인스턴스에 신호 전달
+                    if self.bot_instance:
+                        self.bot_instance.handle_trading_signal(signal)
+                    
+                    # 신호 히스토리 업데이트
+                    with self.signal_lock:
+                        self.signal_history[stock_code] = {
+                            'last_signal_time': time_module.time(),
+                            'last_signal_type': signal['signal_type'],
+                            'cooldown_until': time_module.time() + self.signal_cooldown,
+                            'strategy': strategy_name
+                        }
+
+            except Exception as e:
+                logger.error(f"전략 콜백 오류 ({strategy_name}, {stock_code}): {e}")
+
+        return strategy_callback
 
     def _generate_simple_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
         """간단한 신호 생성 (기술적 지표 통합 버전)"""
@@ -442,6 +605,56 @@ class StrategyScheduler:
 
         except Exception as e:
             logger.error(f"신호 생성 오류: {strategy_name} {stock_code} - {e}")
+            return None
+
+    def _should_process_signal(self, stock_code: str, strategy_name: str) -> bool:
+        """신호 처리 여부 판단 (중복 방지)"""
+        try:
+            with self.signal_lock:
+                current_time = time_module.time()
+                
+                # 기존 히스토리 확인
+                if stock_code in self.signal_history:
+                    history = self.signal_history[stock_code]
+                    
+                    # 쿨다운 시간 체크
+                    cooldown_until = history.get('cooldown_until', 0)
+                    if current_time < cooldown_until:
+                        return False
+                    
+                    # 1분 이내 같은 전략 중복 체크
+                    last_signal_time = history.get('last_signal_time', 0)
+                    last_strategy = history.get('strategy', '')
+                    
+                    if (strategy_name == last_strategy and 
+                        current_time - last_signal_time < 60):
+                        return False
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"신호 처리 여부 판단 오류: {e}")
+            return True  # 오류시 허용
+
+    def _generate_strategy_signal(self, strategy_name: str, market_data: Dict) -> Optional[Dict]:
+        """전략별 신호 생성 (콜백용)"""
+        try:
+            stock_code = market_data['stock_code']
+            current_price = market_data['current_price']
+            change_rate = market_data['change_rate']
+            
+            # 기본 신호 생성 로직 사용
+            data_for_signal = {
+                'current_price': current_price,
+                'change_rate': change_rate,
+                'volume': market_data.get('volume', 0),
+                'timestamp': market_data.get('timestamp', time_module.time())
+            }
+            
+            return self._generate_simple_signal(strategy_name, stock_code, data_for_signal)
+            
+        except Exception as e:
+            logger.error(f"전략별 신호 생성 오류: {e}")
             return None
 
     def send_signal_to_main_bot(self, signal: Dict, source: str = "unknown"):

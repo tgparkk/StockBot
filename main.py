@@ -11,6 +11,7 @@ import asyncio
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Dict
 
 # 프로젝트 루트 경로 설정
 project_root = Path(__file__).parent
@@ -26,13 +27,16 @@ from core.strategy_scheduler import StrategyScheduler
 from core.rest_api_manager import KISRestAPIManager
 from core.hybrid_data_manager import SimpleHybridDataManager
 from core.kis_websocket_manager import KISWebSocketManager
+from core.data_priority import DataPriority
+from core.stock_discovery import StockDiscovery
+from core.trade_database import TradeDatabase
 
 # 텔레그램 봇
 from telegram_bot.bot import TelegramBot
 
 # 설정
 from config.settings import (
-    IS_DEMO, TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID, LOG_LEVEL
+    IS_DEMO, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LOG_LEVEL
 )
 
 logger = setup_logger(__name__)
@@ -61,26 +65,33 @@ class StockBot:
         # 4. 포지션 관리자
         self.position_manager = PositionManager(self.trading_manager)
 
-        # 5. 전략 스케줄러 (핵심!)
-        self.strategy_scheduler = StrategyScheduler(self.rest_api, self.data_manager)
-        self.strategy_scheduler.set_bot_instance(self)
-
-        # 6. 웹소켓 관리자 (선택적)
+        # 5. 웹소켓 관리자 (선택적)
         self.websocket_manager = None
         try:
-            self.websocket_manager = KISWebSocketManager(is_demo=is_demo)
-            logger.info("✅ WebSocket 관리자 초기화 완료")
+            self.websocket_manager = KISWebSocketManager()
+            # 🔧 데이터 매니저에 웹소켓 매니저 연결
+            self.data_manager.websocket_manager = self.websocket_manager
+            logger.info("✅ WebSocket 관리자 초기화 및 연결 완료")
         except Exception as e:
             logger.warning(f"⚠️ WebSocket 관리자 초기화 실패: {e}")
 
+        # 6. 전략 스케줄러 (핵심!)
+        self.strategy_scheduler = StrategyScheduler(self.rest_api, self.data_manager)
+        self.strategy_scheduler.set_bot_instance(self)
+
         # 7. 텔레그램 봇 (선택적)
         self.telegram_bot = None
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
-                self.telegram_bot = TelegramBot(stock_bot_instance=self)
+                self.telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+                # 🎯 메인 봇 참조 설정 (데이터베이스 접근용)
+                self.telegram_bot.set_main_bot_reference(self)
+                # 텔레그램 봇은 별도 스레드에서 시작
                 logger.info("✅ 텔레그램 봇 초기화 완료")
             except Exception as e:
                 logger.warning(f"⚠️ 텔레그램 봇 초기화 실패: {e}")
+        else:
+            logger.info("⚠️ 텔레그램 설정 누락 - 봇 비활성화")
 
         # 통계
         self.stats = {
@@ -91,7 +102,127 @@ class StockBot:
             'positions_closed': 0
         }
 
+        # 중복 매도 방지용 추적
+        self.pending_sell_orders = set()  # 매도 주문 중인 종목들
+
+        # 🎯 거래 데이터베이스 초기화
+        self.trade_db = TradeDatabase()
+        
+        # 데이터 매니저 초기화
+
         logger.info("🚀 StockBot 초기화 완료!")
+
+
+
+    async def _setup_existing_positions(self):
+        """보유 종목 자동 모니터링 설정"""
+        try:
+            logger.info("📊 보유 종목 모니터링 설정 시작")
+            
+            # 현재 보유 종목 조회
+            balance = self.trading_manager.get_balance()
+            holdings = balance.get('holdings', [])
+            
+            if not holdings:
+                logger.info("보유 종목이 없습니다.")
+                return
+            
+            logger.info(f"📈 보유 종목 {len(holdings)}개 발견 - 자동 모니터링 설정")
+            
+            # 포지션 매니저에 보유 종목 추가 (KIS API 응답 구조에 맞게 수정)
+            for holding in holdings:
+                stock_code = holding.get('pdno', '')  # KIS API: 상품번호(종목코드)
+                stock_name = holding.get('prdt_name', '')  # KIS API: 상품명
+                quantity = int(holding.get('hldg_qty', 0))  # KIS API: 보유수량
+                current_price = int(holding.get('prpr', 0))  # KIS API: 현재가
+                avg_price = int(float(holding.get('pchs_avg_pric', current_price)))  # KIS API: 매입평균가격
+                
+                if stock_code and quantity > 0:
+                    # 🆕 데이터베이스에 기존 보유 종목 매수 기록 저장 (중복 체크)
+                    try:
+                        trade_id = self.trade_db.record_existing_position_if_not_exists(
+                            stock_code=stock_code,
+                            stock_name=stock_name,
+                            quantity=quantity,
+                            avg_price=avg_price,
+                            current_price=current_price
+                        )
+                        
+                        if trade_id > 0:
+                            logger.info(f"💾 기존 보유 종목 DB 기록: {stock_code}({stock_name}) {quantity:,}주 @ {avg_price:,}원 (ID: {trade_id})")
+                        elif trade_id == -1:
+                            logger.debug(f"📝 기존 보유 종목 이미 기록됨: {stock_code}")
+                        
+                    except Exception as e:
+                        logger.error(f"기존 보유 종목 DB 기록 오류 ({stock_code}): {e}")
+                    
+                    # 포지션 매니저에 추가 (기존 보유)
+                    self.position_manager.add_position(
+                        stock_code=stock_code,
+                        quantity=quantity,
+                        buy_price=avg_price,
+                        strategy_type="existing_holding"
+                    )
+                    
+                    # 웹소켓 실시간 모니터링 추가 (높은 우선순위)
+                    callback = self._create_position_monitoring_callback(stock_code)
+                    success = self.data_manager.add_stock_request(
+                        stock_code=stock_code,
+                        priority=DataPriority.HIGH,
+                        strategy_name="position_monitoring",
+                        callback=callback
+                    )
+                    
+                    if success:
+                        logger.info(f"✅ 보유종목 모니터링 추가: {stock_code}({stock_name}) {quantity:,}주 @ {avg_price:,}원")
+                    else:
+                        logger.warning(f"⚠️ 보유종목 모니터링 추가 실패: {stock_code}")
+            
+            logger.info(f"📊 보유 종목 자동 모니터링 설정 완료: {len(holdings)}개")
+            
+        except Exception as e:
+            logger.error(f"보유 종목 모니터링 설정 오류: {e}")
+
+    def _create_position_monitoring_callback(self, stock_code: str) -> Callable:
+        """보유 종목 모니터링용 콜백 생성"""
+        def position_callback(stock_code: str, data: Dict, source: str = 'websocket') -> None:
+            """보유 종목 모니터링 콜백"""
+            try:
+                # 기본 데이터 검증
+                if not data or data.get('status') != 'success':
+                    return
+
+                current_price = data.get('current_price', 0)
+                if current_price <= 0:
+                    return
+
+                # 포지션 정보 업데이트
+                existing_positions = self.position_manager.get_positions('active')
+                if stock_code not in existing_positions:
+                    return
+                
+                position = existing_positions[stock_code]
+                buy_price = position.get('buy_price', 0)
+                quantity = position.get('quantity', 0)
+                
+                if buy_price <= 0 or quantity <= 0:
+                    return
+                
+                # 수익률 계산
+                profit_rate = ((current_price - buy_price) / buy_price) * 100
+                
+                # 포지션 정보 업데이트 (내부적으로 처리됨)
+                # position_manager.update_position_prices()에서 자동 처리
+                
+                # 매도 조건 체크 (기존 로직 활용)
+                # _position_worker에서 자동으로 매도 조건을 체크하므로 별도 처리 불필요
+                
+                logger.debug(f"📊 보유종목 업데이트: {stock_code} {current_price:,}원 (수익률: {profit_rate:.2f}%)")
+                
+            except Exception as e:
+                logger.error(f"보유종목 모니터링 콜백 오류 ({stock_code}): {e}")
+
+        return position_callback
 
     def start(self):
         """StockBot 시작"""
@@ -225,12 +356,16 @@ class StockBot:
             logger.error(f"❌ 텔레그램 봇 시작 오류: {e}")
 
     def _start_strategy_scheduler(self):
-        """전략 스케줄러 시작"""
+        """전략 스케줄러 시작 (보유 종목 모니터링 포함)"""
         try:
             def run_strategy_scheduler():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
+                    # 🆕 보유 종목 자동 모니터링 설정
+                    loop.run_until_complete(self._setup_existing_positions())
+                    
+                    # 전략 스케줄러 시작
                     loop.run_until_complete(self.strategy_scheduler.start_scheduler())
                 except Exception as e:
                     logger.error(f"전략 스케줄러 실행 오류: {e}")
@@ -243,7 +378,7 @@ class StockBot:
                 daemon=True
             )
             scheduler_thread.start()
-            logger.info("✅ 전략 스케줄러 시작 완료")
+            logger.info("✅ 전략 스케줄러 시작 완료 (보유종목 모니터링 포함)")
         except Exception as e:
             logger.error(f"❌ 전략 스케줄러 시작 오류: {e}")
 
@@ -286,42 +421,71 @@ class StockBot:
                 sell_signals = self.position_manager.check_exit_conditions()
                 for sell_signal in sell_signals:
                     try:
-                        logger.info(f"🚨 매도 조건 발생: {sell_signal['stock_code']} - {sell_signal['reason']}")
+                        stock_code = sell_signal['stock_code']
+                        logger.info(f"🚨 매도 조건 발생: {stock_code} - {sell_signal['reason']}")
+
+                        # 🔒 중복 매도 방지 체크
+                        if stock_code in self.pending_sell_orders:
+                            logger.warning(f"⚠️ 이미 매도 주문 진행 중: {stock_code} - 중복 매도 방지")
+                            continue
+
+                        # 📊 실제 보유 수량 확인 (중요!)
+                        actual_quantity = self._get_actual_holding_quantity(stock_code)
+                        if actual_quantity <= 0:
+                            logger.warning(f"⚠️ 실제 보유 수량 없음: {stock_code} - 매도 신호 무시")
+                            # 포지션 매니저에서도 제거
+                            if stock_code in self.position_manager.positions:
+                                del self.position_manager.positions[stock_code]
+                            continue
+
+                        # 매도 수량 결정 (실제 보유 수량과 신호 수량 중 작은 값)
+                        sell_quantity = min(sell_signal['quantity'], actual_quantity)
+                        
+                        if sell_quantity != sell_signal['quantity']:
+                            logger.warning(f"⚠️ 매도 수량 조정: {stock_code} {sell_signal['quantity']:,}주 → {sell_quantity:,}주 (실제보유: {actual_quantity:,}주)")
+
+                        # 🔒 매도 주문 시작 - 중복 방지용 등록
+                        self.pending_sell_orders.add(stock_code)
 
                         # 자동 매도용 지정가 계산
                         current_price = sell_signal['current_price']
                         strategy_type = sell_signal['strategy_type']
                         auto_sell_price = self._calculate_sell_price(current_price, strategy_type, is_auto_sell=True)
 
-                        # 자동 매도 실행 (지정가)
+                        # 자동 매도 실행 (검증된 수량으로)
                         order_no = self.trading_manager.execute_order(
-                            stock_code=sell_signal['stock_code'],
+                            stock_code=stock_code,
                             order_type="SELL",
-                            quantity=sell_signal['quantity'],
-                            price=auto_sell_price,  # 계산된 자동매도 지정가
+                            quantity=sell_quantity,  # 검증된 실제 매도 가능 수량
+                            price=auto_sell_price,
                             strategy_type=f"auto_sell_{sell_signal['reason']}"
                         )
 
                         if order_no:
-                            # 포지션 제거
+                            # 포지션 제거 (실제 매도된 수량으로)
                             self.position_manager.remove_position(
-                                sell_signal['stock_code'],
-                                sell_signal['quantity'],
+                                stock_code,
+                                sell_quantity,  # 실제 매도된 수량
                                 auto_sell_price
                             )
 
                             self.stats['orders_executed'] += 1
                             self.stats['positions_closed'] += 1
 
-                            logger.info(f"✅ 자동 매도 주문 완료: {sell_signal['stock_code']} {sell_signal['quantity']:,}주 @ {auto_sell_price:,}원 (현재가: {current_price:,}원)")
+                            logger.info(f"✅ 자동 매도 주문 완료: {stock_code} {sell_quantity:,}주 @ {auto_sell_price:,}원 (현재가: {current_price:,}원)")
 
                             # 텔레그램 알림 (직접 호출)
                             if self.telegram_bot:
                                 sell_signal['auto_sell_price'] = auto_sell_price
                                 self.telegram_bot.send_auto_sell_notification(sell_signal, order_no)
+                        
+                        # 🔓 매도 주문 완료 - 중복 방지용 해제
+                        self.pending_sell_orders.discard(stock_code)
 
                     except Exception as e:
                         logger.error(f"자동 매도 실행 오류: {sell_signal['stock_code']} - {e}")
+                        # 🔓 오류 발생 시에도 중복 방지용 해제
+                        self.pending_sell_orders.discard(sell_signal['stock_code'])
 
                 # 1분마다 업데이트
                 self.shutdown_event.wait(timeout=60)
@@ -376,20 +540,56 @@ class StockBot:
             return {'is_open': False, 'reason': '오류'}
 
     def _update_stats(self):
-        """통계 업데이트"""
+        """통계 정보 업데이트"""
         try:
-            # 포지션 통계
+            current_time = time.time()
+            runtime = current_time - self.stats['start_time']
+
+            # 포지션 요약
             position_summary = self.position_manager.get_position_summary()
 
-            # 전략 스케줄러 통계
-            scheduler_stats = self.strategy_scheduler.get_status()
+            # 전략 스케줄러 상태
+            scheduler_status = self.strategy_scheduler.get_status()
+
+            # 웹소켓 구독 상태
+            websocket_info = {
+                'connected': False,
+                'subscriptions': 0,
+                'usage': '0/41',
+                'stocks': []
+            }
+            
+            if self.websocket_manager:
+                websocket_info['connected'] = getattr(self.websocket_manager, 'is_connected', False)
+                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
+                    websocket_info['stocks'] = self.websocket_manager.get_subscribed_stocks()
+                    websocket_info['subscriptions'] = len(websocket_info['stocks'])
+                if hasattr(self.websocket_manager, 'get_websocket_usage'):
+                    websocket_info['usage'] = self.websocket_manager.get_websocket_usage()
 
             # 통계 업데이트
             self.stats.update({
-                'current_positions': position_summary.get('total_positions', 0),
+                'runtime_hours': runtime / 3600,
+                'positions_count': position_summary.get('total_positions', 0),
                 'total_value': position_summary.get('total_value', 0),
-                'active_strategies': len(scheduler_stats.get('active_strategies', {}))
+                'current_slot': scheduler_status.get('current_phase', 'Unknown'),
+                'active_strategies': len(scheduler_status.get('active_strategies', {})),
+                'websocket_connected': websocket_info['connected'],
+                'websocket_subscriptions': websocket_info['subscriptions'],
+                'websocket_usage': websocket_info['usage'],
+                'last_update': current_time
             })
+
+            # 주기적 로그 (5분마다)
+            if int(current_time) % 300 < 5:  # 5분마다 정확히 한 번만
+                logger.info(
+                    f"📊 시스템 통계 - "
+                    f"실행시간: {self.stats['runtime_hours']:.1f}h, "
+                    f"포지션: {self.stats['positions_count']}개, "
+                    f"현재전략: {self.stats['current_slot']}, "
+                    f"웹소켓: {'✅' if websocket_info['connected'] else '❌'} ({websocket_info['subscriptions']}종목, {websocket_info['usage']}), "
+                    f"처리신호: {self.stats['signals_processed']}개"
+                )
 
         except Exception as e:
             logger.error(f"통계 업데이트 오류: {e}")
@@ -419,6 +619,17 @@ class StockBot:
             # 포지션 요약
             position_summary = self.position_manager.get_position_summary()
 
+            # 웹소켓 구독 상태
+            websocket_info = "❌ 연결 안됨"
+            if self.websocket_manager and getattr(self.websocket_manager, 'is_connected', False):
+                subscriptions = 0
+                usage = "0/41"
+                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
+                    subscriptions = len(self.websocket_manager.get_subscribed_stocks())
+                if hasattr(self.websocket_manager, 'get_websocket_usage'):
+                    usage = self.websocket_manager.get_websocket_usage()
+                websocket_info = f"✅ 연결됨 ({subscriptions}종목, {usage})"
+
             report = (
                 f"🕐 실행시간: {runtime_hours:.1f}시간\n"
                 f"📈 활성포지션: {position_summary.get('total_positions', 0)}개\n"
@@ -426,6 +637,7 @@ class StockBot:
                 f"📊 수익률: {position_summary.get('total_profit_rate', 0):.2f}%\n"
                 f"🎯 현재전략: {scheduler_status.get('current_phase', 'N/A')}\n"
                 f"📋 활성전략수: {len(scheduler_status.get('active_strategies', {}))}\n"
+                f"📡 웹소켓: {websocket_info}\n"
                 f"🎰 처리신호: {self.stats['signals_processed']}개"
             )
 
@@ -454,30 +666,46 @@ class StockBot:
             logger.error(f"최종 통계 출력 오류: {e}")
 
     def _calculate_buy_price(self, current_price: int, strategy: str = 'default') -> int:
-        """매수 지정가 계산 (현재가 기준)"""
+        """매수 지정가 계산 (현재가 기준) - 체결률 개선 버전"""
         try:
-            # 전략별 매수 프리미엄 설정
+            # 🎯 개선된 전략별 매수 프리미엄 (체결률 고려)
             buy_premiums = {
-                'gap_trading': 0.01,      # 갭 거래: 1.0% 위
-                'volume_breakout': 0.012,  # 거래량 돌파: 1.2% 위
-                'momentum': 0.015,         # 모멘텀: 1.5% 위
-                'default': 0.005           # 기본: 0.5% 위
+                'gap_trading': 0.003,      # 갭 거래: 0.3% 위 (빠른 상승 예상)
+                'volume_breakout': 0.005,  # 거래량 돌파: 0.5% 위 (안정적 진입)
+                'momentum': 0.007,         # 모멘텀: 0.7% 위 (트렌드 추종)
+                'existing_holding': 0.002, # 기존 보유: 0.2% 위 (보수적)
+                'default': 0.003           # 기본: 0.3% 위 (균형)
             }
 
-            premium = buy_premiums.get(strategy, buy_premiums['default'])
-
-            # 계산된 매수가 (상승여력 고려)
-            buy_price = int(current_price * (1 + premium))
+            base_premium = buy_premiums.get(strategy, buy_premiums['default'])
+            
+            # 📊 시장 상황별 동적 조정
+            # 현재가 기준 변동성 고려 (호가 스프레드 추정)
+            volatility_adjustment = 0
+            if current_price < 5000:
+                volatility_adjustment = 0.002   # 저가주: +0.2% (활발한 거래)
+            elif current_price > 100000:
+                volatility_adjustment = -0.001  # 고가주: -0.1% (보수적)
+            
+            # 📈 신호 강도별 추가 조정 (향후 확장 가능)
+            signal_strength_adjustment = 0  # 현재는 기본값
+            
+            # 최종 프리미엄 계산
+            final_premium = base_premium + volatility_adjustment + signal_strength_adjustment
+            final_premium = max(0.001, min(final_premium, 0.01))  # 0.1%~1.0% 범위 제한
+            
+            # 계산된 매수가
+            buy_price = int(current_price * (1 + final_premium))
 
             # 호가 단위로 조정
             buy_price = self._adjust_to_tick_size(buy_price)
 
-            logger.debug(f"매수가 계산: {current_price:,}원 → {buy_price:,}원 (프리미엄: {premium:.1%})")
+            logger.info(f"💰 매수가 계산: {current_price:,}원 → {buy_price:,}원 (프리미엄: {final_premium:.1%}, 전략: {strategy})")
             return buy_price
 
         except Exception as e:
             logger.error(f"매수가 계산 오류: {e}")
-            return int(current_price * 1.005)  # 기본 0.5% 프리미엄
+            return int(current_price * 1.003)  # 기본 0.3% 프리미엄
 
     def _calculate_sell_price(self, current_price: int, strategy: str = 'default', is_auto_sell: bool = False) -> int:
         """매도 지정가 계산 (현재가 기준)"""
@@ -530,6 +758,25 @@ class StockBot:
         except Exception as e:
             logger.error(f"호가 단위 조정 오류: {e}")
             return price
+
+    def _get_actual_holding_quantity(self, stock_code: str) -> int:
+        """실제 보유 수량 확인 (KIS API 조회)"""
+        try:
+            balance = self.trading_manager.get_balance()
+            holdings = balance.get('holdings', [])
+            
+            for holding in holdings:
+                if holding.get('pdno') == stock_code:
+                    quantity = int(holding.get('hldg_qty', 0))
+                    logger.debug(f"📊 실제 보유 수량 확인: {stock_code} = {quantity:,}주")
+                    return quantity
+            
+            logger.debug(f"📊 실제 보유 수량 확인: {stock_code} = 0주 (보유하지 않음)")
+            return 0
+            
+        except Exception as e:
+            logger.error(f"실제 보유 수량 확인 오류 ({stock_code}): {e}")
+            return 0
 
     def _signal_handler(self, signum, frame):
         """시스템 신호 처리"""
@@ -601,32 +848,97 @@ class StockBot:
             # 4. 지정가 계산 (전략별 프리미엄 적용)
             buy_price = self._calculate_buy_price(current_price, strategy)
 
-            # 5. 매수 수량 계산 (신호 강도에 따라 조절)
-            position_size = min(available_cash * 0.1 * strength, available_cash * 0.05)  # 잔고의 5-10%
-            quantity = int(position_size // buy_price) if buy_price > 0 else 0
-
+            # 5. 🎯 개선된 매수 수량 계산 (신호 강도 및 리스크 고려)
+            base_position_ratio = 0.08  # 기본 8% (기존 5-10%에서 조정)
+            
+            # 전략별 포지션 사이즈 조정
+            strategy_multipliers = {
+                'gap_trading': 0.7,      # 갭 거래: 보수적 (5.6%)
+                'volume_breakout': 0.9,  # 거래량: 적극적 (7.2%)
+                'momentum': 1.2,         # 모멘텀: 공격적 (9.6%)
+                'existing_holding': 0.5, # 기존 보유: 매우 보수적 (4%)
+                'default': 1.0           # 기본: 8%
+            }
+            
+            # 신호 강도 고려 (0.3 ~ 1.2 범위)
+            strength_adjusted = max(0.3, min(strength, 1.2))
+            
+            # 최종 포지션 비율 계산
+            strategy_multiplier = strategy_multipliers.get(strategy, 1.0)
+            final_position_ratio = base_position_ratio * strategy_multiplier * strength_adjusted
+            
+            # 최대 투자 금액 계산
+            max_investment = min(
+                available_cash * final_position_ratio,  # 잔고 비율 기준
+                available_cash * 0.12,                  # 최대 12% 제한
+                500000                                  # 최대 50만원 제한
+            )
+            
+            # 수량 계산
+            quantity = int(max_investment // buy_price) if buy_price > 0 else 0
+            
+            # 최소 수량 체크 (너무 소액 투자 방지)
+            min_investment = 50000  # 최소 5만원
+            if quantity * buy_price < min_investment:
+                quantity = max(1, int(min_investment // buy_price))
+            
             if quantity <= 0:
-                logger.warning(f"매수 수량 부족: {stock_code} 현재가={current_price:,}원, 매수가={buy_price:,}원")
+                logger.warning(f"💰 매수 수량 부족: {stock_code} 현재가={current_price:,}원, 매수가={buy_price:,}원, 예산={max_investment:,}원")
                 return False
-
-            # 최종 매수 금액 확인
+            
+            # 최종 매수 금액 확인 및 재조정
             total_buy_amount = quantity * buy_price
             if total_buy_amount > available_cash:
-                # 수량 재조정
                 quantity = int(available_cash // buy_price)
                 total_buy_amount = quantity * buy_price
-                logger.info(f"매수 수량 재조정: {stock_code} {quantity}주, 총액={total_buy_amount:,}원")
+                logger.info(f"💰 매수 수량 재조정: {stock_code} {quantity:,}주, 총액={total_buy_amount:,}원")
+            
+            logger.info(f"💰 매수 수량 계산: {stock_code} - 전략={strategy}, 강도={strength:.2f}, 비율={final_position_ratio:.1%}, 수량={quantity:,}주, 금액={total_buy_amount:,}원")
 
             # 6. 실제 매수 주문 (지정가)
-            order_no = self.trading_manager.execute_order(
+            order_result = self.trading_manager.buy_order(
                 stock_code=stock_code,
-                order_type="BUY",
                 quantity=quantity,
-                price=buy_price,  # 계산된 지정가
-                strategy_type=strategy
+                price=buy_price
             )
 
-            if order_no:
+            if order_result.get('status') == 'success':
+                logger.info(f"✅ 매수 주문 성공: {stock_code} {quantity}주 @{buy_price:,}원")
+                
+                # 🎯 데이터베이스 기록 저장
+                try:
+                    # 종목명 조회 (간단하게 종목코드 사용)
+                    stock_name = stock_code  # 실제로는 종목명 조회 API 사용 가능
+                    total_amount = quantity * buy_price
+                    reason = signal.get('reason', f'{strategy} 신호')
+                    
+                    trade_id = self.trade_db.record_buy_trade(
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        quantity=quantity,
+                        price=buy_price,
+                        total_amount=total_amount,
+                        strategy_type=strategy,
+                        order_id=order_result.get('order_no', ''),
+                        status='SUCCESS',
+                        market_conditions={
+                            'current_price': current_price,
+                            'signal_strength': strength,
+                            'reason': reason
+                        },
+                        notes=f"신호강도: {strength:.2f}, 사유: {reason}"
+                    )
+                    logger.info(f"💾 매수 기록 저장 완료 (ID: {trade_id})")
+                    
+                    # 🆕 선정된 종목과 거래 연결
+                    if trade_id > 0:
+                        try:
+                            self.trade_db.link_trade_to_selected_stock(stock_code, trade_id)
+                        except Exception as e:
+                            logger.error(f"선정 종목-거래 연결 오류: {e}")
+                except Exception as e:
+                    logger.error(f"💾 매수 기록 저장 실패: {e}")
+
                 # 포지션 추가
                 self.position_manager.add_position(
                     stock_code=stock_code,
@@ -635,7 +947,7 @@ class StockBot:
                     strategy_type=strategy
                 )
 
-                logger.info(f"✅ 매수 주문 완료: {stock_code} {quantity:,}주 @ {buy_price:,}원 (현재가: {current_price:,}원, 주문번호: {order_no})")
+                logger.info(f"✅ 매수 주문 완료: {stock_code} {quantity:,}주 @ {buy_price:,}원 (현재가: {current_price:,}원, 주문번호: {order_result.get('order_no', '')})")
 
                 # 텔레그램 알림 (직접 호출)
                 if self.telegram_bot:
@@ -683,28 +995,58 @@ class StockBot:
             # 3. 지정가 계산 (전략별 할인 적용)
             sell_price = self._calculate_sell_price(current_price, strategy, is_auto_sell=False)
 
-            # 4. 실제 매도 주문 (지정가)
-            order_no = self.trading_manager.execute_order(
+            # 🛡️ 매도 수량 검증 - 실제 보유 수량 확인
+            actual_quantity = self._get_actual_holding_quantity(stock_code)
+            verified_quantity = min(quantity, actual_quantity) if actual_quantity > 0 else 0
+            
+            if verified_quantity <= 0:
+                logger.warning(f"❌ 매도 불가: {stock_code} 실제 보유 수량 부족 (요청: {quantity}, 실제: {actual_quantity})")
+                return False
+
+            # 매도 주문 실행
+            sell_result = self.trading_manager.sell_order(
                 stock_code=stock_code,
-                order_type="SELL",
-                quantity=quantity,
-                price=sell_price,  # 계산된 지정가
-                strategy_type=strategy
+                quantity=verified_quantity,
+                price=sell_price
             )
 
-            if order_no:
-                # 포지션 제거 (실제 체결가는 매도가로 기록)
-                self.position_manager.remove_position(stock_code, quantity, sell_price)
+            if sell_result.get('status') == 'success':
+                logger.info(f"✅ 매도 주문 성공: {stock_code} {verified_quantity}주 @{sell_price:,}원")
+                
+                # 🎯 데이터베이스 기록 저장
+                try:
+                    # 매수 거래 ID 찾기
+                    buy_trade_id = self.trade_db.find_buy_trade_for_sell(stock_code, verified_quantity)
+                    
+                    # 수익률 계산
+                    buy_price = position.get('buy_price', sell_price)
+                    profit_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+                    sell_type = "수동매도"
+                    condition_reason = signal.get('reason', '매도 신호')
+                    
+                    trade_id = self.trade_db.record_sell_trade(
+                        stock_code=stock_code,
+                        stock_name=position.get('stock_name', stock_code),
+                        quantity=verified_quantity,
+                        price=sell_price,
+                        total_amount=verified_quantity * sell_price,
+                        strategy_type=position.get('strategy_type', 'unknown'),
+                        buy_trade_id=buy_trade_id,
+                        order_id=sell_result.get('order_no', ''),
+                        status='SUCCESS',
+                        market_conditions={
+                            'current_price': current_price,
+                            'profit_rate': profit_rate,
+                            'sell_reason': f"{sell_type}: {condition_reason}"
+                        },
+                        notes=f"매도사유: {sell_type}, 조건: {condition_reason}"
+                    )
+                    logger.info(f"💾 매도 기록 저장 완료 (ID: {trade_id})")
+                except Exception as e:
+                    logger.error(f"💾 매도 기록 저장 실패: {e}")
 
-                # 수익률 계산
-                buy_price = position.get('buy_price', sell_price)
-                profit_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
-
-                logger.info(f"✅ 매도 주문 완료: {stock_code} {quantity:,}주 @ {sell_price:,}원 (현재가: {current_price:,}원, 수익률: {profit_rate:.2f}%, 주문번호: {order_no})")
-
-                # 텔레그램 알림 (직접 호출)
-                if self.telegram_bot:
-                    self.telegram_bot.send_order_notification('매도', stock_code, quantity, sell_price, strategy)
+                # 포지션에서 제거
+                self.position_manager.remove_position(stock_code, verified_quantity, sell_price)
 
                 return True
             else:
@@ -730,14 +1072,26 @@ class StockBot:
             # 전략 스케줄러 상태
             scheduler_status = self.strategy_scheduler.get_status()
 
-            # 웹소켓 상태
+            # 웹소켓 상태 및 구독 정보
             websocket_connected = False
+            websocket_subscriptions = 0
+            websocket_usage = "0/41"
+            subscribed_stocks = []
+            
             if self.websocket_manager:
                 websocket_connected = getattr(self.websocket_manager, 'is_connected', False)
+                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
+                    subscribed_stocks = self.websocket_manager.get_subscribed_stocks()
+                    websocket_subscriptions = len(subscribed_stocks)
+                if hasattr(self.websocket_manager, 'get_websocket_usage'):
+                    websocket_usage = self.websocket_manager.get_websocket_usage()
 
             return {
                 'bot_running': self.is_running,
                 'websocket_connected': websocket_connected,
+                'websocket_subscriptions': websocket_subscriptions,
+                'websocket_usage': websocket_usage,
+                'subscribed_stocks': subscribed_stocks[:10],  # 최대 10개만 표시
                 'positions_count': position_summary.get('total_positions', 0),
                 'pending_orders_count': 0,  # 추후 구현
                 'order_history_count': 0,   # 추후 구현
@@ -752,6 +1106,9 @@ class StockBot:
             return {
                 'bot_running': self.is_running,
                 'websocket_connected': False,
+                'websocket_subscriptions': 0,
+                'websocket_usage': "0/41",
+                'subscribed_stocks': [],
                 'positions_count': 0,
                 'pending_orders_count': 0,
                 'order_history_count': 0,

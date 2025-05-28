@@ -4,16 +4,16 @@
 """
 import asyncio
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from utils.logger import setup_logger
-from database.db_manager import db_manager
 from utils.korean_time import now_kst, now_kst_time
 
 # 설정 import (settings.py에서 .env 파일을 읽어서 제공)
-from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID
+from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = setup_logger(__name__)
 
@@ -23,10 +23,11 @@ class TelegramBot:
     def __init__(self, stock_bot_instance=None):
         # StockBot 메인 인스턴스 참조
         self.stock_bot = stock_bot_instance
+        self.main_bot_ref = None  # 메인 봇 참조 추가
 
         # 텔레그램 설정 (settings.py에서 가져옴)
         self.bot_token = TELEGRAM_BOT_TOKEN
-        self.chat_id = TELEGRAM_ADMIN_ID
+        self.chat_id = TELEGRAM_CHAT_ID
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 설정되지 않았습니다.")
@@ -41,6 +42,11 @@ class TelegramBot:
         self.authorized_users = set([int(self.chat_id)])  # 승인된 사용자만 접근
 
         logger.info("🤖 텔레그램 봇 초기화 완료")
+
+    def set_main_bot_reference(self, main_bot_ref):
+        """메인 봇 참조 설정 (데이터베이스 접근용)"""
+        self.main_bot_ref = main_bot_ref
+        logger.info("🔗 메인 봇 참조 설정 완료")
 
     def start_bot(self):
         """별도 스레드에서 봇 시작"""
@@ -117,6 +123,15 @@ class TelegramBot:
             CommandHandler("today", self._cmd_today_summary),
             CommandHandler("scheduler", self._cmd_scheduler_status),
             CommandHandler("stocks", self._cmd_active_stocks),
+            CommandHandler("refresh", self._cmd_refresh_prices),
+            CommandHandler("stats", self._cmd_stats),
+            CommandHandler("history", self._cmd_history),
+            CommandHandler("todaydb", self._cmd_today_db),
+            CommandHandler("export", self._cmd_export),
+            CommandHandler("slots", self._cmd_time_slots),
+            CommandHandler("selected", self._cmd_selected_stocks),
+            CommandHandler("slotperf", self._cmd_slot_performance),
+            CommandHandler("existing", self._cmd_existing_positions),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
         ]
 
@@ -138,7 +153,16 @@ class TelegramBot:
             BotCommand("today", "오늘 요약"),
             BotCommand("scheduler", "스케줄러 상태"),
             BotCommand("stocks", "활성 종목"),
+            BotCommand("refresh", "REST API 가격 갱신"),
+            BotCommand("stats", "거래 통계"),
+            BotCommand("history", "거래 내역 DB"),
+            BotCommand("todaydb", "오늘 거래 DB"),
+            BotCommand("export", "CSV 내보내기"),
             BotCommand("stop", "시스템 종료"),
+            BotCommand("slots", "시간대별 종목 선정"),
+            BotCommand("selected", "선택된 종목"),
+            BotCommand("slotperf", "시간대별 성과"),
+            BotCommand("existing", "기존 보유 종목"),
         ]
 
         await self.application.bot.set_my_commands(commands)
@@ -202,9 +226,20 @@ class TelegramBot:
             "/profit - 오늘 수익률\n"
             "/positions - 현재 포지션\n"
             "/trades - 최근 거래 내역\n\n"
+            "📋 <b>거래 데이터베이스</b>\n"
+            "/stats [일수] - 거래 성과 통계 (기본: 7일)\n"
+            "/history [일수] - 거래 내역 조회 (기본: 3일)\n"
+            "/todaydb - 오늘 거래 요약 (DB)\n"
+            "/export [일수] - CSV 내보내기 (기본: 30일)\n\n"
+            "🕐 <b>시간대별 종목 선정</b>\n"
+            "/slots - 시간대별 종목 선정 현황\n"
+            "/selected [날짜] - 선정된 종목 조회\n"
+            "/slotperf [일수] - 시간대별 성과 분석\n"
+            "/existing - 기존 보유 종목 현황\n\n"
             "🎮 <b>제어 명령</b>\n"
             "/pause - 거래 일시정지\n"
             "/resume - 거래 재개\n"
+            "/refresh - REST API 가격 강제 갱신\n"
             "/stop - 시스템 종료\n\n"
             "❓ /help - 이 도움말"
         )
@@ -224,11 +259,26 @@ class TelegramBot:
 
             status = self.stock_bot.get_system_status()
 
+            # 웹소켓 구독 정보 포맷팅
+            websocket_status = "❌"
+            if status.get('websocket_connected', False):
+                websocket_status = f"✅ ({status.get('websocket_subscriptions', 0)}종목)"
+            
+            # 구독 종목 목록 (최대 5개만 표시)
+            subscribed_stocks = status.get('subscribed_stocks', [])
+            subscription_info = ""
+            if subscribed_stocks:
+                displayed_stocks = subscribed_stocks[:5]
+                subscription_info = f"\n📋 구독 종목: {', '.join(displayed_stocks)}"
+                if len(subscribed_stocks) > 5:
+                    subscription_info += f" 외 {len(subscribed_stocks)-5}개"
+
             message = (
                 "📊 <b>StockBot 시스템 상태</b>\n\n"
                 f"🔄 봇 실행: {'✅' if status.get('bot_running', False) else '❌'}\n"
                 f"⏸️ 일시정지: {'✅' if self.bot_paused else '❌'}\n"
-                f"📡 WebSocket: {'✅' if status.get('websocket_connected', False) else '❌'}\n"
+                f"📡 WebSocket: {websocket_status}\n"
+                f"🔗 웹소켓 사용량: {status.get('websocket_usage', '0/41')}{subscription_info}\n"
                 f"💼 보유 포지션: {status.get('positions_count', 0)}개\n"
                 f"📋 대기 주문: {status.get('pending_orders_count', 0)}개\n"
                 f"📝 거래 내역: {status.get('order_history_count', 0)}건\n\n"
@@ -685,6 +735,89 @@ class TelegramBot:
             logger.error(f"활성 종목 조회 오류: {e}")
             await update.message.reply_text("❌ 활성 종목 조회 중 오류가 발생했습니다.")
 
+    async def _cmd_refresh_prices(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """REST API 가격 강제 갱신"""
+        if not self._check_authorization(update.effective_user.id):
+            await update.message.reply_text("❌ 권한이 없습니다.")
+            return
+
+        try:
+            if not self.stock_bot:
+                await update.message.reply_text("❌ StockBot 인스턴스에 접근할 수 없습니다.")
+                return
+
+            # 로딩 메시지
+            loading_msg = await update.message.reply_text("🔄 <b>REST API로 현재가 강제 갱신 중...</b>", parse_mode='HTML')
+
+            # 포지션 매니저 확인
+            if not hasattr(self.stock_bot, 'position_manager') or not self.stock_bot.position_manager:
+                await loading_msg.edit_text("❌ 포지션 매니저에 접근할 수 없습니다.")
+                return
+
+            # 현재 포지션 확인
+            active_positions = self.stock_bot.position_manager.get_positions(status='active')
+            
+            if not active_positions:
+                await loading_msg.edit_text("📋 현재 보유 중인 포지션이 없습니다.")
+                return
+
+            # REST API 강제 갱신 실행
+            start_time = time.time()
+            updated_count = self.stock_bot.position_manager.force_price_update_via_rest_api()
+            elapsed = time.time() - start_time
+
+            # 업데이트된 포지션 정보 수집
+            updated_positions = self.stock_bot.position_manager.get_positions(status='active')
+            
+            position_list = []
+            for stock_code, position in updated_positions.items():
+                current_price = position.get('current_price', 0)
+                profit_rate = position.get('profit_rate', 0)
+                last_update = position.get('last_update', 0)
+                
+                # 최근 업데이트 확인 (30초 이내)
+                recently_updated = "🆕" if time.time() - last_update < 30 else "⏰"
+                
+                position_list.append(
+                    f"{recently_updated} {stock_code}: {current_price:,}원 "
+                    f"({'📈' if profit_rate >= 0 else '📉'}{profit_rate:+.1f}%)"
+                )
+
+            # 결과 메시지
+            if updated_count > 0:
+                message = (
+                    f"✅ <b>REST API 가격 갱신 완료</b>\n\n"
+                    f"📊 갱신된 종목: {updated_count}/{len(active_positions)}개\n"
+                    f"⏱️ 소요 시간: {elapsed:.1f}초\n\n"
+                    f"📋 <b>현재 포지션 상태</b>\n"
+                )
+                
+                # 포지션이 많으면 일부만 표시
+                if len(position_list) <= 8:
+                    message += "\n".join(position_list)
+                else:
+                    message += "\n".join(position_list[:8])
+                    message += f"\n\n📝 총 {len(position_list)}개 포지션 (8개만 표시)"
+                
+                message += f"\n\n⏰ 갱신 시간: {now_kst().strftime('%H:%M:%S')}"
+                
+            else:
+                message = (
+                    f"⚠️ <b>가격 갱신 실패</b>\n\n"
+                    f"❌ 갱신된 종목: 0/{len(active_positions)}개\n"
+                    f"🔧 웹소켓이나 REST API 연결을 확인해주세요.\n\n"
+                    f"⏰ 시도 시간: {now_kst().strftime('%H:%M:%S')}"
+                )
+
+            await loading_msg.edit_text(message, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"가격 갱신 오류: {e}")
+            try:
+                await loading_msg.edit_text(f"❌ 가격 갱신 중 오류가 발생했습니다.\n\n🔧 오류: {str(e)[:50]}...")
+            except:
+                await update.message.reply_text("❌ 가격 갱신 중 오류가 발생했습니다.")
+
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """일반 메시지 처리"""
         if not self._check_authorization(update.effective_user.id):
@@ -737,10 +870,27 @@ class TelegramBot:
             return
 
         try:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.send_notification(message))
+            import threading
+            
+            # 별도 스레드에서 비동기 알림 실행
+            def run_async_notification():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(self.send_notification(message))
+                    finally:
+                        loop.close()
+                except Exception as e:
+                    logger.error(f"스레드 내 알림 전송 실패: {e}")
+            
+            # 별도 스레드에서 실행 (메인 이벤트 루프 간섭 방지)
+            notification_thread = threading.Thread(target=run_async_notification, daemon=True)
+            notification_thread.start()
+            
+            # 최대 3초 대기 (블로킹 방지)
+            notification_thread.join(timeout=3.0)
+            
         except Exception as e:
             logger.error(f"동기 알림 전송 실패: {e}")
 
@@ -820,3 +970,486 @@ class TelegramBot:
             self.send_notification_sync(message)
         except Exception as e:
             logger.error(f"리포트 전송 오류: {e}")
+
+    # ========== 데이터베이스 관련 명령어들 ==========
+
+    async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """거래 통계 조회"""
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            # 기간 파라미터 처리
+            days = 7  # 기본 7일
+            if context.args:
+                try:
+                    days = int(context.args[0])
+                    days = max(1, min(days, 365))  # 1~365일 제한
+                except:
+                    pass
+
+            await update.message.reply_text(f"📊 최근 {days}일 거래 통계 조회 중...")
+            
+            # 거래 성과 통계 조회
+            stats = self.main_bot_ref.trade_db.get_performance_stats(days=days)
+            
+            if not stats:
+                await update.message.reply_text("📊 거래 통계 데이터가 없습니다")
+                return
+
+            # 통계 메시지 구성
+            message = f"📊 **거래 성과 통계** (최근 {days}일)\n\n"
+            
+            # 기본 통계
+            message += f"🔢 **거래 현황**\n"
+            message += f"• 총 거래: {stats['total_trades']}건 (매수: {stats['buy_trades']}, 매도: {stats['sell_trades']})\n"
+            message += f"• 완료된 거래: {stats['completed_trades']}건\n"
+            message += f"• 승률: {stats['win_rate']}% ({stats['winning_trades']}승 {stats['losing_trades']}패)\n\n"
+            
+            # 수익 통계
+            message += f"💰 **수익 현황**\n"
+            message += f"• 총 손익: {stats['total_profit_loss']:+,}원\n"
+            message += f"• 평균 수익률: {stats['avg_profit_rate']:+.2f}%\n"
+            message += f"• 최대 수익: {stats['max_profit']:+,}원\n"
+            message += f"• 최대 손실: {stats['max_loss']:+,}원\n"
+            message += f"• 평균 보유시간: {stats['avg_holding_minutes']:.1f}분\n\n"
+            
+            # 전략별 성과
+            if stats['strategy_performance']:
+                message += f"📈 **전략별 성과**\n"
+                for strategy in stats['strategy_performance']:
+                    message += f"• {strategy['strategy']}: {strategy['total_profit']:+,}원 ({strategy['avg_profit_rate']:+.1f}%, {strategy['trade_count']}건)\n"
+
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"거래 통계 조회 오류: {e}")
+            await update.message.reply_text(f"❌ 통계 조회 실패: {str(e)}")
+
+    async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """거래 내역 조회"""
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            # 파라미터 처리
+            days = 3  # 기본 3일
+            limit = 10  # 기본 10건
+            
+            if context.args:
+                try:
+                    days = int(context.args[0])
+                    days = max(1, min(days, 30))  # 1~30일 제한
+                except:
+                    pass
+
+            await update.message.reply_text(f"📋 최근 {days}일 거래 내역 조회 중...")
+            
+            # 거래 내역 조회
+            trades = self.main_bot_ref.trade_db.get_trade_history(days=days)
+            
+            if not trades:
+                await update.message.reply_text("📋 거래 내역이 없습니다")
+                return
+
+            # 최근 거래 내역 표시 (최대 limit건)
+            recent_trades = trades[:limit]
+            
+            message = f"📋 **최근 거래 내역** (최근 {days}일, {len(recent_trades)}/{len(trades)}건)\n\n"
+            
+            for trade in recent_trades:
+                timestamp = trade['timestamp'][:16]  # YYYY-MM-DD HH:MM
+                trade_type = "🟢 매수" if trade['trade_type'] == 'BUY' else "🔴 매도"
+                
+                message += f"{trade_type} `{trade['stock_code']}`\n"
+                message += f"• 시간: {timestamp}\n"
+                message += f"• 수량: {trade['quantity']:,}주 @ {trade['price']:,}원\n"
+                message += f"• 금액: {trade['total_amount']:,}원\n"
+                
+                # 매도의 경우 수익 정보 추가
+                if trade['trade_type'] == 'SELL' and trade['profit_loss'] is not None:
+                    profit_emoji = "📈" if trade['profit_loss'] > 0 else "📉"
+                    message += f"• 손익: {profit_emoji} {trade['profit_loss']:+,}원 ({trade['profit_rate']:+.1f}%)\n"
+                    message += f"• 보유: {trade['holding_duration']}분\n"
+                
+                message += f"• 전략: {trade['strategy_type']}\n\n"
+
+            # 메시지가 너무 길면 분할
+            if len(message) > 4000:
+                # 첫 5건만 표시
+                message = f"📋 **최근 거래 내역** (최근 {days}일, 5/{len(trades)}건)\n\n"
+                for trade in recent_trades[:5]:
+                    timestamp = trade['timestamp'][:16]
+                    trade_type = "🟢 매수" if trade['trade_type'] == 'BUY' else "🔴 매도"
+                    
+                    message += f"{trade_type} `{trade['stock_code']}`\n"
+                    message += f"• {timestamp}, {trade['quantity']:,}주 @ {trade['price']:,}원\n"
+                    if trade['trade_type'] == 'SELL' and trade['profit_loss'] is not None:
+                        profit_emoji = "📈" if trade['profit_loss'] > 0 else "📉"
+                        message += f"• 손익: {profit_emoji} {trade['profit_loss']:+,}원 ({trade['profit_rate']:+.1f}%)\n"
+                    message += "\n"
+
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"거래 내역 조회 오류: {e}")
+            await update.message.reply_text(f"❌ 내역 조회 실패: {str(e)}")
+
+    async def _cmd_today_db(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """오늘 거래 요약 (데이터베이스)"""
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            await update.message.reply_text("📅 오늘 거래 요약 조회 중...")
+            
+            # 오늘 거래 통계
+            today_stats = self.main_bot_ref.trade_db.get_performance_stats(days=1)
+            daily_summary = self.main_bot_ref.trade_db.get_daily_summary(days=1)
+            
+            if not today_stats:
+                await update.message.reply_text("📅 오늘 거래 데이터가 없습니다")
+                return
+
+            message = f"📅 **오늘 거래 요약**\n\n"
+            
+            # 기본 정보
+            message += f"🔢 **거래 현황**\n"
+            message += f"• 총 거래: {today_stats['total_trades']}건\n"
+            message += f"• 매수: {today_stats['buy_trades']}건, 매도: {today_stats['sell_trades']}건\n"
+            message += f"• 완료된 거래: {today_stats['completed_trades']}건\n\n"
+            
+            # 수익 현황
+            if today_stats['completed_trades'] > 0:
+                message += f"💰 **수익 현황**\n"
+                message += f"• 총 손익: {today_stats['total_profit_loss']:+,}원\n"
+                message += f"• 평균 수익률: {today_stats['avg_profit_rate']:+.2f}%\n"
+                message += f"• 승률: {today_stats['win_rate']}% ({today_stats['winning_trades']}승 {today_stats['losing_trades']}패)\n"
+                
+                if today_stats['max_profit'] > 0:
+                    message += f"• 최고 수익: +{today_stats['max_profit']:,}원\n"
+                if today_stats['max_loss'] < 0:
+                    message += f"• 최대 손실: {today_stats['max_loss']:,}원\n"
+                
+                message += f"• 평균 보유시간: {today_stats['avg_holding_minutes']:.1f}분\n\n"
+            
+            # 전략별 성과
+            if today_stats['strategy_performance']:
+                message += f"📈 **전략별 성과**\n"
+                for strategy in today_stats['strategy_performance']:
+                    message += f"• {strategy['strategy']}: {strategy['total_profit']:+,}원 ({strategy['trade_count']}건)\n"
+
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"오늘 거래 요약 오류: {e}")
+            await update.message.reply_text(f"❌ 요약 조회 실패: {str(e)}")
+
+    async def _cmd_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """거래 내역 CSV 내보내기"""
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            # 기간 파라미터 처리
+            days = 30  # 기본 30일
+            if context.args:
+                try:
+                    days = int(context.args[0])
+                    days = max(1, min(days, 365))
+                except:
+                    pass
+
+            await update.message.reply_text(f"📄 최근 {days}일 거래 내역 CSV 생성 중...")
+            
+            # CSV 파일 생성
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = f"data/trades_export_{timestamp}.csv"
+            
+            success = self.main_bot_ref.trade_db.export_trades_to_csv(csv_filename, days=days)
+            
+            if success:
+                # 파일 전송
+                try:
+                    with open(csv_filename, 'rb') as file:
+                        await update.message.reply_document(
+                            document=file,
+                            filename=f"거래내역_{timestamp}.csv",
+                            caption=f"📄 최근 {days}일 거래 내역 CSV 파일"
+                        )
+                except Exception as e:
+                    logger.error(f"CSV 파일 전송 오류: {e}")
+                    await update.message.reply_text(f"✅ CSV 생성 완료: {csv_filename}\n❌ 파일 전송 실패: {str(e)}")
+            else:
+                await update.message.reply_text("❌ CSV 생성 실패")
+                
+        except Exception as e:
+            logger.error(f"CSV 내보내기 오류: {e}")
+            await update.message.reply_text(f"❌ CSV 생성 실패: {str(e)}")
+
+    async def _cmd_time_slots(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """시간대별 종목 선정 현황"""
+        if not self._check_authorization(update.effective_user.id):
+            await update.message.reply_text("❌ 권한이 없습니다.")
+            return
+
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            # 오늘 선정된 종목들 조회
+            selected_stocks = self.main_bot_ref.trade_db.get_selected_stocks_by_date()
+
+            if not selected_stocks:
+                await update.message.reply_text("📊 오늘 선정된 종목이 없습니다.")
+                return
+
+            # 시간대별로 그룹화
+            time_slots = {}
+            for stock in selected_stocks:
+                slot = stock['time_slot']
+                if slot not in time_slots:
+                    time_slots[slot] = []
+                time_slots[slot].append(stock)
+
+            message = "🕐 <b>오늘의 시간대별 종목 선정</b>\n\n"
+            
+            for slot_name, stocks in time_slots.items():
+                message += f"📍 <b>{slot_name}</b> ({stocks[0]['slot_start_time']} ~ {stocks[0]['slot_end_time']})\n"
+                
+                # 전략별로 그룹화
+                strategies = {}
+                for stock in stocks:
+                    strategy = stock['strategy_type']
+                    if strategy not in strategies:
+                        strategies[strategy] = []
+                    strategies[strategy].append(stock)
+                
+                for strategy_name, strategy_stocks in strategies.items():
+                    message += f"  📈 <b>{strategy_name}</b>: {len(strategy_stocks)}개\n"
+                    
+                    # 상위 3개만 표시
+                    for i, stock in enumerate(strategy_stocks[:3]):
+                        status = "✅" if stock['is_activated'] else "⏸️"
+                        trade_status = "💰" if stock['trade_executed'] else ""
+                        message += f"    {i+1}. {stock['stock_code']} {status}{trade_status} ({stock['score']:.1f}점)\n"
+                    
+                    if len(strategy_stocks) > 3:
+                        message += f"    ... 외 {len(strategy_stocks)-3}개\n"
+                
+                message += "\n"
+
+            await update.message.reply_text(message, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"시간대별 종목 선정 현황 오류: {e}")
+            await update.message.reply_text(f"❌ 조회 중 오류가 발생했습니다: {str(e)}")
+
+    async def _cmd_selected_stocks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """선정된 종목 상세 조회"""
+        if not self._check_authorization(update.effective_user.id):
+            await update.message.reply_text("❌ 권한이 없습니다.")
+            return
+
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            # 날짜 파라미터 처리 (기본: 오늘)
+            target_date = None
+            if context.args:
+                try:
+                    from datetime import datetime
+                    target_date = datetime.strptime(context.args[0], '%Y-%m-%d').date()
+                except ValueError:
+                    await update.message.reply_text("❌ 날짜 형식이 잘못되었습니다. (예: 2024-01-01)")
+                    return
+
+            # 선정된 종목들 조회
+            selected_stocks = self.main_bot_ref.trade_db.get_selected_stocks_by_date(target_date)
+
+            if not selected_stocks:
+                date_str = target_date.strftime('%Y-%m-%d') if target_date else '오늘'
+                await update.message.reply_text(f"📊 {date_str} 선정된 종목이 없습니다.")
+                return
+
+            message = f"📊 <b>선정된 종목 상세</b>\n"
+            if target_date:
+                message += f"📅 {target_date.strftime('%Y-%m-%d')}\n\n"
+            else:
+                message += f"📅 오늘\n\n"
+
+            # 점수 기준으로 정렬
+            sorted_stocks = sorted(selected_stocks, key=lambda x: x['score'], reverse=True)
+
+            for i, stock in enumerate(sorted_stocks[:10]):  # 상위 10개만
+                status_icons = []
+                if stock['is_activated']:
+                    status_icons.append("✅활성")
+                if stock['activation_success']:
+                    status_icons.append("📡실시간")
+                if stock['trade_executed']:
+                    status_icons.append("💰거래")
+                
+                status = " ".join(status_icons) if status_icons else "⏸️대기"
+                
+                message += f"{i+1}. <b>{stock['stock_code']}</b> ({stock['strategy_type']})\n"
+                message += f"   점수: {stock['score']:.1f} | 순위: {stock['rank_in_strategy']}\n"
+                message += f"   현재가: {stock['current_price']:,}원 ({stock['change_rate']:+.1f}%)\n"
+                message += f"   상태: {status}\n"
+                message += f"   이유: {stock['reason']}\n\n"
+
+            if len(selected_stocks) > 10:
+                message += f"... 외 {len(selected_stocks)-10}개 종목"
+
+            await update.message.reply_text(message, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"선정된 종목 조회 오류: {e}")
+            await update.message.reply_text(f"❌ 조회 중 오류가 발생했습니다: {str(e)}")
+
+    async def _cmd_slot_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """시간대별 성과 분석"""
+        if not self._check_authorization(update.effective_user.id):
+            await update.message.reply_text("❌ 권한이 없습니다.")
+            return
+
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            # 기간 파라미터 처리
+            days = 7  # 기본 7일
+            if context.args:
+                try:
+                    days = int(context.args[0])
+                    days = max(1, min(days, 30))  # 1~30일 제한
+                except ValueError:
+                    await update.message.reply_text("❌ 일수는 숫자로 입력해주세요.")
+                    return
+
+            # 시간대별 성과 조회
+            performance_data = self.main_bot_ref.trade_db.get_time_slot_performance(days)
+
+            if not performance_data:
+                await update.message.reply_text(f"📊 최근 {days}일간 시간대별 성과 데이터가 없습니다.")
+                return
+
+            message = f"📊 <b>시간대별 성과 분석</b> (최근 {days}일)\n\n"
+
+            # 시간대별로 그룹화
+            time_slots = {}
+            for data in performance_data:
+                slot = data['time_slot']
+                if slot not in time_slots:
+                    time_slots[slot] = []
+                time_slots[slot].append(data)
+
+            for slot_name, strategies in time_slots.items():
+                # 시간대 전체 통계 계산
+                total_candidates = sum(s['total_candidates'] for s in strategies)
+                total_activated = sum(s['activated_count'] for s in strategies)
+                total_traded = sum(s['traded_count'] for s in strategies)
+                total_profit = sum(s['total_profit'] for s in strategies)
+                avg_score = sum(s['avg_score'] * s['total_candidates'] for s in strategies) / total_candidates if total_candidates > 0 else 0
+
+                message += f"🕐 <b>{slot_name}</b>\n"
+                message += f"📊 후보: {total_candidates}개 | 활성: {total_activated}개 | 거래: {total_traded}개\n"
+                message += f"💰 총손익: {total_profit:+,}원 | 평균점수: {avg_score:.1f}\n"
+                
+                # 전략별 세부 성과
+                best_strategy = max(strategies, key=lambda x: x['total_profit'])
+                if best_strategy['total_profit'] != 0:
+                    message += f"🏆 최고 전략: {best_strategy['strategy_type']} ({best_strategy['total_profit']:+,}원)\n"
+                
+                message += "\n"
+
+            await update.message.reply_text(message, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"시간대별 성과 분석 오류: {e}")
+            await update.message.reply_text(f"❌ 분석 중 오류가 발생했습니다: {str(e)}")
+
+    async def _cmd_existing_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """기존 보유 종목 조회"""
+        if not self._check_authorization(update.effective_user.id):
+            await update.message.reply_text("❌ 권한이 없습니다.")
+            return
+
+        try:
+            if not hasattr(self, 'main_bot_ref') or not self.main_bot_ref:
+                await update.message.reply_text("❌ 봇 참조를 찾을 수 없습니다")
+                return
+            
+            if not hasattr(self.main_bot_ref, 'trade_db'):
+                await update.message.reply_text("❌ 거래 데이터베이스를 찾을 수 없습니다")
+                return
+
+            # 기존 보유 종목 조회
+            existing_positions = self.main_bot_ref.trade_db.get_existing_positions()
+
+            if not existing_positions:
+                await update.message.reply_text("📊 기존 보유 종목이 없습니다.")
+                return
+
+            message = "📊 <b>기존 보유 종목</b>\n\n"
+
+            for pos in existing_positions[:5]:  # 최대 5개만 표시
+                stock_code = pos['stock_code']
+                quantity = pos['quantity']
+                avg_price = pos['avg_buy_price']
+                unrealized_pnl = pos.get('unrealized_pnl', 0)
+                pnl_rate = pos.get('unrealized_pnl_rate', 0)
+
+                pnl_emoji = "📈" if unrealized_pnl > 0 else "📉" if unrealized_pnl < 0 else "➖"
+
+                message += (
+                    f"{pnl_emoji} <b>{stock_code}</b>\n"
+                    f"  📊 {quantity:,}주 @ {avg_price:,}원\n"
+                    f"  💰 {unrealized_pnl:+,}원 ({pnl_rate:+.2f}%)\n\n"
+                )
+
+            if len(existing_positions) > 5:
+                message += f"... 외 {len(existing_positions) - 5}개 더"
+
+            await update.message.reply_text(message, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"기존 보유 종목 조회 오류: {e}")
+            await update.message.reply_text("❌ 기존 보유 종목 조회 중 오류가 발생했습니다.")

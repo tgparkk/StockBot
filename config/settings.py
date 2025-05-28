@@ -21,11 +21,15 @@ HTS_ID = os.getenv('KIS_HTS_ID', '')
 
 # 텔레그램 봇 설정
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_ADMIN_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
 # 기타 설정
 IS_DEMO = os.getenv('IS_DEMO', 'false').lower() == 'true'
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# === 거래 방식 설정 ===
+TRADING_MODE = "swing"  # "day" = 당일매매, "swing" = 스윙트레이딩
+DAY_TRADING_EXIT_TIME = "15:00"  # 당일매매시 강제 매도 시간 (장마감 30분 전)
 
 # 설정 검증
 def validate_settings():

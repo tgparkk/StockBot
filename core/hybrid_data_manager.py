@@ -5,14 +5,12 @@ KIS 하이브리드 데이터 관리자 (간소화 버전)
 import time
 import threading
 import asyncio
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Any
 from utils.logger import setup_logger
+from core.data_priority import DataPriority
 from . import kis_data_cache as cache
 from .kis_data_collector import KISDataCollector
 from .kis_websocket_manager import KISWebSocketManager
-
-# DataPriority import 추가
-from database.db_models import DataPriority
 
 logger = setup_logger(__name__)
 
@@ -32,7 +30,7 @@ class SimpleHybridDataManager:
         self.collector = KISDataCollector(is_demo=is_demo)
 
         # 웹소켓 매니저
-        self.websocket_manager = KISWebSocketManager(is_demo=is_demo)
+        self.websocket_manager = KISWebSocketManager()
         self.websocket_running = False
         self.websocket_task: Optional[asyncio.Task] = None
 
@@ -546,8 +544,7 @@ class SimpleHybridDataManager:
                 self.websocket_running = True
                 logger.info("✅ 웹소켓 연결 성공")
 
-                # 연결 후 메시지 핸들러 시작
-                self._start_websocket_message_handler()
+                # 연결 후 메시지 핸들러는 자동으로 실행됨 (연결 로직에 포함)
             else:
                 self.websocket_running = False
                 logger.error("❌ 웹소켓 연결 실패")
@@ -566,73 +563,65 @@ class SimpleHybridDataManager:
             result_container = []
             exception_container = []
 
-            def run_connection():
+            def run_websocket_loop():
+                """웹소켓을 위한 지속적인 이벤트 루프"""
                 try:
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
+                    # 새로운 이벤트 루프 생성
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
 
-                    try:
-                        # 웹소켓 연결 실행
-                        if hasattr(self.websocket_manager, 'connect'):
-                            result = new_loop.run_until_complete(
-                                self.websocket_manager.connect()
-                            )
-                        else:
-                            # 웹소켓 매니저가 connect 메서드가 없는 경우
-                            # 접속키 발급 및 기본 연결 처리
-                            approval_key = self.websocket_manager.get_approval_key()
-                            self.websocket_manager.approval_key = approval_key
-
-                            # 연결 상태를 True로 설정
-                            self.websocket_manager.is_connected = True
-                            result = True
-
-                        result_container.append(result)
-                    finally:
-                        new_loop.close()
-
+                    async def websocket_worker():
+                        try:
+                            # 웹소켓 실행 상태 설정
+                            self.websocket_manager.is_running = True
+                            
+                            # 웹소켓 연결
+                            success = await self.websocket_manager.connect()
+                            result_container.append(success)
+                            
+                            if success:
+                                logger.info("✅ 웹소켓 연결 완료 - 메시지 수신 시작")
+                                # 메시지 핸들러를 같은 루프에서 실행
+                                await self.websocket_manager._message_handler()
+                            else:
+                                logger.error("❌ 웹소켓 연결 실패")
+                                
+                        except Exception as e:
+                            logger.error(f"웹소켓 워커 오류: {e}")
+                            exception_container.append(e)
+                    
+                    # 웹소켓 워커 실행
+                    loop.run_until_complete(websocket_worker())
+                    
                 except Exception as e:
+                    logger.error(f"웹소켓 루프 오류: {e}")
                     exception_container.append(e)
+                finally:
+                    logger.info("웹소켓 이벤트 루프 종료")
+                    # 루프는 스레드 종료시 자동으로 정리됨
 
-            # 별도 스레드에서 실행
-            thread = threading.Thread(target=run_connection, daemon=True)
-            thread.start()
-            thread.join(timeout=20)  # 20초 타임아웃
+            # 웹소켓 전용 스레드 시작
+            self.websocket_thread = threading.Thread(target=run_websocket_loop, daemon=True)
+            self.websocket_thread.start()
+            
+            # 연결 확인을 위해 잠시 대기
+            time.sleep(3)
 
             if exception_container:
                 logger.error(f"웹소켓 연결 오류: {exception_container[0]}")
                 return False
             elif result_container:
-                return result_container[0]
+                success = result_container[0]
+                if success:
+                    logger.info("✅ 웹소켓 연결 및 스레드 시작 완료")
+                return success
             else:
-                logger.error("웹소켓 연결 타임아웃")
-                return False
+                logger.warning("웹소켓 연결 대기 중...")
+                return True  # 연결 진행 중으로 간주
 
         except Exception as e:
             logger.error(f"웹소켓 연결 실행 오류: {e}")
             return False
-
-    def _start_websocket_message_handler(self):
-        """웹소켓 메시지 핸들러 시작"""
-        try:
-            if hasattr(self.websocket_manager, 'start_listening'):
-                # 메시지 핸들러를 별도 스레드에서 실행
-                def run_message_handler():
-                    try:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(self.websocket_manager.start_listening())
-                    except Exception as e:
-                        logger.error(f"메시지 핸들러 오류: {e}")
-
-                handler_thread = threading.Thread(target=run_message_handler, daemon=True)
-                handler_thread.start()
-                logger.info("웹소켓 메시지 핸들러 시작")
-            else:
-                logger.info("웹소켓 매니저에 메시지 핸들러가 없음")
-
-        except Exception as e:
-            logger.error(f"메시지 핸들러 시작 오류: {e}")
 
     def _process_data_update(self, stock_code: str, data: Dict) -> None:
         """데이터 업데이트 처리"""
@@ -723,12 +712,29 @@ class SimpleHybridDataManager:
     def get_status(self) -> Dict:
         """시스템 상태"""
         with self.subscription_lock:
+            # 웹소켓 상세 정보
+            websocket_details = {
+                'connected': False,
+                'subscribed_stocks': [],
+                'subscription_count': 0,
+                'usage_ratio': "0/41"
+            }
+            
+            if self.websocket_manager:
+                websocket_details['connected'] = getattr(self.websocket_manager, 'is_connected', False)
+                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
+                    websocket_details['subscribed_stocks'] = self.websocket_manager.get_subscribed_stocks()
+                    websocket_details['subscription_count'] = len(websocket_details['subscribed_stocks'])
+                if hasattr(self.websocket_manager, 'get_websocket_usage'):
+                    websocket_details['usage_ratio'] = self.websocket_manager.get_websocket_usage()
+            
             return {
                 'total_subscriptions': len(self.subscriptions),
                 'realtime_subscriptions': len(self.realtime_stocks),
                 'polling_subscriptions': len(self.polling_stocks),
                 'realtime_capacity': f"{len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS}",
                 'websocket_usage': f"{self.stats['websocket_usage']}/{self.WEBSOCKET_LIMIT}",
+                'websocket_details': websocket_details,
                 'priority_queue_size': len(self.realtime_priority_queue),
                 'polling_active': self.polling_active,
                 'polling_interval': self.polling_interval,
