@@ -225,30 +225,45 @@ class StockBot:
                 avg_price = int(float(holding.get('pchs_avg_pric', current_price)))
                 
                 if stock_code and quantity > 0:
-                    # 기존 보유 종목 DB 기록 저장
-                    try:
-                        trade_id = self.trade_db.record_existing_position_if_not_exists(
-                            stock_code=stock_code,
-                            stock_name=stock_name,
-                            quantity=quantity,
-                            avg_price=avg_price,
-                            current_price=current_price
-                        )
-                        
-                        if trade_id > 0:
-                            logger.info(f"💾 기존 보유 종목 DB 기록: {stock_code}({stock_name}) {quantity:,}주 @ {avg_price:,}원 (ID: {trade_id})")
-                        elif trade_id == -1:
-                            logger.debug(f"📝 기존 보유 종목 이미 기록됨: {stock_code}")
-                        
-                    except Exception as e:
-                        logger.error(f"기존 보유 종목 DB 기록 오류 ({stock_code}): {e}")
+                    # 🆕 간소화된 전략 타입 결정 로직
+                    strategy_type = "existing_holding"  # 기본값
                     
-                    # 포지션 매니저에 추가
+                    try:
+                        # DB에서 해당 종목의 미결제 포지션 확인
+                        open_positions = self.trade_db.get_open_positions()
+                        for pos in open_positions:
+                            if (pos['stock_code'] == stock_code and 
+                                pos['buy_price'] == avg_price and
+                                pos['quantity'] == quantity):
+                                # 동일한 종목/가격/수량의 미결제 포지션 발견
+                                strategy_type = pos['strategy_type']
+                                logger.info(f"🔄 {stock_code} 기존 전략 발견: {strategy_type}")
+                                break
+                        else:
+                            # DB에 해당하는 미결제 포지션이 없음 -> 순수 기존 보유
+                            logger.info(f"📝 {stock_code} 새로운 기존 보유 종목")
+                            
+                            # 기존 보유 종목으로 DB에 기록
+                            trade_id = self.trade_db.record_existing_position_if_not_exists(
+                                stock_code=stock_code,
+                                stock_name=stock_name,
+                                quantity=quantity,
+                                avg_price=avg_price,
+                                current_price=current_price
+                            )
+                            
+                            if trade_id > 0:
+                                logger.info(f"💾 기존 보유 종목 DB 기록: {stock_code}({stock_name}) (ID: {trade_id})")
+                                
+                    except Exception as e:
+                        logger.debug(f"전략 타입 확인 실패 ({stock_code}): {e}")
+                    
+                    # 포지션 매니저에 전략 타입과 함께 추가
                     self.position_manager.add_position(
                         stock_code=stock_code,
                         quantity=quantity,
                         buy_price=avg_price,
-                        strategy_type="existing_holding"
+                        strategy_type=strategy_type  # 🆕 결정된 전략 타입 사용
                     )
                     
                     # 웹소켓 실시간 모니터링 추가
