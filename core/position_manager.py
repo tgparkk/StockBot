@@ -25,44 +25,8 @@ class PositionManager:
         self.positions: Dict[str, Dict] = {}  # {stock_code: position_info}
         self.position_lock = threading.RLock()
 
-        # 손익 설정 (🎯 더 수익성 있고 현실적인 기준으로 개선)
-        self.profit_targets = {
-            # 기본 전략: 안정적이고 수익성 있는 매도
-            'default': {
-                'stop_loss': -4.5, 'take_profit': 6.0, 'min_holding_minutes': 45,
-                'trailing_stop_trigger': 3.5, 'trailing_stop_gap': 2.0  # 3.5% 수익 후 2% 하락시 매도
-            },
-            
-            # 기존 보유 종목: 더 여유있는 관리
-            'existing_holding': {
-                'stop_loss': -5.5, 'take_profit': 8.0, 'min_holding_minutes': 90,
-                'trailing_stop_trigger': 4.0, 'trailing_stop_gap': 2.5  # 4% 수익 후 2.5% 하락시 매도
-            },
-            
-            # 🆕 이격도 반등: 과매도 반등 기대하며 여유 있게
-            'disparity_reversal': {
-                'stop_loss': -3.5, 'take_profit': 7.0, 'min_holding_minutes': 60,
-                'trailing_stop_trigger': 4.0, 'trailing_stop_gap': 2.0  # 4% 수익 후 2% 하락시 매도
-            },
-            
-            # 갭 거래: 빠른 수익 실현, 하지만 여유 있게
-            'gap_trading': {
-                'stop_loss': -3.5, 'take_profit': 5.0, 'min_holding_minutes': 30,
-                'trailing_stop_trigger': 3.0, 'trailing_stop_gap': 1.8  # 3% 수익 후 1.8% 하락시 매도
-            },
-            
-            # 거래량 돌파: 트렌드 지속 기대
-            'volume_breakout': {
-                'stop_loss': -4.0, 'take_profit': 7.0, 'min_holding_minutes': 40,
-                'trailing_stop_trigger': 4.0, 'trailing_stop_gap': 2.2  # 4% 수익 후 2.2% 하락시 매도
-            },
-            
-            # 모멘텀: 트렌드 최대한 활용
-            'momentum': {
-                'stop_loss': -3.0, 'take_profit': 8.5, 'min_holding_minutes': 25,
-                'trailing_stop_trigger': 5.0, 'trailing_stop_gap': 2.5  # 5% 수익 후 2.5% 하락시 매도
-            }
-        }
+        # 🎯 데이터 기반 손익 설정 계산
+        self.profit_targets = self._calculate_scientific_targets()
 
         # 통계
         self.stats = {
@@ -74,6 +38,226 @@ class PositionManager:
         }
 
         logger.info("포지션 관리자 초기화 완료")
+
+    def _calculate_scientific_targets(self) -> Dict:
+        """📊 과학적 근거 기반 손익 목표 계산"""
+        try:
+            # 🔍 시장 변동성 분석
+            market_volatility = self._analyze_market_volatility()
+            
+            # 📈 전략별 백테스팅 성과 분석  
+            strategy_performance = self._analyze_strategy_performance()
+            
+            # ⚖️ 리스크 대비 수익률 최적화
+            risk_adjusted_targets = self._calculate_risk_adjusted_targets(
+                market_volatility, strategy_performance
+            )
+            
+            logger.info(f"📊 과학적 손익 목표 설정 완료 - 시장변동성: {market_volatility:.2f}%")
+            return risk_adjusted_targets
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 과학적 계산 실패, 기본값 사용: {e}")
+            return self._get_default_targets()
+
+    def _analyze_market_volatility(self) -> float:
+        """📊 시장 전체 변동성 분석"""
+        try:
+            # KOSPI 지수 최근 20일 변동성 분석
+            kospi_data = self.data_collector.get_market_index_data('001', period=20)
+            if not kospi_data or len(kospi_data) < 10:
+                return 2.5  # 기본값
+            
+            # 일일 변동률 계산
+            daily_changes = []
+            for i in range(1, len(kospi_data)):
+                prev_price = float(kospi_data[i-1].get('bstp_nmix_prpr', 1))
+                curr_price = float(kospi_data[i].get('bstp_nmix_prpr', 1))
+                if prev_price > 0:
+                    change_pct = abs((curr_price - prev_price) / prev_price * 100)
+                    daily_changes.append(change_pct)
+            
+            if daily_changes:
+                avg_volatility = sum(daily_changes) / len(daily_changes)
+                logger.info(f"📊 시장 평균 변동성: {avg_volatility:.2f}%")
+                return avg_volatility
+            
+            return 2.5  # 기본값
+            
+        except Exception as e:
+            logger.debug(f"시장 변동성 분석 오류: {e}")
+            return 2.5  # 기본값
+
+    def _analyze_strategy_performance(self) -> Dict:
+        """📈 전략별 과거 성과 분석"""
+        try:
+            # 데이터베이스에서 과거 거래 성과 조회
+            if hasattr(self.trading_manager, 'trade_db'):
+                performance_data = self.trading_manager.trade_db.get_strategy_performance_stats()
+                
+                # 전략별 성과 지표 계산
+                strategy_stats = {}
+                for strategy, data in performance_data.items():
+                    if data['total_trades'] >= 10:  # 최소 10회 거래 필요
+                        avg_profit = data['avg_profit_rate']
+                        win_rate = data['win_rate']
+                        max_drawdown = data['max_drawdown']
+                        
+                        # 샤프 비율 근사 계산
+                        sharpe_ratio = (avg_profit - 1.0) / (data['volatility'] + 0.1)
+                        
+                        strategy_stats[strategy] = {
+                            'avg_profit': avg_profit,
+                            'win_rate': win_rate,
+                            'max_drawdown': max_drawdown,
+                            'sharpe_ratio': sharpe_ratio,
+                            'sample_size': data['total_trades']
+                        }
+                
+                return strategy_stats
+            
+            return {}
+            
+        except Exception as e:
+            logger.debug(f"전략 성과 분석 오류: {e}")
+            return {}
+
+    def _calculate_risk_adjusted_targets(self, market_volatility: float, 
+                                       strategy_performance: Dict) -> Dict:
+        """⚖️ 리스크 조정 손익 목표 계산"""
+        
+        # 🎯 변동성 기반 기본 배수 계산
+        volatility_multiplier = max(1.0, min(market_volatility / 2.0, 3.0))  # 1.0~3.0 범위
+        
+        # 📊 기본 리스크 비율 (변동성의 0.7~1.2배)
+        base_stop_loss = -(market_volatility * 0.8)
+        base_take_profit = market_volatility * 1.8
+        base_trailing_trigger = market_volatility * 1.2
+        
+        # 🎯 전략별 조정 계산
+        targets = {}
+        
+        strategy_configs = {
+            'default': {'risk_factor': 1.0, 'profit_factor': 1.0, 'holding_factor': 1.0},
+            'existing_holding': {'risk_factor': 1.3, 'profit_factor': 1.4, 'holding_factor': 2.0},
+            'disparity_reversal': {'risk_factor': 0.9, 'profit_factor': 1.2, 'holding_factor': 1.5},
+            'gap_trading': {'risk_factor': 0.7, 'profit_factor': 0.8, 'holding_factor': 0.7},
+            'volume_breakout': {'risk_factor': 1.1, 'profit_factor': 1.3, 'holding_factor': 1.2},
+            'momentum': {'risk_factor': 0.8, 'profit_factor': 1.6, 'holding_factor': 0.8}
+        }
+        
+        for strategy, config in strategy_configs.items():
+            # 🎯 과거 성과 반영
+            performance = strategy_performance.get(strategy, {})
+            performance_multiplier = 1.0
+            
+            if performance and performance.get('sample_size', 0) >= 10:
+                # 윈율 기반 조정
+                win_rate = performance.get('win_rate', 50)
+                if win_rate > 60:
+                    performance_multiplier = 1.2  # 고성과 전략은 더 공격적
+                elif win_rate < 40:
+                    performance_multiplier = 0.8  # 저성과 전략은 더 보수적
+                
+                # 샤프 비율 반영
+                sharpe = performance.get('sharpe_ratio', 0)
+                if sharpe > 1.0:
+                    performance_multiplier *= 1.1
+                elif sharpe < 0.5:
+                    performance_multiplier *= 0.9
+            
+            # 🎯 최종 계산
+            final_stop_loss = base_stop_loss * config['risk_factor'] * performance_multiplier
+            final_take_profit = base_take_profit * config['profit_factor'] * performance_multiplier
+            final_trailing_trigger = base_trailing_trigger * config['profit_factor'] * performance_multiplier
+            final_trailing_gap = final_trailing_trigger * 0.5  # 트리거의 50%
+            
+            # 📏 합리적 범위 제한
+            final_stop_loss = max(-8.0, min(final_stop_loss, -1.0))  # -1% ~ -8%
+            final_take_profit = max(2.0, min(final_take_profit, 15.0))  # 2% ~ 15%
+            final_trailing_trigger = max(1.5, min(final_trailing_trigger, 8.0))  # 1.5% ~ 8%
+            final_trailing_gap = max(0.8, min(final_trailing_gap, 4.0))  # 0.8% ~ 4%
+            
+            # 🕐 보유 시간도 변동성 기반 계산
+            base_holding_minutes = 30 + (market_volatility * 5)  # 변동성 높을수록 더 오래 보유
+            final_holding_minutes = int(base_holding_minutes * config['holding_factor'])
+            final_holding_minutes = max(10, min(final_holding_minutes, 120))  # 10분~2시간
+            
+            targets[strategy] = {
+                'stop_loss': round(final_stop_loss, 1),
+                'take_profit': round(final_take_profit, 1),
+                'min_holding_minutes': final_holding_minutes,
+                'early_stop_loss': round(final_stop_loss * 0.6, 1),  # 손절의 60%
+                'early_stop_minutes': max(5, final_holding_minutes // 3),  # 보유시간의 1/3
+                'trailing_stop_trigger': round(final_trailing_trigger, 1),
+                'trailing_stop_gap': round(final_trailing_gap, 1),
+                'dynamic_stop_loss': True,
+                # 📊 계산 근거 로깅용
+                '_calculation_basis': {
+                    'market_volatility': market_volatility,
+                    'risk_factor': config['risk_factor'],
+                    'profit_factor': config['profit_factor'],
+                    'performance_multiplier': performance_multiplier,
+                    'sample_size': performance.get('sample_size', 0)
+                }
+            }
+            
+            logger.info(f"📊 {strategy}: 손절{final_stop_loss:.1f}%, 익절{final_take_profit:.1f}%, "
+                       f"추격{final_trailing_trigger:.1f}% (변동성:{market_volatility:.1f}%)")
+        
+        return targets
+
+    def _get_default_targets(self) -> Dict:
+        """기본 손익 목표 (백업용)"""
+        return {
+            # 기본 전략: 안정적이고 수익성 있는 매도 (개선)
+            'default': {
+                'stop_loss': -3.5, 'take_profit': 5.5, 'min_holding_minutes': 30,
+                'early_stop_loss': -2.0, 'early_stop_minutes': 15,
+                'trailing_stop_trigger': 3.0, 'trailing_stop_gap': 1.5,
+                'dynamic_stop_loss': True
+            },
+            
+            # 기존 보유 종목: 더 여유있는 관리 (개선)
+            'existing_holding': {
+                'stop_loss': -4.5, 'take_profit': 7.5, 'min_holding_minutes': 60,
+                'early_stop_loss': -3.0, 'early_stop_minutes': 30,
+                'trailing_stop_trigger': 3.5, 'trailing_stop_gap': 2.0,
+                'dynamic_stop_loss': True
+            },
+            
+            # 🆕 이격도 반등: 과매도 반등 기대하며 여유 있게 (개선)
+            'disparity_reversal': {
+                'stop_loss': -3.0, 'take_profit': 6.5, 'min_holding_minutes': 45,
+                'early_stop_loss': -2.0, 'early_stop_minutes': 20,
+                'trailing_stop_trigger': 3.5, 'trailing_stop_gap': 1.8,
+                'dynamic_stop_loss': True
+            },
+            
+            # 갭 거래: 빠른 수익 실현 (개선)
+            'gap_trading': {
+                'stop_loss': -2.5, 'take_profit': 4.5, 'min_holding_minutes': 20,
+                'early_stop_loss': -1.5, 'early_stop_minutes': 10,
+                'trailing_stop_trigger': 2.5, 'trailing_stop_gap': 1.2,
+                'dynamic_stop_loss': True
+            },
+            
+            # 거래량 돌파: 트렌드 지속 기대 (개선)
+            'volume_breakout': {
+                'stop_loss': -3.2, 'take_profit': 6.8, 'min_holding_minutes': 35,
+                'early_stop_loss': -2.2, 'early_stop_minutes': 18,
+                'trailing_stop_trigger': 3.8, 'trailing_stop_gap': 2.0,
+                'dynamic_stop_loss': True
+            },
+            
+            # 모멘텀: 트렌드 최대한 활용 (개선)
+            'momentum': {
+                'stop_loss': -2.2, 'take_profit': 8.0, 'min_holding_minutes': 20,
+                'early_stop_loss': -1.5, 'early_stop_minutes': 8,
+                'trailing_stop_trigger': 4.5, 'trailing_stop_gap': 2.2,
+                'dynamic_stop_loss': True
+            }
+        }
 
     # === 수익률 계산 헬퍼 메서드들 ===
     
@@ -437,7 +621,7 @@ class PositionManager:
 
         # 매도 조건 확인
         sell_reason = self._evaluate_sell_conditions(
-            profit_rate, max_profit_rate, holding_minutes, targets
+            profit_rate, max_profit_rate, holding_minutes, targets, position
         )
 
         if sell_reason:
@@ -457,19 +641,41 @@ class PositionManager:
         return None
 
     def _evaluate_sell_conditions(self, profit_rate: float, max_profit_rate: float, 
-                                 holding_minutes: float, targets: Dict) -> Optional[str]:
-        """매도 조건 평가"""
+                                 holding_minutes: float, targets: Dict, position: Dict = None) -> Optional[str]:
+        """매도 조건 평가 (🎯 개선된 안전한 로직)"""
         stop_loss = targets['stop_loss']
         take_profit = targets['take_profit']
-        min_holding_minutes = targets.get('min_holding_minutes', 45)
-        trailing_stop_trigger = targets.get('trailing_stop_trigger', 3.5)
-        trailing_stop_gap = targets.get('trailing_stop_gap', 2.0)
+        min_holding_minutes = targets.get('min_holding_minutes', 30)
+        trailing_stop_trigger = targets.get('trailing_stop_trigger', 3.0)
+        trailing_stop_gap = targets.get('trailing_stop_gap', 1.5)
+        
+        # 🆕 새로운 안전 장치들
+        early_stop_loss = targets.get('early_stop_loss', -2.0)
+        early_stop_minutes = targets.get('early_stop_minutes', 15)
+        dynamic_stop_loss = targets.get('dynamic_stop_loss', True)
 
-        # 1. 극심한 손실 시 즉시 손절
-        if profit_rate <= stop_loss - 3.0:
+        # 1. 극심한 손실 시 즉시 손절 (기존 유지)
+        if profit_rate <= stop_loss - 2.5:  # 더 빠른 긴급손절
             return f"긴급손절 ({profit_rate:.2f}%)"
         
-        # 2. 최소 홀딩 시간 후 매도 조건
+        # 2. 🆕 조기 손절 (시간 단축 + 안전성 강화)
+        elif holding_minutes >= early_stop_minutes and profit_rate <= early_stop_loss:
+            return f"조기손절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+        
+        # 3. 🆕 동적 손절 (최고점 기반 손절선 조정)
+        elif dynamic_stop_loss and max_profit_rate > 2.0:
+            # 최고점에서 이익이 났으면 손절선을 동적으로 조정
+            dynamic_stop = max(stop_loss, early_stop_loss + (max_profit_rate * 0.3))
+            if holding_minutes >= early_stop_minutes and profit_rate <= dynamic_stop:
+                return f"동적손절 ({profit_rate:.2f}%, 최고:{max_profit_rate:.1f}%, {holding_minutes:.0f}분)"
+        
+        # 4. 🧠 지능형 추격매도 우선 체크 (충분한 수익 시)
+        elif max_profit_rate >= trailing_stop_trigger and position:
+            intelligent_signal = self._check_intelligent_trailing_stop(position)
+            if intelligent_signal:
+                return intelligent_signal
+        
+        # 5. 최소 홀딩 시간 후 정상 매도 조건
         elif holding_minutes >= min_holding_minutes:
             if profit_rate <= stop_loss:
                 return f"손절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
@@ -477,10 +683,10 @@ class PositionManager:
                 return f"익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
             elif (max_profit_rate >= trailing_stop_trigger and 
                   profit_rate <= max_profit_rate - trailing_stop_gap):
-                return f"추격매도 (최고 {max_profit_rate:.2f}% → {profit_rate:.2f}%, {holding_minutes:.0f}분)"
+                return f"기본추격매도 (최고 {max_profit_rate:.2f}% → {profit_rate:.2f}%, {holding_minutes:.0f}분)"
         
-        # 3. 조기 익절 조건
-        elif holding_minutes < min_holding_minutes and profit_rate >= take_profit + 2.0:
+        # 6. 조기 익절 조건 (더 관대하게 조정)
+        elif holding_minutes < min_holding_minutes and profit_rate >= take_profit + 1.5:
             return f"조기익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
 
         return None
@@ -801,3 +1007,94 @@ class PositionManager:
         except Exception as e:
             logger.debug(f"웹소켓 연결 상태 확인 오류: {e}")
             return False
+
+    def _check_intelligent_trailing_stop(self, position: Dict) -> Optional[str]:
+        """🧠 지능형 추격매도 - 기술적 지표 활용"""
+        try:
+            stock_code = position['stock_code']
+            current_price = position.get('current_price', position['buy_price'])
+            profit_rate = position.get('profit_rate', 0)
+            max_profit_rate = position.get('max_profit_rate', 0)
+            
+            # 🎯 추격매도 트리거 확인 (기본 3% 이상 수익)
+            strategy_type = position.get('strategy_type', 'default')
+            targets = self.profit_targets.get(strategy_type, self.profit_targets['default'])
+            trailing_trigger = targets.get('trailing_stop_trigger', 3.0)
+            
+            if max_profit_rate < trailing_trigger:
+                return None  # 아직 추격매도 조건 미달성
+            
+            # 🔍 기술적 지표 기반 매도 신호 확인
+            try:
+                # 최근 가격 데이터 조회 (간단한 버전)
+                price_data = self.data_collector.get_historical_data(stock_code, period=20)
+                if not price_data or len(price_data) < 10:
+                    # 기술적 지표 없으면 기존 방식 사용
+                    trailing_gap = targets.get('trailing_stop_gap', 1.5)
+                    if profit_rate <= max_profit_rate - trailing_gap:
+                        return f"기본추격매도 (최고 {max_profit_rate:.2f}% → {profit_rate:.2f}%)"
+                    return None
+                
+                # 🧠 기술적 지표 계산
+                from core.technical_indicators import TechnicalIndicators
+                
+                closes = [float(d.get('stck_clpr', 0)) for d in price_data[-20:]]
+                closes.append(current_price)  # 현재가 포함
+                
+                # RSI 계산
+                rsi_values = TechnicalIndicators.calculate_rsi(closes, period=14)
+                current_rsi = rsi_values[-1] if rsi_values else 50.0
+                
+                # MACD 계산
+                macd_data = TechnicalIndicators.calculate_macd(closes)
+                current_macd = macd_data['macd'][-1] if macd_data['macd'] else 0.0
+                current_signal = macd_data['signal'][-1] if macd_data['signal'] else 0.0
+                
+                # 볼린저 밴드 계산
+                bb_data = TechnicalIndicators.calculate_bollinger_bands(closes)
+                bb_position = bb_data['bandwidth'][-1] if bb_data['bandwidth'] else 50.0
+                
+                # 🎯 지능형 매도 신호 판단
+                sell_signals = []
+                
+                # 1. RSI 과매수 신호 (70 이상)
+                if current_rsi >= 70:
+                    sell_signals.append(f"RSI과매수({current_rsi:.1f})")
+                
+                # 2. MACD 하향 전환
+                if current_macd < current_signal and abs(current_macd - current_signal) > 0.5:
+                    sell_signals.append("MACD하향전환")
+                
+                # 3. 볼린저 밴드 상단 터치 (과매수)
+                if bb_position >= 80:
+                    sell_signals.append(f"볼린저상단({bb_position:.1f}%)")
+                
+                # 4. 지지선 이탈 확인
+                support_resistance = TechnicalIndicators.calculate_support_resistance(closes[-10:])
+                if current_price < support_resistance['support'] * 1.02:  # 지지선 2% 근처
+                    sell_signals.append("지지선근접")
+                
+                # 🚨 매도 신호 종합 판단
+                if len(sell_signals) >= 2:  # 2개 이상 신호시 매도
+                    return f"지능형추격매도 (최고:{max_profit_rate:.1f}%→{profit_rate:.1f}%, 신호:{'+'.join(sell_signals)})"
+                elif len(sell_signals) == 1 and profit_rate <= max_profit_rate - 2.0:  # 1개 신호 + 2% 하락
+                    return f"조건부추격매도 (최고:{max_profit_rate:.1f}%→{profit_rate:.1f}%, {sell_signals[0]})"
+                else:
+                    # 📈 기술적으로 아직 상승 여력 있음 → 기존 추격매도 기준 완화
+                    relaxed_gap = targets.get('trailing_stop_gap', 1.5) + 0.5  # 0.5% 완화
+                    if profit_rate <= max_profit_rate - relaxed_gap:
+                        return f"완화추격매도 (최고:{max_profit_rate:.1f}%→{profit_rate:.1f}%, 기술적여력존재)"
+                
+                return None
+                
+            except Exception as e:
+                logger.debug(f"기술적 지표 분석 오류 ({stock_code}): {e}")
+                # 기술적 분석 실패시 기존 방식 사용
+                trailing_gap = targets.get('trailing_stop_gap', 1.5)
+                if profit_rate <= max_profit_rate - trailing_gap:
+                    return f"백업추격매도 (최고 {max_profit_rate:.2f}% → {profit_rate:.2f}%)"
+                return None
+                
+        except Exception as e:
+            logger.error(f"지능형 추격매도 오류 ({position.get('stock_code', 'Unknown')}): {e}")
+            return None
