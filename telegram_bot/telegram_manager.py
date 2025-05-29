@@ -6,7 +6,7 @@ import asyncio
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from utils.logger import setup_logger
@@ -15,12 +15,15 @@ from utils.korean_time import now_kst, now_kst_time
 # 설정 import (settings.py에서 .env 파일을 읽어서 제공)
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
+if TYPE_CHECKING:
+    from main import StockBot
+
 logger = setup_logger(__name__)
 
 class TelegramBot:
     """텔레그램 봇 클래스"""
 
-    def __init__(self, stock_bot_instance=None):
+    def __init__(self, stock_bot_instance: Optional['StockBot'] = None):
         # StockBot 메인 인스턴스 참조
         self.stock_bot = stock_bot_instance
         self.main_bot_ref = None  # 메인 봇 참조 추가
@@ -369,43 +372,41 @@ class TelegramBot:
             # 로딩 메시지 전송
             loading_msg = await update.message.reply_text("⏳ 잔고 조회 중...")
 
-            # 🔧 KIS API의 실제 메소드 사용: get_balance()
+            # 🔧 StockBot의 get_balance() 메서드 사용 (TradingManager에 위임)
             try:
-                balance_data = self.stock_bot.get_balance()
+                balance_data = self.stock_bot.trading_manager.get_balance()
 
-                if not balance_data:
-                    raise Exception("잔고 조회 데이터가 비어있습니다")
+                if not balance_data or not balance_data.get('success'):
+                    error_msg = balance_data.get('message', '잔고 조회 실패') if balance_data else '응답 없음'
+                    raise Exception(error_msg)
 
-                # 계좌 요약 정보 추출
-                account_summary = balance_data.get('account_summary', {})
-                positions = balance_data.get('positions', [])
+                # TradingManager.get_balance()의 실제 반환 구조 사용
+                total_assets = balance_data.get('total_assets', 0)         # 총평가금액
+                available_cash = balance_data.get('available_cash', 0)     # 가용현금
+                stock_evaluation = balance_data.get('stock_evaluation', 0) # 주식평가금액
+                profit_loss = balance_data.get('profit_loss', 0)           # 평가손익
+                holdings = balance_data.get('holdings', [])                # 보유종목
 
-                # 주요 정보 추출 (get_balance의 실제 반환 구조 사용)
-                deposit = account_summary.get('deposit_balance', 0)  # 예수금총액
-                stock_eval = account_summary.get('securities_eval_amount', 0)  # 유가증권평가금액
-                total_eval = account_summary.get('total_eval_amount', 0)  # 총평가금액
-                total_profit = account_summary.get('total_profit_loss', 0)  # 총평가손익
-
-                # 수익률 계산 (매입금액 기준)
-                purchase_total = account_summary.get('purchase_amount_total', 0)
-                profit_rate = (total_profit / purchase_total * 100) if purchase_total > 0 else 0
+                # 수익률 계산 (투자원금 기준)
+                investment_amount = total_assets - profit_loss if total_assets > profit_loss else total_assets
+                profit_rate = (profit_loss / investment_amount * 100) if investment_amount > 0 else 0
 
                 # 포맷팅
-                deposit_str = f"{int(deposit):,}" if deposit else "0"
-                stock_eval_str = f"{int(stock_eval):,}" if stock_eval else "0"
-                total_eval_str = f"{int(total_eval):,}" if total_eval else "0"
-                profit_str = f"{int(total_profit):+,}" if total_profit else "0"
+                total_assets_str = f"{total_assets:,}" if total_assets else "0"
+                available_cash_str = f"{available_cash:,}" if available_cash else "0"
+                stock_eval_str = f"{stock_evaluation:,}" if stock_evaluation else "0"
+                profit_str = f"{profit_loss:+,}" if profit_loss else "0"
 
                 # 수익률 색상
-                profit_emoji = "📈" if total_profit > 0 else "📉" if total_profit < 0 else "➖"
+                profit_emoji = "📈" if profit_loss > 0 else "📉" if profit_loss < 0 else "➖"
 
                 message = (
                     f"💰 <b>계좌 잔고</b>\n\n"
-                    f"🏦 예수금: {deposit_str}원\n"
+                    f"💵 총 평가금액: {total_assets_str}원\n"
+                    f"🏦 가용 현금: {available_cash_str}원\n"
                     f"📊 주식 평가금액: {stock_eval_str}원\n"
-                    f"💵 총 평가금액: {total_eval_str}원\n"
                     f"{profit_emoji} 평가손익: {profit_str}원 ({profit_rate:+.2f}%)\n"
-                    f"📦 보유 종목: {len(positions)}개\n\n"
+                    f"📦 보유 종목: {len(holdings)}개\n\n"
                     f"⏰ {now_kst().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
 
@@ -414,33 +415,42 @@ class TelegramBot:
             except Exception as api_error:
                 logger.error(f"KIS API 잔고 조회 오류: {api_error}")
 
-                # API 오류 시 fallback - 로컬 데이터 사용
-                await loading_msg.edit_text("⚠️ API 오류 - 로컬 데이터로 대체합니다...")
+                # API 오류 시 fallback - 포지션 매니저 데이터 사용
+                await loading_msg.edit_text("⚠️ API 오류 - 포지션 데이터로 대체합니다...")
 
-                # 현재 포지션 기반 간단 계산
-                if hasattr(self.stock_bot, 'positions') and self.stock_bot.positions:
-                    total_positions = len(self.stock_bot.positions)
-                    position_value = 0
+                # 포지션 매니저에서 현재 포지션 정보 가져오기
+                try:
+                    if hasattr(self.stock_bot, 'position_manager') and self.stock_bot.position_manager:
+                        positions = self.stock_bot.position_manager.get_positions('active')
+                        total_positions = len(positions)
+                        position_value = 0
 
-                    for stock_code, position in self.stock_bot.positions.items():
-                        qty = position.get('quantity', 0)
-                        avg_price = position.get('avg_price', 0)
-                        position_value += qty * avg_price
+                        for stock_code, position in positions.items():
+                            qty = position.get('quantity', 0)
+                            buy_price = position.get('buy_price', 0)
+                            position_value += qty * buy_price
 
-                    fallback_message = (
-                        f"💰 <b>계좌 정보 (로컬 추정)</b>\n\n"
-                        f"📊 보유 종목: {total_positions}개\n"
-                        f"💵 포지션 추정가치: {position_value:,}원\n\n"
-                        f"⚠️ 정확한 잔고는 증권사 앱에서 확인하세요.\n"
-                        f"🔧 API 연결 상태: {str(api_error)[:50]}..."
-                    )
+                        fallback_message = (
+                            f"💰 <b>계좌 정보 (로컬 추정)</b>\n\n"
+                            f"📊 보유 종목: {total_positions}개\n"
+                            f"💵 포지션 추정가치: {position_value:,}원\n\n"
+                            f"⚠️ 정확한 잔고는 증권사 앱에서 확인하세요.\n"
+                            f"🔧 API 오류: {str(api_error)[:50]}..."
+                        )
 
-                    await loading_msg.edit_text(fallback_message, parse_mode='HTML')
-                else:
+                        await loading_msg.edit_text(fallback_message, parse_mode='HTML')
+                    else:
+                        await loading_msg.edit_text(
+                            f"❌ API 오류 및 로컬 데이터 없음\n"
+                            f"🔧 오류: {str(api_error)[:50]}...\n"
+                            f"증권사 앱에서 직접 확인해주세요."
+                        )
+                except Exception as fallback_error:
+                    logger.error(f"Fallback 데이터 조회 오류: {fallback_error}")
                     await loading_msg.edit_text(
-                        f"❌ API 오류 및 로컬 데이터 없음\n"
-                        f"🔧 오류: {str(api_error)[:50]}...\n"
-                        f"증권사 앱에서 직접 확인해주세요."
+                        f"❌ 모든 데이터 소스 접근 실패\n"
+                        f"🔧 주 오류: {str(api_error)[:30]}...\n"
+                        f"🔧 보조 오류: {str(fallback_error)[:30]}..."
                     )
 
         except Exception as e:
@@ -970,6 +980,31 @@ class TelegramBot:
             self.send_notification_sync(message)
         except Exception as e:
             logger.error(f"리포트 전송 오류: {e}")
+
+    def send_startup_notification(self):
+        """StockBot 시작 알림 전송"""
+        if not self.stock_bot:
+            logger.warning("📱 StockBot 참조가 없어 시작 알림을 보낼 수 없습니다")
+            return
+            
+        try:
+            market_status = self.stock_bot._check_market_status()
+            
+            message = (
+                f"🤖 <b>StockBot 시작 완료!</b>\n\n"
+                f"📅 시간: {market_status['current_date']} {market_status['current_time']} (KST)\n"
+                f"📈 시장 상태: {market_status['status']}\n"
+                f"🔗 웹소켓: {'연결됨' if self.stock_bot.websocket_manager and hasattr(self.stock_bot.websocket_manager, 'is_connected') and self.stock_bot.websocket_manager.is_connected else '준비중'}\n"
+                f"📅 전략 스케줄러: 활성화\n\n"
+                f"💬 /help 명령어로 사용법을 확인하세요."
+            )
+            
+            logger.info("📨 텔레그램 시작 알림 전송 시도")
+            self.send_notification_sync(message)
+            logger.info("✅ 텔레그램 시작 알림 전송 완료")
+            
+        except Exception as e:
+            logger.error(f"❌ 텔레그램 시작 알림 전송 실패: {e}")
 
     # ========== 데이터베이스 관련 명령어들 ==========
 

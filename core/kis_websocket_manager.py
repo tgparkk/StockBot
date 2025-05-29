@@ -50,8 +50,6 @@ class KISWebSocketManager:
     """KIS API 통합 웹소켓 매니저"""
 
     def __init__(self):
-        self.is_demo = False  # 실전투자 고정
-
         # 웹소켓 제한
         self.WEBSOCKET_LIMIT = 41
         self.MAX_STOCKS = 13  # 체결(13) + 호가(13) = 26건 + 여유분
@@ -91,10 +89,74 @@ class KISWebSocketManager:
             'subscriptions': 0,
             'errors': 0,
             'reconnections': 0,
-            'last_message_time': None
+            'last_message_time': None,
+            'ping_pong_count': 0
         }
 
         logger.info(f"KIS 통합 웹소켓 매니저 초기화 (실전투자)")
+
+    def ensure_connection(self):
+        """웹소켓 연결 보장 (동기 방식)"""
+        try:
+            logger.info("🔗 웹소켓 연결 보장 시도")
+            
+            # 새 이벤트 루프 생성
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # 연결 시도
+                success = loop.run_until_complete(self._ensure_connection_async())
+                
+                if success:
+                    logger.info("✅ 웹소켓 연결 보장 성공")
+                else:
+                    logger.error("❌ 웹소켓 연결 보장 실패")
+                    raise Exception("웹소켓 연결 실패")
+                    
+            finally:
+                loop.close()
+                
+        except Exception as e:
+            logger.error(f"웹소켓 연결 보장 오류: {e}")
+            raise
+
+    async def _ensure_connection_async(self) -> bool:
+        """웹소켓 연결 보장 (비동기)"""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"웹소켓 연결 시도 {attempt}/{max_attempts}")
+                
+                if await self.connect():
+                    # 연결 성공 시 간단한 테스트
+                    await asyncio.sleep(1)  # 연결 안정화 대기
+                    
+                    if self.is_connected:
+                        logger.info(f"✅ 웹소켓 연결 성공 (시도 {attempt})")
+                        
+                        # 🆕 is_running 플래그 설정
+                        self.is_running = True
+                        
+                        # 🆕 메시지 처리 루프 자동 시작
+                        if not hasattr(self, '_message_handler_task') or self._message_handler_task.done():
+                            self._message_handler_task = asyncio.create_task(self._message_handler())
+                            logger.info("📨 웹소켓 메시지 처리 루프 시작")
+                        
+                        return True
+                        
+                logger.warning(f"⚠️ 웹소켓 연결 실패 - 시도 {attempt}/{max_attempts}")
+                
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 * attempt)  # 지수적 백오프
+                    
+            except Exception as e:
+                logger.error(f"웹소켓 연결 시도 {attempt} 오류: {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 * attempt)
+                    
+        logger.error("❌ 모든 웹소켓 연결 시도 실패")
+        return False
 
     def get_approval_key(self) -> str:
         """웹소켓 접속키 발급"""
@@ -156,9 +218,11 @@ class KISWebSocketManager:
             logger.info(f"웹소켓 연결 시도: {self.ws_url}")
             self.websocket = await websockets.connect(
                 self.ws_url,
-                ping_interval=60,
-                ping_timeout=30,
-                close_timeout=10
+                ping_interval=60,  # 🆕 KIS 공식 가이드와 동일하게 60초
+                ping_timeout=None,  # 🔧 ping_timeout 제거 (기본값 사용)
+                close_timeout=10,
+                max_size=None,  # 🆕 메시지 크기 제한 해제
+                max_queue=None   # 🆕 큐 크기 제한 해제
             )
 
             self.is_connected = True
@@ -494,9 +558,31 @@ class KISWebSocketManager:
             tr_id = json_data.get('header', {}).get('tr_id', '')
 
             if tr_id == "PINGPONG":
-                # PING/PONG 응답
-                await self.websocket.pong(data.encode())
-                logger.debug("PONG 응답 전송")
+                # 🆕 KIS 공식 가이드에 맞춘 PING/PONG 응답
+                logger.debug(f"### RECV [PINGPONG] [{data}]")
+                
+                # 🔧 websockets 라이브러리에 맞는 pong 응답
+                try:
+                    # websockets 라이브러리는 pong 메서드에 bytes 데이터를 요구할 수 있음
+                    if hasattr(self.websocket, 'pong'):
+                        if isinstance(data, str):
+                            await self.websocket.pong(data.encode('utf-8'))
+                        else:
+                            await self.websocket.pong(data)
+                    else:
+                        # 대안: send로 직접 pong 전송
+                        await self.websocket.send(data)
+                    
+                    logger.debug(f"### SEND [PINGPONG] [{data}]")
+                    self.stats['ping_pong_count'] = self.stats.get('ping_pong_count', 0) + 1
+                    self.stats['last_ping_pong_time'] = datetime.now()  # 🆕 마지막 PINGPONG 시간 기록
+                    
+                except Exception as pong_error:
+                    logger.error(f"PONG 응답 전송 실패: {pong_error}")
+                    # 연결 상태 재확인
+                    if not self.websocket or self.websocket.closed:
+                        logger.error("웹소켓 연결이 닫혀있음 - 재연결 필요")
+                        self.is_connected = False
 
             else:
                 body = json_data.get('body', {})
@@ -519,6 +605,11 @@ class KISWebSocketManager:
 
         except Exception as e:
             logger.error(f"시스템 메시지 처리 오류: {e}")
+            # PINGPONG 처리 실패 시 더 자세한 로깅
+            if "PINGPONG" in data:
+                logger.error(f"PINGPONG 처리 실패 - 데이터: {data}")
+                logger.error(f"웹소켓 연결 상태: {self.is_connected}")
+                logger.error(f"웹소켓 객체: {type(self.websocket)}")
 
     async def _message_handler(self):
         """메시지 수신 루프"""
@@ -587,14 +678,93 @@ class KISWebSocketManager:
 
     def get_status(self) -> Dict:
         """상태 조회"""
+        # 🆕 실시간 연결 상태 체크
+        actual_connected = self._check_actual_connection_status()
+        
         return {
             'is_connected': self.is_connected,
             'is_running': self.is_running,
+            'actual_connected': actual_connected,  # 🆕 실제 연결 상태
             'subscribed_stocks': len(self.subscribed_stocks),
             'max_stocks': self.MAX_STOCKS,
             'websocket_usage': f"{len(self.subscribed_stocks) * 2}/{self.WEBSOCKET_LIMIT}",
-            'stats': self.stats.copy()
+            'stats': self.stats.copy(),
+            'ping_pong_responses': self.stats.get('ping_pong_count', 0),
+            'last_ping_pong': self.stats.get('last_ping_pong_time', None),
+            'last_message_time': self.stats.get('last_message_time', None)
         }
+
+    def _check_actual_connection_status(self) -> bool:
+        """실제 웹소켓 연결 상태 체크"""
+        try:
+            # 1차: 기본 플래그 확인
+            if not self.is_connected or not self.is_running:
+                return False
+            
+            # 2차: 웹소켓 객체 존재 확인
+            if not self.websocket:
+                return False
+            
+            # 3차: websockets 라이브러리 상태 체크
+            try:
+                # closed 속성 체크 (가장 확실한 방법)
+                if hasattr(self.websocket, 'closed') and self.websocket.closed:
+                    return False
+                
+                # open 속성 체크 (추가 확인)
+                if hasattr(self.websocket, 'open') and not self.websocket.open:
+                    return False
+                
+                # state 속성 체크 (더 안전하게)
+                if hasattr(self.websocket, 'state'):
+                    # state가 1이면 OPEN (websockets 라이브러리 기준)
+                    if hasattr(self.websocket.state, 'value'):
+                        # Enum 타입인 경우
+                        if self.websocket.state.value != 1:
+                            return False
+                    else:
+                        # 정수 타입인 경우
+                        if self.websocket.state != 1:
+                            return False
+                
+                return True
+                
+            except Exception as state_error:
+                logger.debug(f"웹소켓 상태 체크 오류: {state_error}")
+                # 상태 체크 실패시 기본 플래그만으로 판단
+                return self.is_connected and self.is_running
+            
+        except Exception as e:
+            logger.debug(f"연결 상태 체크 오류: {e}")
+            return False
+
+    def is_healthy(self) -> bool:
+        """웹소켓 연결 건강성 체크"""
+        try:
+            # 기본 연결 상태 확인
+            if not self._check_actual_connection_status():
+                return False
+            
+            # 최근 메시지 수신 확인 (5분 이내)
+            last_message_time = self.stats.get('last_message_time')
+            if last_message_time:
+                from datetime import datetime, timedelta
+                if datetime.now() - last_message_time > timedelta(minutes=5):
+                    logger.warning("웹소켓 메시지 수신이 5분 이상 없음")
+                    return False
+            
+            # PINGPONG 응답 확인 (10분 이내)
+            last_ping_pong = self.stats.get('last_ping_pong_time')
+            if last_ping_pong:
+                if datetime.now() - last_ping_pong > timedelta(minutes=10):
+                    logger.warning("PINGPONG 응답이 10분 이상 없음")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"건강성 체크 오류: {e}")
+            return False
 
     def get_subscribed_stocks(self) -> List[str]:
         """구독 중인 종목 목록"""

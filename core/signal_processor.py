@@ -18,10 +18,9 @@ logger = setup_logger(__name__)
 class SignalProcessor:
     """간소화된 신호 처리기"""
 
-    def __init__(self, data_collector: KISDataCollector, is_demo: bool = False):
+    def __init__(self, data_collector: KISDataCollector):
         """초기화"""
         self.data_collector = data_collector
-        self.is_demo = is_demo
 
         # 전략 관리자
         self.strategy_manager = StrategyManager()

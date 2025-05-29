@@ -14,13 +14,28 @@ logger = setup_logger(__name__)
 class TradingManager:
     """간소화된 주문 실행 관리자"""
 
-    def __init__(self, is_demo: bool = False):
+    def __init__(self, websocket_manager=None, rest_api_manager=None, data_collector=None):
         """초기화"""
-        self.is_demo = is_demo
 
-        # API 관리자들
-        self.rest_api = KISRestAPIManager(is_demo=is_demo)
-        self.data_collector = KISDataCollector(is_demo=is_demo)
+        # 🎯 REST API 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
+        if rest_api_manager is None:
+            raise ValueError("❌ rest_api_manager는 필수입니다. main.py에서 KISRestAPIManager 인스턴스를 생성하여 주입해주세요.")
+        
+        self.rest_api = rest_api_manager
+        logger.info("✅ REST API 매니저 주입 완료 (거래 관리자)")
+        
+        # 🎯 웹소켓 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
+        if websocket_manager is None:
+            raise ValueError("❌ websocket_manager는 필수입니다. main.py에서 KISWebSocketManager 인스턴스를 생성하여 주입해주세요.")
+        
+        logger.info("✅ 웹소켓 매니저 주입 완료 (거래 관리자)")
+
+        # 🎯 데이터 수집기는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
+        if data_collector is None:
+            raise ValueError("❌ data_collector는 필수입니다. main.py에서 KISDataCollector 인스턴스를 생성하여 주입해주세요.")
+        
+        self.data_collector = data_collector
+        logger.info("✅ 데이터 수집기 주입 완료 (거래 관리자)")
 
         # 주문 추적
         self.pending_orders: Dict[str, Dict] = {}  # {order_no: order_info}
@@ -34,8 +49,6 @@ class TradingManager:
             'buy_orders': 0,
             'sell_orders': 0
         }
-
-        logger.info(f"주문 관리자 초기화 완료 ({'모의투자' if is_demo else '실전투자'})")
 
     def execute_order(self, stock_code: str, order_type: str, quantity: int,
                      price: int = 0, strategy_type: str = "manual") -> Optional[str]:
