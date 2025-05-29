@@ -113,8 +113,8 @@ class WorkerManager:
             logger.error(f"❌ 웹소켓 모니터링 워커 시작 오류: {e}")
 
     def _position_monitor_worker(self, bot_instance):
-        """포지션 모니터링 워커"""
-        logger.info("📊 포지션 모니터링 워커 시작됨")
+        """포지션 모니터링 워커 (🎯 개선된 실시간성)"""
+        logger.info("📊 포지션 모니터링 워커 시작됨 (실시간 모드)")
         
         while not self.shutdown_event.is_set():
             try:
@@ -123,18 +123,19 @@ class WorkerManager:
                     bot_instance.position_manager):
                     bot_instance.position_manager.update_position_prices()
                 
-                # 30초마다 실행
-                self.shutdown_event.wait(timeout=30)
+                # 🎯 10초마다 실행 (기존 30초에서 단축)
+                # 웹소켓이 정상이면 부담이 적고, REST API 백업 시에만 호출 증가
+                self.shutdown_event.wait(timeout=10)
                 
             except Exception as e:
                 logger.error(f"❌ 포지션 모니터링 워커 오류: {e}")
-                self.shutdown_event.wait(timeout=10)
+                self.shutdown_event.wait(timeout=5)  # 오류 시 더 짧은 대기
 
         logger.info("🛑 포지션 모니터링 워커 종료")
 
     def _auto_sell_worker(self, bot_instance):
-        """자동 매도 워커"""
-        logger.info("💰 자동 매도 워커 시작됨")
+        """자동 매도 워커 (🎯 개선된 실시간성)"""
+        logger.info("💰 자동 매도 워커 시작됨 (고빈도 모드)")
         
         while not self.shutdown_event.is_set():
             try:
@@ -143,12 +144,13 @@ class WorkerManager:
                     bot_instance.position_manager):
                     bot_instance.position_manager.check_auto_sell()
                 
-                # 10초마다 실행
-                self.shutdown_event.wait(timeout=10)
+                # 🎯 5초마다 실행 (기존 10초에서 단축)
+                # 급변하는 시장에서 빠른 대응을 위해
+                self.shutdown_event.wait(timeout=5)
                 
             except Exception as e:
                 logger.error(f"❌ 자동 매도 워커 오류: {e}")
-                self.shutdown_event.wait(timeout=5)
+                self.shutdown_event.wait(timeout=3)  # 오류 시 더 짧은 대기
 
         logger.info("🛑 자동 매도 워커 종료")
 

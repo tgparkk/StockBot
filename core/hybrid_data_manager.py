@@ -301,6 +301,22 @@ class SimpleHybridDataManager:
                     logger.error(f"웹소켓 연결 실패: {stock_code}")
                     return False
 
+            # 🆕 첫 구독인 경우 웹소켓 완전 준비 상태 확인
+            if len(self.realtime_stocks) == 0:  # 첫 구독
+                logger.info(f"🎯 첫 구독 시도: {stock_code} - 웹소켓 준비 상태 확인")
+                
+                # 웹소켓 준비 상태 확인 및 대기
+                if hasattr(self.websocket_manager, 'ensure_ready_for_subscriptions'):
+                    ready = self.websocket_manager.ensure_ready_for_subscriptions()
+                    if ready:
+                        logger.info("✅ 웹소켓 구독 준비 완료 - 첫 구독 진행")
+                    else:
+                        logger.warning("⚠️ 웹소켓 구독 준비 실패 - 동기 방식으로 시도")
+                else:
+                    # 준비 상태 확인 메서드가 없는 경우 기본 대기
+                    logger.info("🔄 웹소켓 안정화 대기 (기본 3초)")
+                    time.sleep(3)
+
             # 이미 구독 중인지 확인
             if hasattr(self.websocket_manager, 'subscribed_stocks'):
                 if stock_code in self.websocket_manager.subscribed_stocks:
@@ -337,15 +353,23 @@ class SimpleHybridDataManager:
             return False
 
     def _execute_websocket_subscription(self, stock_code: str) -> bool:
-        """웹소켓 구독 실행 (비동기 처리)"""
+        """웹소켓 구독 실행 (별도 스레드)"""
         try:
-            import threading
+            logger.debug(f"🔗 웹소켓 구독 실행: {stock_code}")
+
+            # 🆕 동기 방식 구독 메서드 사용 (이벤트 루프 문제 해결)
+            if hasattr(self.websocket_manager, 'subscribe_stock_sync'):
+                logger.debug(f"📡 동기 방식 웹소켓 구독 시도: {stock_code}")
+                result = self.websocket_manager.subscribe_stock_sync(stock_code, self._websocket_callback)
+                logger.debug(f"📡 동기 방식 웹소켓 구독 결과: {stock_code} = {result}")
+                return result
+            
+            # 🔧 기존 async 방식 (fallback)
             result_container = []
             exception_container = []
 
             def run_subscription():
                 try:
-                    # 새로운 이벤트 루프 생성
                     new_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(new_loop)
 
