@@ -18,19 +18,32 @@ logger = setup_logger(__name__)
 class SimpleHybridDataManager:
     """웹소켓 제한을 고려한 스마트 하이브리드 데이터 관리자"""
 
-    def __init__(self, is_demo: bool = False):
+    def __init__(self, websocket_manager=None, rest_api_manager=None, data_collector=None):
         # 웹소켓 제한 상수
-        self.WEBSOCKET_LIMIT = 41  # KIS 웹소켓 제한
-        self.STREAMS_PER_STOCK = 3  # 종목당 스트림 수 (체결가 + 호가 + 예상체결)
+        self.WEBSOCKET_LIMIT = 41  # KIS 웹소켓 연결 제한
+        self.STREAMS_PER_STOCK = 3  # 종목당 스트림 수 (체결가, 호가, 체결강도)
         self.MAX_REALTIME_STOCKS = self.WEBSOCKET_LIMIT // self.STREAMS_PER_STOCK  # 13개
 
-        self.is_demo = is_demo
+        # 🎯 웹소켓 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
+        if websocket_manager is None:
+            raise ValueError("❌ websocket_manager는 필수입니다. main.py에서 KISWebSocketManager 인스턴스를 생성하여 주입해주세요.")
+        
+        self.websocket_manager = websocket_manager
+        logger.info("✅ 웹소켓 매니저 주입 완료 (하이브리드 데이터 관리자)")
 
-        # 데이터 수집기
-        self.collector = KISDataCollector(is_demo=is_demo)
+        # 🎯 REST API 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)  
+        if rest_api_manager is None:
+            raise ValueError("❌ rest_api_manager는 필수입니다. main.py에서 KISRestAPIManager 인스턴스를 생성하여 주입해주세요.")
+        
+        logger.info("✅ REST API 매니저 주입 완료 (하이브리드 데이터 관리자)")
 
-        # 웹소켓 매니저
-        self.websocket_manager = KISWebSocketManager()
+        # 🎯 데이터 수집기는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
+        if data_collector is None:
+            raise ValueError("❌ data_collector는 필수입니다. main.py에서 KISDataCollector 인스턴스를 생성하여 주입해주세요.")
+        
+        self.collector = data_collector
+        logger.info("✅ 데이터 수집기 주입 완료 (하이브리드 데이터 관리자)")
+
         self.websocket_running = False
         self.websocket_task: Optional[asyncio.Task] = None
 
@@ -58,7 +71,6 @@ class SimpleHybridDataManager:
             'priority_swaps': 0  # 우선순위 교체 횟수
         }
 
-        logger.info(f"스마트 하이브리드 데이터 관리자 초기화 완료 ({'모의투자' if is_demo else '실전투자'})")
         logger.info(f"웹소켓 제한: {self.WEBSOCKET_LIMIT}건, 최대 실시간 종목: {self.MAX_REALTIME_STOCKS}개")
 
     # === 구독 관리 ===

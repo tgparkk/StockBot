@@ -28,16 +28,13 @@ logger = setup_logger(__name__)
 class KISRestAPIManager:
     """KIS REST API 통합 관리자 (간소화 버전)"""
 
-    def __init__(self, is_demo: bool = False):
+    def __init__(self):
         """초기화"""
-        self.is_demo = is_demo
-
         # 인증 초기화
-        svr = 'vps' if is_demo else 'prod'
+        svr = 'prod'
         if not kis.auth(svr):
             raise ValueError("KIS API 인증 실패")
 
-        logger.info(f"KIS API 매니저 초기화 완료 ({'모의투자' if is_demo else '실전투자'})")
 
     # === 인증 관련 ===
 
@@ -52,13 +49,12 @@ class KISRestAPIManager:
             "app_key": env.my_app[:10] + "...",  # 일부만 표시
             "account": env.my_acct,
             "product": env.my_prod,
-            "url": env.my_url,
-            "is_paper": kis.isPaperTrading()
+            "url": env.my_url
         }
 
     def force_token_refresh(self) -> bool:
         """토큰 강제 갱신"""
-        svr = 'vps' if self.is_demo else 'prod'
+        svr = 'prod'
         return kis.auth(svr)
 
     # === 주문 관련 ===
@@ -720,7 +716,6 @@ class KISRestAPIManager:
         return {
             "account": token_info.get("account", ""),
             "product": token_info.get("product", ""),
-            "is_demo": self.is_demo,
             "is_market_open": self.is_market_open(),
             "total_holdings": balance_info.get("total_count", 0),
             "status": "active" if token_info.get("status") == "success" else "inactive"

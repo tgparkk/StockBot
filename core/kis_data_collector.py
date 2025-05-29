@@ -24,13 +24,22 @@ class DataSource(Enum):
 class KISDataCollector:
     """KIS 데이터 수집기 (간소화 버전)"""
 
-    def __init__(self, is_demo: bool = False):
+    def __init__(self, websocket_manager=None, rest_api_manager=None):
         """초기화"""
-        self.is_demo = is_demo
 
-        # API 매니저들
-        self.rest_api = KISRestAPIManager(is_demo=is_demo)
-        self.websocket = KISWebSocketManager()
+        # 🎯 REST API 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
+        if rest_api_manager is None:
+            raise ValueError("❌ rest_api_manager는 필수입니다. main.py에서 KISRestAPIManager 인스턴스를 생성하여 주입해주세요.")
+        
+        self.rest_api = rest_api_manager
+        logger.info("✅ REST API 매니저 주입 완료 (데이터 수집기)")
+        
+        # 🎯 웹소켓 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
+        if websocket_manager is None:
+            raise ValueError("❌ websocket_manager는 필수입니다. main.py에서 KISWebSocketManager 인스턴스를 생성하여 주입해주세요.")
+        
+        self.websocket = websocket_manager
+        logger.info("✅ 웹소켓 매니저 주입 완료 (데이터 수집기)")
 
         # 콜백 등록
         self.data_callbacks: Dict[str, List[Callable]] = {}
@@ -42,8 +51,6 @@ class KISDataCollector:
             'cache_hits': 0,
             'total_requests': 0
         }
-
-        logger.info(f"데이터 수집기 초기화 완료 ({'모의투자' if is_demo else '실전투자'})")
 
     def get_current_price(self, stock_code: str, use_cache: bool = False) -> Dict:
         """현재가 조회 (실시간 우선)"""
@@ -405,22 +412,3 @@ class KISDataCollector:
         except Exception as e:
             logger.error(f"데이터 신선도 확인 오류: {stock_code} - {e}")
             return {'status': 'error'}
-
-
-# 편의 함수들 (공식 스타일)
-def get_current_price(stock_code: str, is_demo: bool = False) -> Dict:
-    """현재가 간단 조회"""
-    collector = KISDataCollector(is_demo=is_demo)
-    return collector.get_current_price(stock_code)
-
-
-def get_orderbook(stock_code: str, is_demo: bool = False) -> Dict:
-    """호가 간단 조회"""
-    collector = KISDataCollector(is_demo=is_demo)
-    return collector.get_orderbook(stock_code)
-
-
-def get_stock_overview(stock_code: str, is_demo: bool = False) -> Dict:
-    """종목 개요 간단 조회"""
-    collector = KISDataCollector(is_demo=is_demo)
-    return collector.get_stock_overview(stock_code)

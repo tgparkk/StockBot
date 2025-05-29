@@ -75,6 +75,29 @@ class PositionManager:
 
         logger.info("포지션 관리자 초기화 완료")
 
+    # === 수익률 계산 헬퍼 메서드들 ===
+    
+    def _calculate_profit_rate(self, current_price: int, buy_price: int) -> float:
+        """수익률 계산"""
+        if buy_price <= 0:
+            return 0.0
+        return ((current_price - buy_price) / buy_price) * 100
+    
+    def _calculate_profit_loss(self, sell_price: int, buy_price: int, quantity: int) -> int:
+        """손익 계산"""
+        return (sell_price - buy_price) * quantity
+    
+    def _update_position_profit_info(self, position: Dict, current_price: int) -> None:
+        """포지션 수익 정보 업데이트"""
+        profit_rate = self._calculate_profit_rate(current_price, position['buy_price'])
+        position['current_price'] = current_price
+        position['profit_rate'] = profit_rate
+        position['last_update'] = time.time()
+        
+        # 최대 수익률 업데이트
+        if profit_rate > position.get('max_profit_rate', 0):
+            position['max_profit_rate'] = profit_rate
+
     def add_position(self, stock_code: str, quantity: int, buy_price: int,
                     strategy_type: str = "manual") -> bool:
         """포지션 추가"""
@@ -107,8 +130,8 @@ class PositionManager:
                         'status': 'active'
                     }
 
-                    self.stats['total_positions'] += 1
-                    logger.info(f"✅ 새 포지션: {stock_code} {quantity}주 {buy_price:,}원")
+                self.stats['total_positions'] += 1
+                logger.info(f"✅ 새 포지션: {stock_code} {quantity}주 {buy_price:,}원")
 
                 self.stats['active_positions'] = len([p for p in self.positions.values() if p['status'] == 'active'])
                 return True
@@ -129,8 +152,8 @@ class PositionManager:
 
                 if quantity >= position['quantity']:
                     # 전체 매도
-                    profit_loss = (sell_price - position['buy_price']) * position['quantity']
-                    profit_rate = ((sell_price - position['buy_price']) / position['buy_price']) * 100
+                    profit_loss = self._calculate_profit_loss(sell_price, position['buy_price'], position['quantity'])
+                    profit_rate = self._calculate_profit_rate(sell_price, position['buy_price'])
 
                     position['status'] = 'closed'
                     position['sell_price'] = sell_price
@@ -151,7 +174,7 @@ class PositionManager:
                     logger.info(f"✅ 포지션 전체 매도: {stock_code} 수익률 {profit_rate:.2f}%")
                 else:
                     # 부분 매도
-                    profit_loss = (sell_price - position['buy_price']) * quantity
+                    profit_loss = self._calculate_profit_loss(sell_price, position['buy_price'], quantity)
                     position['quantity'] -= quantity
 
                     self.stats['total_profit_loss'] += profit_loss
@@ -166,112 +189,127 @@ class PositionManager:
                 return False
 
     def update_position_prices(self, force_rest_api: bool = False) -> None:
-        """포지션별 현재가 및 수익률 업데이트 - 🎯 웹소켓 우선 사용 정책"""
+        """포지션 가격 업데이트"""
+        if not self.positions:
+            return
+
+        current_time = time.time()
+
+        # 웹소켓 연결 상태 확인 (REST API 강제 사용이 아닌 경우)
+        websocket_available = False
+        
+        if not force_rest_api:
+            websocket_available = self._check_websocket_connection()
+            
+            if not websocket_available:
+                # 재연결 시도 빈도 제한 (5분 간격)
+                if not hasattr(self, '_last_reconnect_attempt'):
+                    self._last_reconnect_attempt = 0
+                
+                if current_time - self._last_reconnect_attempt > 300:  # 5분
+                    logger.warning("🔴 웹소켓 연결 확인 불가 - 재연결 시도 중... (5분 간격)")
+                    
+                    # 재연결 시도
+                    reconnected = self._attempt_websocket_reconnection_with_retry()
+                    
+                    if reconnected:
+                        logger.info("✅ 웹소켓 필수 재연결 성공")
+                        websocket_available = True
+                    else:
+                        logger.debug("재연결 실패 - REST API 백업 사용")
+                    
+                    self._last_reconnect_attempt = current_time
+                else:
+                    logger.debug("재연결 시도 쿨다운 중 - REST API 사용")
+
+        # 웹소켓 우선 시도 (사용 가능한 경우)
+        websocket_success = False
+        if websocket_available:
+            try:
+                websocket_success = self._update_prices_via_websocket()
+                if websocket_success:
+                    logger.debug("✅ 웹소켓을 통한 가격 업데이트 성공")
+                    return
+                else:
+                    logger.debug("웹소켓 가격 업데이트 실패 - REST API로 백업")
+            except Exception as e:
+                logger.error(f"웹소켓 가격 업데이트 오류: {e}")
+
+        # REST API 백업 또는 강제 사용
+        reason = "강제 모드" if force_rest_api else "웹소켓 재연결시도했으나 실패"
+        logger.info(f"💾 REST API 백업 사용: {reason}")
+        self._update_prices_via_rest_api()
+
+    def _update_prices_via_rest_api(self):
+        """REST API를 통한 가격 업데이트"""
         with self.position_lock:
             active_positions = [code for code, pos in self.positions.items() if pos['status'] == 'active']
-
+            
             if not active_positions:
                 return
-
-            # 🎯 웹소켓 우선 사용 정책
-            websocket_available = False
-            websocket_retry_needed = False
             
-            if hasattr(self.data_collector, 'websocket') and self.data_collector.websocket:
-                websocket_available = getattr(self.data_collector.websocket, 'is_connected', False)
-                
-                # 🎯 웹소켓이 연결되지 않은 경우 재연결 시도
-                if not websocket_available and not force_rest_api:
-                    logger.info("🔄 웹소켓 연결 끊김 감지 - 재연결 시도 중...")
-                    websocket_retry_needed = True
-                    
-                    # 웹소켓 재연결 시도
-                    if hasattr(self.data_collector, 'data_manager') and self.data_collector.data_manager:
-                        try:
-                            reconnect_success = self._attempt_websocket_reconnection()
-                            if reconnect_success:
-                                websocket_available = True
-                                logger.info("✅ 웹소켓 재연결 성공 - 웹소켓으로 가격 조회")
-                            else:
-                                logger.warning("⚠️ 웹소켓 재연결 실패 - REST API로 백업")
-                        except Exception as e:
-                            logger.error(f"웹소켓 재연결 시도 오류: {e}")
-
-            # 데이터 수집 방식 결정
-            if force_rest_api or not websocket_available:
-                if websocket_retry_needed:
-                    logger.info(f"💾 REST API 백업 사용: 웹소켓 재연결{'시도했으나 실패' if websocket_retry_needed else '불가'}")
-                else:
-                    logger.info(f"💾 REST API 강제 사용: force={force_rest_api}, websocket_connected={websocket_available}")
-                
-                # REST API 강제 사용 - 캐시 비활성화
-                price_data = {}
-                for stock_code in active_positions:
-                    price_data[stock_code] = self.data_collector.get_fresh_price(stock_code)
-                    time.sleep(0.05)  # API 호출 간격
-            else:
-                # 🎯 웹소켓 우선 사용
-                logger.info(f"📡 웹소켓 우선 사용: {len(active_positions)}개 종목 실시간 조회")
-                # 배치로 현재가 조회 (캐시 우선, 웹소켓→REST API 자동 백업)
-                price_data = self.data_collector.get_multiple_prices(active_positions, use_cache=True)
-
-            # 실패한 종목에 대해서는 REST API 재시도
-            failed_stocks = []
-            for stock_code, position in self.positions.items():
-                if position['status'] != 'active':
-                    continue
-
-                if stock_code in price_data:
-                    price_info = price_data[stock_code]
+            # REST API로 각 종목 가격 조회
+            for stock_code in active_positions:
+                try:
+                    price_info = self.data_collector.get_fresh_price(stock_code)
                     if price_info.get('status') == 'success':
                         current_price = price_info.get('current_price', 0)
                         if current_price > 0:
-                            # 수익률 계산
-                            profit_rate = ((current_price - position['buy_price']) / position['buy_price']) * 100
+                            self._update_position_price(stock_code, current_price)
+                    time.sleep(0.05)  # API 호출 간격
+                except Exception as e:
+                    logger.error(f"REST API 가격 조회 실패: {stock_code} - {e}")
 
-                            # 최대 수익률 업데이트
-                            position['max_profit_rate'] = max(position['max_profit_rate'], profit_rate)
-                            position['current_price'] = current_price
-                            position['profit_rate'] = profit_rate
-                            position['last_update'] = time.time()
-                        else:
-                            failed_stocks.append(stock_code)
-                    else:
-                        failed_stocks.append(stock_code)
-                else:
-                    failed_stocks.append(stock_code)
+    def _update_prices_via_websocket(self) -> bool:
+        """웹소켓을 통한 가격 업데이트"""
+        try:
+            with self.position_lock:
+                active_positions = [code for code, pos in self.positions.items() if pos['status'] == 'active']
+                
+                if not active_positions:
+                    return True
+                
+                # 웹소켓으로 배치 가격 조회
+                price_data = self.data_collector.get_multiple_prices(active_positions, use_cache=True)
+                
+                success_count = 0
+                for stock_code in active_positions:
+                    if stock_code in price_data:
+                        price_info = price_data[stock_code]
+                        if price_info.get('status') == 'success':
+                            current_price = price_info.get('current_price', 0)
+                            if current_price > 0:
+                                self._update_position_price(stock_code, current_price)
+                                success_count += 1
+                
+                # 50% 이상 성공하면 성공으로 간주
+                return success_count >= len(active_positions) * 0.5
+                
+        except Exception as e:
+            logger.error(f"웹소켓 가격 업데이트 오류: {e}")
+            return False
 
-            # 실패한 종목들 REST API로 재시도
-            if failed_stocks and not force_rest_api:
-                logger.warning(f"가격 조회 실패 종목 {len(failed_stocks)}개 - REST API 재시도: {failed_stocks}")
-                for stock_code in failed_stocks:
-                    try:
-                        fresh_data = self.data_collector.get_fresh_price(stock_code)
-                        if fresh_data.get('status') == 'success':
-                            current_price = fresh_data.get('current_price', 0)
-                            if current_price > 0 and stock_code in self.positions:
-                                position = self.positions[stock_code]
-                                profit_rate = ((current_price - position['buy_price']) / position['buy_price']) * 100
-                                position['max_profit_rate'] = max(position['max_profit_rate'], profit_rate)
-                                position['current_price'] = current_price
-                                position['profit_rate'] = profit_rate
-                                position['last_update'] = time.time()
-                                logger.info(f"✅ REST API 백업 성공: {stock_code} {current_price:,}원")
-                        time.sleep(0.05)
-                    except Exception as e:
-                        logger.error(f"REST API 백업 실패: {stock_code} - {e}")
+    def _update_position_price(self, stock_code: str, current_price: int):
+        """개별 포지션 가격 업데이트"""
+        with self.position_lock:
+            if stock_code in self.positions:
+                position = self.positions[stock_code]
+                
+                if position['status'] == 'active' and current_price > 0:
+                    # 헬퍼 메서드를 사용하여 수익 정보 업데이트
+                    self._update_position_profit_info(position, current_price)
+                    
+                    logger.debug(f"📊 포지션 업데이트: {stock_code} {current_price:,}원 "
+                               f"(수익률: {position['profit_rate']:.2f}%)")
 
     def _attempt_websocket_reconnection(self) -> bool:
         """🎯 웹소켓 재연결 시도"""
         try:
-            # 데이터 매니저를 통한 웹소켓 재연결
-            if hasattr(self.data_collector, 'data_manager'):
-                data_manager = self.data_collector.data_manager
+            # 데이터 수집기를 통한 웹소켓 재연결
+            if hasattr(self.data_collector, 'websocket'):
+                websocket_manager = self.data_collector.websocket
                 
-                # 웹소켓 매니저 확인
-                if hasattr(data_manager, 'websocket_manager') and data_manager.websocket_manager:
-                    websocket_manager = data_manager.websocket_manager
-                    
+                if websocket_manager:
                     # 현재 연결 상태 확인
                     is_connected = getattr(websocket_manager, 'is_connected', False)
                     
@@ -279,16 +317,20 @@ class PositionManager:
                         logger.info("🔄 웹소켓 재연결 시도...")
                         
                         # 웹소켓 재시작 시도
-                        if hasattr(data_manager, '_start_websocket_if_needed'):
-                            success = data_manager._start_websocket_if_needed()
-                            if success:
-                                logger.info("✅ 웹소켓 재연결 성공")
-                                return True
-                            else:
-                                logger.warning("⚠️ 웹소켓 재연결 실패")
+                        if hasattr(websocket_manager, 'ensure_connection'):
+                            try:
+                                websocket_manager.ensure_connection()
+                                if getattr(websocket_manager, 'is_connected', False):
+                                    logger.info("✅ 웹소켓 재연결 성공")
+                                    return True
+                                else:
+                                    logger.warning("⚠️ 웹소켓 재연결 실패")
+                                    return False
+                            except Exception as e:
+                                logger.warning(f"웹소켓 ensure_connection 오류: {e}")
                                 return False
                         else:
-                            logger.warning("웹소켓 재시작 메서드 없음")
+                            logger.warning("웹소켓 ensure_connection 메서드 없음")
                             return False
                     else:
                         logger.debug("웹소켓이 이미 연결되어 있음")
@@ -297,12 +339,53 @@ class PositionManager:
                     logger.warning("웹소켓 매니저 없음")
                     return False
             else:
-                logger.warning("데이터 매니저 없음")
+                logger.warning("데이터 수집기에 웹소켓 없음")
                 return False
                 
         except Exception as e:
             logger.error(f"웹소켓 재연결 시도 중 오류: {e}")
             return False
+
+    def _attempt_websocket_reconnection_with_retry(self) -> bool:
+        """🎯 웹소켓 강력한 재연결 시도 (여러 번 재시도)"""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"🔄 웹소켓 재연결 시도 {attempt}/{max_attempts}")
+                
+                if hasattr(self.data_collector, 'websocket'):
+                    websocket_manager = self.data_collector.websocket
+                    
+                    if websocket_manager:
+                        # ensure_connection 메서드 사용 (새로 추가된)
+                        if hasattr(websocket_manager, 'ensure_connection'):
+                            try:
+                                websocket_manager.ensure_connection()
+                                # 연결 상태 확인
+                                if getattr(websocket_manager, 'is_connected', False):
+                                    logger.info(f"✅ 웹소켓 재연결 성공 (시도 {attempt})")
+                                    return True
+                            except Exception as e:
+                                logger.warning(f"⚠️ ensure_connection 실패 (시도 {attempt}): {e}")
+                        
+                        logger.warning(f"⚠️ 웹소켓 재연결 실패 - 시도 {attempt}/{max_attempts}")
+                        
+                        if attempt < max_attempts:
+                            time.sleep(3 * attempt)  # 점진적 대기
+                    else:
+                        logger.error("웹소켓 매니저를 찾을 수 없음")
+                        return False
+                else:
+                    logger.error("데이터 수집기에 웹소켓을 찾을 수 없음")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"웹소켓 재연결 시도 {attempt} 중 오류: {e}")
+                if attempt < max_attempts:
+                    time.sleep(3 * attempt)
+                    
+        logger.error("❌ 모든 웹소켓 재연결 시도 실패")
+        return False
 
     def force_price_update_via_rest_api(self) -> int:
         """모든 포지션 현재가를 REST API로 강제 업데이트"""
@@ -320,7 +403,7 @@ class PositionManager:
         return updated_count
 
     def check_exit_conditions(self) -> List[Dict]:
-        """매도 조건 확인 - 🎯 개선된 수익성 중심 로직"""
+        """매도 조건 확인 - 개선된 수익성 중심 로직"""
         sell_signals = []
 
         with self.position_lock:
@@ -332,65 +415,75 @@ class PositionManager:
                 if not current_price:
                     continue
 
-                profit_rate = position.get('profit_rate', 0)
-                max_profit_rate = position.get('max_profit_rate', 0)
-                strategy_type = position.get('strategy_type', 'default')
-                buy_time = position.get('buy_time', time.time())
-
-                # 전략별 손익 기준
-                targets = self.profit_targets.get(strategy_type, self.profit_targets['default'])
-                stop_loss = targets['stop_loss']
-                take_profit = targets['take_profit']
-                min_holding_minutes = targets.get('min_holding_minutes', 45)
-                trailing_stop_trigger = targets.get('trailing_stop_trigger', 3.5)
-                trailing_stop_gap = targets.get('trailing_stop_gap', 2.0)
-
-                # 홀딩 시간 확인 (분 단위)
-                holding_minutes = (time.time() - buy_time) / 60
-
-                # 🎯 개선된 매도 조건 확인
-                sell_reason = None
-
-                # 1. 💥 극심한 손실 시 즉시 손절 (홀딩시간 무관)
-                if profit_rate <= stop_loss - 3.0:  # 기준보다 3% 더 하락
-                    sell_reason = f"긴급손절 ({profit_rate:.2f}%)"
-                
-                # 2. ⏰ 최소 홀딩 시간 후 매도 조건
-                elif holding_minutes >= min_holding_minutes:
-                    # 2-1. 손절 조건
-                    if profit_rate <= stop_loss:
-                        sell_reason = f"손절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
-                    
-                    # 2-2. 고수익 익절 조건 (기준보다 높을 때만)
-                    elif profit_rate >= take_profit:
-                        sell_reason = f"익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
-                    
-                    # 2-3. 🎯 개선된 트레일링 스톱 (더 관대하게)
-                    elif max_profit_rate >= trailing_stop_trigger and profit_rate <= max_profit_rate - trailing_stop_gap:
-                        sell_reason = f"추격매도 (최고 {max_profit_rate:.2f}% → {profit_rate:.2f}%, {holding_minutes:.0f}분)"
-                
-                # 3. 📈 조기 익절 조건 (매우 높은 수익시만)
-                elif holding_minutes < min_holding_minutes and profit_rate >= take_profit + 2.0:  # 익절 기준보다 2% 더 수익
-                    sell_reason = f"조기익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
-                
-                # 4. ⚡ 장마감 30분 전 강제 매도 방지 (당일매매 아니므로 제거)
-                # 현재는 스윙 트레이딩이므로 장마감 강제 매도 없음
-
-                if sell_reason:
-                    sell_signals.append({
-                        'stock_code': stock_code,
-                        'quantity': position['quantity'],
-                        'current_price': current_price,
-                        'profit_rate': profit_rate,
-                        'max_profit_rate': max_profit_rate,
-                        'holding_minutes': holding_minutes,
-                        'reason': sell_reason,
-                        'strategy_type': strategy_type
-                    })
-                    
-                    logger.info(f"🚨 매도 신호 생성: {stock_code} - {sell_reason} (최고수익: {max_profit_rate:.2f}%)")
+                # 개별 포지션 매도 조건 확인
+                sell_signal = self._check_position_exit_conditions(position)
+                if sell_signal:
+                    sell_signals.append(sell_signal)
 
         return sell_signals
+
+    def _check_position_exit_conditions(self, position: Dict) -> Optional[Dict]:
+        """개별 포지션의 매도 조건 확인"""
+        stock_code = position['stock_code']
+        current_price = position.get('current_price')
+        profit_rate = position.get('profit_rate', 0)
+        max_profit_rate = position.get('max_profit_rate', 0)
+        strategy_type = position.get('strategy_type', 'default')
+        buy_time = position.get('buy_time', time.time())
+
+        # 전략별 손익 기준
+        targets = self.profit_targets.get(strategy_type, self.profit_targets['default'])
+        holding_minutes = (time.time() - buy_time) / 60
+
+        # 매도 조건 확인
+        sell_reason = self._evaluate_sell_conditions(
+            profit_rate, max_profit_rate, holding_minutes, targets
+        )
+
+        if sell_reason:
+            logger.info(f"🚨 매도 신호 생성: {stock_code} - {sell_reason} (최고수익: {max_profit_rate:.2f}%)")
+            
+            return {
+                'stock_code': stock_code,
+                'quantity': position['quantity'],
+                'current_price': current_price,
+                'profit_rate': profit_rate,
+                'max_profit_rate': max_profit_rate,
+                'holding_minutes': holding_minutes,
+                'reason': sell_reason,
+                'strategy_type': strategy_type
+            }
+
+        return None
+
+    def _evaluate_sell_conditions(self, profit_rate: float, max_profit_rate: float, 
+                                 holding_minutes: float, targets: Dict) -> Optional[str]:
+        """매도 조건 평가"""
+        stop_loss = targets['stop_loss']
+        take_profit = targets['take_profit']
+        min_holding_minutes = targets.get('min_holding_minutes', 45)
+        trailing_stop_trigger = targets.get('trailing_stop_trigger', 3.5)
+        trailing_stop_gap = targets.get('trailing_stop_gap', 2.0)
+
+        # 1. 극심한 손실 시 즉시 손절
+        if profit_rate <= stop_loss - 3.0:
+            return f"긴급손절 ({profit_rate:.2f}%)"
+        
+        # 2. 최소 홀딩 시간 후 매도 조건
+        elif holding_minutes >= min_holding_minutes:
+            if profit_rate <= stop_loss:
+                return f"손절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+            elif profit_rate >= take_profit:
+                return f"익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+            elif (max_profit_rate >= trailing_stop_trigger and 
+                  profit_rate <= max_profit_rate - trailing_stop_gap):
+                return f"추격매도 (최고 {max_profit_rate:.2f}% → {profit_rate:.2f}%, {holding_minutes:.0f}분)"
+        
+        # 3. 조기 익절 조건
+        elif holding_minutes < min_holding_minutes and profit_rate >= take_profit + 2.0:
+            return f"조기익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+
+        return None
 
     def execute_auto_sell(self, sell_signal: Dict) -> Optional[str]:
         """자동 매도 실행"""
@@ -635,61 +728,6 @@ class PositionManager:
             logger.debug(f"다중 이격도 매도 신호 확인 오류 ({position.get('stock_code', 'Unknown')}): {e}")
             return None
 
-    def check_sell_signals(self) -> List[Dict]:
-        """매도 신호 확인"""
-        sell_signals = []
-        
-        with self.position_lock:
-            for position in list(self.positions.values()):
-                if position['status'] != 'active':
-                    continue
-                
-                # 🆕 이격도 기반 매도 신호 우선 확인
-                disparity_signal = self._check_disparity_sell_signal(position)
-                if disparity_signal:
-                    sell_signals.append({
-                        'stock_code': position['stock_code'],
-                        'signal': disparity_signal,
-                        'position': position
-                    })
-                    continue  # 이격도 신호가 있으면 다른 신호 체크 생략
-                
-                # 기존 매도 신호 체크
-                try:
-                    # 손익 기반 매도 신호
-                    profit_signal = self._check_profit_loss_signal(position)
-                    if profit_signal:
-                        sell_signals.append({
-                            'stock_code': position['stock_code'],
-                            'signal': profit_signal,
-                            'position': position
-                        })
-                        continue
-                    
-                    # 시간 기반 매도 신호
-                    time_signal = self._check_time_based_signal(position)
-                    if time_signal:
-                        sell_signals.append({
-                            'stock_code': position['stock_code'],
-                            'signal': time_signal,
-                            'position': position
-                        })
-                        continue
-                    
-                    # 트레일링 스톱 신호
-                    trailing_signal = self._check_trailing_stop_signal(position)
-                    if trailing_signal:
-                        sell_signals.append({
-                            'stock_code': position['stock_code'],
-                            'signal': trailing_signal,
-                            'position': position
-                        })
-                
-                except Exception as e:
-                    logger.error(f"매도 신호 확인 오류 ({position['stock_code']}): {e}")
-        
-        return sell_signals
-
     def check_auto_sell(self) -> List[str]:
         """자동 매도 체크 및 실행 - worker_manager 호환용"""
         try:
@@ -727,3 +765,39 @@ class PositionManager:
         except Exception as e:
             logger.error(f"❌ 자동 매도 체크 오류: {e}")
             return []
+
+    def _check_websocket_connection(self) -> bool:
+        """웹소켓 연결 상태 확인 (간소화 버전)"""
+        try:
+            # data_collector를 통해 웹소켓 매니저 접근
+            websocket_manager = getattr(
+                getattr(self.trading_manager, 'data_collector', None), 
+                'websocket', 
+                None
+            )
+            
+            if not websocket_manager:
+                logger.debug("웹소켓 매니저를 찾을 수 없음")
+                return False
+
+            # 기본 연결 상태 확인
+            is_connected = getattr(websocket_manager, 'is_connected', False)
+            is_running = getattr(websocket_manager, 'is_running', False)
+            
+            # 실제 연결 상태 확인
+            actual_connected = websocket_manager._check_actual_connection_status()
+            
+            # 건강성 체크
+            is_healthy = getattr(websocket_manager, 'is_healthy', lambda: False)()
+            
+            # 전체 상태 판단
+            websocket_available = is_connected and is_running and actual_connected and is_healthy
+            
+            logger.debug(f"웹소켓 상태: connected={is_connected}, running={is_running}, "
+                        f"actual={actual_connected}, healthy={is_healthy}")
+            
+            return websocket_available
+                
+        except Exception as e:
+            logger.debug(f"웹소켓 연결 상태 확인 오류: {e}")
+            return False

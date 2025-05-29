@@ -104,12 +104,6 @@ def _setTRENV(cfg: Dict) -> None:
         my_url=cfg['my_url']
     )
 
-
-def isPaperTrading() -> bool:
-    """모의투자 여부"""
-    return _isPaper
-
-
 def changeTREnv(token_key: str, svr: str = 'prod', product: str = '01') -> None:
     """환경 변경"""
     global _isPaper
@@ -117,16 +111,10 @@ def changeTREnv(token_key: str, svr: str = 'prod', product: str = '01') -> None:
     cfg = {}
 
     # settings.py에서 설정 로드
-    if svr == 'prod':  # 실전투자
-        cfg['my_app'] = APP_KEY
-        cfg['my_sec'] = SECRET_KEY
-        cfg['my_url'] = KIS_BASE_URL
-        _isPaper = False
-    elif svr == 'vps':  # 모의투자
-        cfg['my_app'] = APP_KEY  # 모의투자도 동일한 키 사용
-        cfg['my_sec'] = SECRET_KEY
-        cfg['my_url'] = 'https://openapivts.koreainvestment.com:29443'  # 모의투자 URL
-        _isPaper = True
+    cfg['my_app'] = APP_KEY
+    cfg['my_sec'] = SECRET_KEY
+    cfg['my_url'] = KIS_BASE_URL
+    _isPaper = False
 
     # 계좌번호 설정
     if ACCOUNT_NUMBER and len(ACCOUNT_NUMBER) >= 10:
@@ -164,8 +152,6 @@ def auth(svr: str = 'prod', product: str = '01') -> bool:
         }
 
         url = KIS_BASE_URL
-        #if svr == 'vps':
-        #    url = 'https://openapivts.koreainvestment.com:29443'  # 모의투자 URL
 
         url += '/oauth2/tokenP'
 
@@ -305,11 +291,8 @@ def _url_fetch(api_url: str, ptr_id: str, tr_cont: str, params: Dict,
 
     url = f"{_TRENV.my_url}{api_url}"
     
-    # TR ID 설정 (모의투자용 변환)
+    # TR ID 설정
     tr_id = ptr_id
-    if ptr_id[0] in ('T', 'J', 'C'):
-        if isPaperTrading():
-            tr_id = 'V' + ptr_id[1:]
 
     # 재시도 로직
     for attempt in range(_max_retries + 1):
