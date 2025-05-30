@@ -5,12 +5,13 @@
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Any, Tuple
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from utils.logger import setup_logger
 from ..api.rest_api_manager import KISRestAPIManager
 from ..api.kis_market_api import get_disparity_rank, get_multi_period_disparity, get_disparity_trading_signals
+from ..data.data_priority import DataPriority
 
 logger = setup_logger(__name__)
 
@@ -126,6 +127,10 @@ class StockDiscovery:
                     self.candidates['gap_trading'] = gap_candidates
                     self.candidates['volume_breakout'] = volume_candidates
                     self.candidates['momentum'] = momentum_candidates
+
+                # 🆕 프리마켓 후보들도 웹소켓 구독 처리
+                if self.data_manager:
+                    self._subscribe_premarket_candidates(gap_candidates, volume_candidates, momentum_candidates)
 
                 logger.info(f"🌙 프리 마켓 후보 발굴: 갭({len(gap_candidates)}) 볼륨({len(volume_candidates)}) 모멘텀({len(momentum_candidates)})")
             else:
@@ -247,8 +252,6 @@ class StockDiscovery:
                     logger.info(f"🎯 새로운 후보 {len(new_stocks_to_subscribe)}개 발견, 웹소켓 여유 슬롯: {available_slots}개")
 
                     if available_slots > 0:
-                        from core.data_priority import DataPriority
-
                         # 상위 종목들만 구독 (가용 슬롯만큼)
                         stocks_to_add = new_stocks_to_subscribe[:available_slots]
 
@@ -957,3 +960,25 @@ class StockDiscovery:
             self.candidates.clear()
 
         logger.info("✅ 종목 탐색 관리자 정리 완료")
+
+    def _subscribe_premarket_candidates(self, gap_candidates: List[StockCandidate], volume_candidates: List[StockCandidate], momentum_candidates: List[StockCandidate]):
+        """프리마켓 후보들을 웹소켓에 구독하는 로직"""
+        if self.data_manager:
+            # 전략별 우선순위 매핑
+            priority_map = {
+                'gap_trading': DataPriority.HIGH,
+                'volume_breakout': DataPriority.HIGH,
+                'momentum': DataPriority.MEDIUM,
+                'disparity_reversal': DataPriority.MEDIUM
+            }
+
+            # 각 전략별로 후보들을 웹소켓에 구독
+            for strategy_name, candidates in [('gap_trading', gap_candidates), ('volume_breakout', volume_candidates), ('momentum', momentum_candidates)]:
+                for candidate in candidates:
+                    priority = priority_map.get(strategy_name, DataPriority.MEDIUM)
+                    self.data_manager.add_stock_request(
+                        stock_code=candidate.stock_code,
+                        priority=priority,
+                        strategy_name=strategy_name,
+                        callback=self._create_discovery_callback(candidate.stock_code, strategy_name)
+                    )
