@@ -1,15 +1,15 @@
 """
-KIS 데이터 수집기 (공식 스타일)
-WebSocket + REST API 통합 데이터 수집
+KIS 데이터 수집기 (리팩토링 버전)
 """
 import time
 import asyncio
-from typing import Dict, List, Optional, Callable
+import threading
+from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 from utils.logger import setup_logger
 from . import kis_data_cache as cache
-from .rest_api_manager import KISRestAPIManager
-from .kis_websocket_manager import KISWebSocketManager
+from ..api.rest_api_manager import KISRestAPIManager
+from ..websocket.kis_websocket_manager import KISWebSocketManager
 
 logger = setup_logger(__name__)
 
@@ -24,22 +24,11 @@ class DataSource(Enum):
 class KISDataCollector:
     """KIS 데이터 수집기 (간소화 버전)"""
 
-    def __init__(self, websocket_manager=None, rest_api_manager=None):
+    def __init__(self, websocket_manager: KISWebSocketManager, rest_api_manager: KISRestAPIManager):
         """초기화"""
 
-        # 🎯 REST API 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
-        if rest_api_manager is None:
-            raise ValueError("❌ rest_api_manager는 필수입니다. main.py에서 KISRestAPIManager 인스턴스를 생성하여 주입해주세요.")
-        
         self.rest_api = rest_api_manager
-        logger.info("✅ REST API 매니저 주입 완료 (데이터 수집기)")
-        
-        # 🎯 웹소켓 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
-        if websocket_manager is None:
-            raise ValueError("❌ websocket_manager는 필수입니다. main.py에서 KISWebSocketManager 인스턴스를 생성하여 주입해주세요.")
-        
         self.websocket = websocket_manager
-        logger.info("✅ 웹소켓 매니저 주입 완료 (데이터 수집기)")
 
         # 콜백 등록
         self.data_callbacks: Dict[str, List[Callable]] = {}
@@ -62,11 +51,11 @@ class KISDataCollector:
             # 🔍 웹소켓 연결 상태 상세 진단
             websocket_connected = False
             websocket_subscribed = False
-            
+
             if hasattr(self.websocket, 'is_connected'):
                 websocket_connected = self.websocket.is_connected
                 diagnostic_info['websocket_status'] = 'connected' if websocket_connected else 'disconnected'
-                
+
                 # 구독 상태도 확인
                 if websocket_connected and hasattr(self.websocket, 'subscribed_stocks'):
                     websocket_subscribed = stock_code in self.websocket.subscribed_stocks
@@ -76,11 +65,11 @@ class KISDataCollector:
             websocket_data = None
             if websocket_connected:
                 websocket_data = cache.get_cached_price(stock_code)
-                
+
                 if websocket_data and websocket_data.get('source') == DataSource.WEBSOCKET.value:
                     data_age = time.time() - websocket_data.get('timestamp', 0)
                     diagnostic_info['cache_status'] = f'websocket_age_{data_age:.1f}s'
-                    
+
                     # 🎯 웹소켓 데이터이고 신선한 경우 우선 사용
                     if data_age < 5:  # 5초 이내
                         self.stats['cache_hits'] += 1
@@ -117,7 +106,7 @@ class KISDataCollector:
                 diagnostic_info['websocket_status'] = 'no_websocket_manager'
                 diagnostic_info['cache_status'] = 'websocket_disconnected'
                 logger.debug(f"🔴 웹소켓 연결 안됨: {stock_code}")
-                
+
         except Exception as e:
             diagnostic_info['websocket_error'] = str(e)
             logger.debug(f"웹소켓 데이터 확인 오류: {e}")
@@ -131,7 +120,7 @@ class KISDataCollector:
             if data.get('status') == 'success':
                 # 🎯 중요: REST API 데이터 캐시 저장 전략 개선
                 should_cache_rest_data = self._should_cache_rest_api_data(stock_code, data)
-                
+
                 if should_cache_rest_data:
                     cache.cache_current_price(stock_code, data)
                     logger.debug(f"💾 REST API 데이터 캐시 저장: {stock_code}")
@@ -177,19 +166,19 @@ class KISDataCollector:
         try:
             # 현재 캐시에 있는 데이터 확인
             cached_data = cache.get_cached_price(stock_code)
-            
+
             if not cached_data:
                 # 캐시에 데이터가 없으면 REST API 데이터 저장
                 return True
-            
+
             cached_source = cached_data.get('source', 'unknown')
             cached_timestamp = cached_data.get('timestamp', 0)
             rest_timestamp = time.time()
-            
+
             # 🎯 웹소켓 데이터가 있는 경우의 보호 로직
             if cached_source == DataSource.WEBSOCKET.value:
                 cached_age = rest_timestamp - cached_timestamp
-                
+
                 # 웹소켓 데이터가 5분 이내면 REST API 데이터로 덮어쓰지 않음
                 if cached_age < 300:  # 5분
                     logger.debug(f"🛡️ 웹소켓 데이터 보호: {stock_code} (웹소켓 나이: {cached_age:.1f}초)")
@@ -201,7 +190,7 @@ class KISDataCollector:
             else:
                 # 웹소켓이 아닌 데이터는 항상 교체 가능
                 return True
-                
+
         except Exception as e:
             logger.error(f"REST API 캐시 저장 결정 오류: {stock_code} - {e}")
             return True  # 오류 시 저장
@@ -518,7 +507,7 @@ class KISDataCollector:
             return {'status': 'error'}
 
     # ========== 🔍 진단 및 모니터링 메서드들 ==========
-    
+
     def get_websocket_diagnostic(self, stock_code: str = None) -> Dict:
         """🔍 웹소켓 상태 상세 진단"""
         try:
@@ -534,7 +523,7 @@ class KISDataCollector:
                 'cache_status': {},
                 'overall_health': 'unhealthy'
             }
-            
+
             # 웹소켓 매니저 상태 확인
             if hasattr(self, 'websocket') and self.websocket:
                 ws = self.websocket
@@ -546,7 +535,7 @@ class KISDataCollector:
                     'stats': getattr(ws, 'stats', {}),
                     'health_check': getattr(ws, 'is_healthy', lambda: False)()
                 })
-            
+
             # 특정 종목 캐시 상태 확인
             if stock_code:
                 cached_data = cache.get_cached_price(stock_code)
@@ -565,24 +554,24 @@ class KISDataCollector:
                         'exists': False,
                         'reason': 'no_cached_data'
                     }
-            
+
             # 전체 건강성 판단
             ws_manager = diagnostic['websocket_manager']
-            if (ws_manager['exists'] and ws_manager['connected'] and 
+            if (ws_manager['exists'] and ws_manager['connected'] and
                 ws_manager['running'] and ws_manager['health_check']):
                 diagnostic['overall_health'] = 'healthy'
             elif ws_manager['connected']:
                 diagnostic['overall_health'] = 'partially_healthy'
-            
+
             return diagnostic
-            
+
         except Exception as e:
             return {
                 'error': f'진단 중 오류: {e}',
                 'timestamp': time.time(),
                 'overall_health': 'error'
             }
-    
+
     def test_websocket_data_flow(self, stock_code: str = "005930") -> Dict:
         """🧪 웹소켓 데이터 플로우 테스트"""
         test_results = {
@@ -591,87 +580,87 @@ class KISDataCollector:
             'steps': {},
             'success': False
         }
-        
+
         try:
             # 1단계: 웹소켓 연결 확인
             test_results['steps']['1_connection'] = self._test_websocket_connection()
-            
+
             # 2단계: 구독 상태 확인
             test_results['steps']['2_subscription'] = self._test_websocket_subscription(stock_code)
-            
+
             # 3단계: 캐시 데이터 확인
             test_results['steps']['3_cache_data'] = self._test_cache_data(stock_code)
-            
+
             # 4단계: 실시간 데이터 수신 테스트
             test_results['steps']['4_realtime_test'] = self._test_realtime_data_reception(stock_code)
-            
+
             # 전체 성공 여부 판단
             all_passed = all(step.get('passed', False) for step in test_results['steps'].values())
             test_results['success'] = all_passed
-            
+
             return test_results
-            
+
         except Exception as e:
             test_results['error'] = f'테스트 중 오류: {e}'
             return test_results
-    
+
     def _test_websocket_connection(self) -> Dict:
         """웹소켓 연결 테스트"""
         try:
             if not hasattr(self, 'websocket') or not self.websocket:
                 return {'passed': False, 'message': '웹소켓 매니저 없음'}
-            
+
             ws = self.websocket
             connected = getattr(ws, 'is_connected', False)
             running = getattr(ws, 'is_running', False)
             healthy = getattr(ws, 'is_healthy', lambda: False)()
-            
+
             if connected and running and healthy:
                 return {'passed': True, 'message': '웹소켓 연결 정상'}
             else:
                 return {
-                    'passed': False, 
+                    'passed': False,
                     'message': f'웹소켓 상태 이상 (연결:{connected}, 실행:{running}, 건강:{healthy})'
                 }
-                
+
         except Exception as e:
             return {'passed': False, 'message': f'연결 테스트 오류: {e}'}
-    
+
     def _test_websocket_subscription(self, stock_code: str) -> Dict:
         """웹소켓 구독 상태 테스트"""
         try:
             if not hasattr(self, 'websocket') or not self.websocket:
                 return {'passed': False, 'message': '웹소켓 매니저 없음'}
-            
+
             ws = self.websocket
             subscribed_stocks = getattr(ws, 'subscribed_stocks', set())
             is_subscribed = stock_code in subscribed_stocks
-            
+
             if is_subscribed:
                 return {'passed': True, 'message': f'{stock_code} 구독 중'}
             else:
                 return {
-                    'passed': False, 
+                    'passed': False,
                     'message': f'{stock_code} 미구독 (구독 종목: {list(subscribed_stocks)})'
                 }
-                
+
         except Exception as e:
             return {'passed': False, 'message': f'구독 테스트 오류: {e}'}
-    
+
     def _test_cache_data(self, stock_code: str) -> Dict:
         """캐시 데이터 테스트"""
         try:
             cached_data = cache.get_cached_price(stock_code)
-            
+
             if not cached_data:
                 return {'passed': False, 'message': f'{stock_code} 캐시 데이터 없음'}
-            
+
             source = cached_data.get('source', 'unknown')
             age = time.time() - cached_data.get('timestamp', 0)
-            
+
             if source == DataSource.WEBSOCKET.value and age < 30:
                 return {
-                    'passed': True, 
+                    'passed': True,
                     'message': f'웹소켓 캐시 데이터 정상 (나이: {age:.1f}초)'
                 }
             else:
@@ -679,46 +668,46 @@ class KISDataCollector:
                     'passed': False,
                     'message': f'캐시 데이터 문제 (소스: {source}, 나이: {age:.1f}초)'
                 }
-                
+
         except Exception as e:
             return {'passed': False, 'message': f'캐시 테스트 오류: {e}'}
-    
+
     def _test_realtime_data_reception(self, stock_code: str) -> Dict:
         """실시간 데이터 수신 테스트 (30초간 모니터링)"""
         try:
             # 테스트 시작 시점의 캐시 타임스탬프 기록
             initial_data = cache.get_cached_price(stock_code)
             initial_timestamp = initial_data.get('timestamp', 0) if initial_data else 0
-            
+
             # 30초 대기하며 새로운 데이터 수신 확인
             import time
             start_time = time.time()
             timeout = 30  # 30초 타임아웃
-            
+
             while time.time() - start_time < timeout:
                 current_data = cache.get_cached_price(stock_code)
                 if current_data:
                     current_timestamp = current_data.get('timestamp', 0)
                     source = current_data.get('source', 'unknown')
-                    
+
                     # 새로운 웹소켓 데이터가 수신되었는지 확인
-                    if (current_timestamp > initial_timestamp and 
+                    if (current_timestamp > initial_timestamp and
                         source == DataSource.WEBSOCKET.value):
                         return {
                             'passed': True,
                             'message': f'실시간 데이터 수신 확인 ({time.time() - start_time:.1f}초 후)'
                         }
-                
+
                 time.sleep(1)  # 1초마다 확인
-            
+
             return {
                 'passed': False,
                 'message': f'{timeout}초 동안 새로운 웹소켓 데이터 수신 없음'
             }
-            
+
         except Exception as e:
             return {'passed': False, 'message': f'실시간 테스트 오류: {e}'}
-    
+
     def monitor_websocket_data_updates(self, duration_seconds: int = 60) -> Dict:
         """🎬 웹소켓 데이터 업데이트 모니터링"""
         monitoring_results = {
@@ -731,25 +720,25 @@ class KISDataCollector:
                 'avg_update_interval': 0
             }
         }
-        
+
         try:
             start_time = time.time()
             last_check_data = {}
-            
+
             logger.info(f"🎬 웹소켓 데이터 업데이트 모니터링 시작 ({duration_seconds}초)")
-            
+
             while time.time() - start_time < duration_seconds:
                 # 웹소켓 매니저의 구독 종목들 확인
                 if hasattr(self, 'websocket') and self.websocket:
                     subscribed_stocks = getattr(self.websocket, 'subscribed_stocks', set())
-                    
+
                     for stock_code in subscribed_stocks:
                         current_data = cache.get_cached_price(stock_code)
-                        
+
                         if current_data and current_data.get('source') == DataSource.WEBSOCKET.value:
                             current_timestamp = current_data.get('timestamp', 0)
                             last_timestamp = last_check_data.get(stock_code, 0)
-                            
+
                             # 새로운 업데이트 감지
                             if current_timestamp > last_timestamp:
                                 update_info = {
@@ -758,28 +747,28 @@ class KISDataCollector:
                                     'price': current_data.get('current_price', 0),
                                     'age_seconds': time.time() - current_timestamp
                                 }
-                                
+
                                 monitoring_results['updates'].append(update_info)
                                 monitoring_results['stats']['unique_stocks'].add(stock_code)
                                 last_check_data[stock_code] = current_timestamp
-                
+
                 time.sleep(2)  # 2초마다 확인
-            
+
             # 통계 계산
             total_updates = len(monitoring_results['updates'])
             monitoring_results['stats']['total_updates'] = total_updates
             monitoring_results['stats']['unique_stocks'] = len(monitoring_results['stats']['unique_stocks'])
-            
+
             if total_updates > 1:
                 timestamps = [update['timestamp'] for update in monitoring_results['updates']]
                 intervals = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
                 monitoring_results['stats']['avg_update_interval'] = sum(intervals) / len(intervals)
-            
+
             logger.info(f"🎬 모니터링 완료: {total_updates}개 업데이트, "
                        f"{monitoring_results['stats']['unique_stocks']}개 종목")
-            
+
             return monitoring_results
-            
+
         except Exception as e:
             monitoring_results['error'] = f'모니터링 오류: {e}'
             return monitoring_results

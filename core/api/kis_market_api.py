@@ -194,7 +194,7 @@ def get_inquire_daily_price_2(div_code: str = "J", itm_no: str = "", tr_cont: st
 def get_volume_power_rank(fid_cond_mrkt_div_code: str = "J",
                          fid_cond_scr_div_code: str = "20168",
                          fid_input_iscd: str = "0000",
-                         fid_div_cls_code: str = "0",
+                         fid_div_cls_code: str = "1",
                          fid_input_price_1: str = "",
                          fid_input_price_2: str = "",
                          fid_vol_cnt: str = "",
@@ -257,7 +257,7 @@ def get_volume_power_rank(fid_cond_mrkt_div_code: str = "J",
 def get_volume_rank(fid_cond_mrkt_div_code: str = "J",
                    fid_cond_scr_div_code: str = "20171",
                    fid_input_iscd: str = "0000",
-                   fid_div_cls_code: str = "0",
+                   fid_div_cls_code: str = "1",
                    fid_blng_cls_code: str = "0",
                    fid_trgt_cls_code: str = "111111111",
                    fid_trgt_exls_cls_code: str = "0000000000",
@@ -406,10 +406,10 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
         time_context = f"현재시간:{current_time.strftime('%H:%M:%S')}"
         is_market_open = 9 <= current_time.hour < 16
         time_context += f" 장운영:{'Y' if is_market_open else 'N'}"
-        
+
         logger.info(f"🔍 등락률순위 API 호출 - {time_context}")
         logger.debug(f"📋 요청파라미터: 시장={fid_input_iscd}, 등락률={fid_rsfl_rate1}~{fid_rsfl_rate2}%, 정렬={fid_rank_sort_cls_code}")
-        
+
         res = kis._url_fetch(url, tr_id, tr_cont, params)
 
         if res and res.isOK():
@@ -417,14 +417,14 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
                 # 🔧 응답 구조 상세 분석
                 body = res.getBody()
                 logger.debug(f"📄 응답 body 타입: {type(body)}")
-                
+
                 # rt_cd, msg_cd, msg1 확인
                 rt_cd = getattr(body, 'rt_cd', 'Unknown')
                 msg_cd = getattr(body, 'msg_cd', 'Unknown')
                 msg1 = getattr(body, 'msg1', 'Unknown')
-                
+
                 logger.info(f"📡 API 응답상태: rt_cd={rt_cd}, msg_cd={msg_cd}, msg1='{msg1}'")
-                
+
                 # output 확인
                 if hasattr(body, 'output'):
                     output_data = body.output
@@ -439,7 +439,7 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
                 else:
                     logger.error(f"❌ 응답에 output 필드 없음 - body 구조: {dir(body)}")
                     return pd.DataFrame()
-                    
+
             except AttributeError as e:
                 logger.error(f"❌ 등락률 순위 응답 구조 오류: {e}")
                 logger.debug(f"응답 구조: {type(res.getBody())}")
@@ -449,14 +449,14 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
                 rt_cd = getattr(res, 'rt_cd', getattr(res.getBody(), 'rt_cd', 'Unknown') if res.getBody() else 'Unknown')
                 msg1 = getattr(res, 'msg1', getattr(res.getBody(), 'msg1', 'Unknown') if res.getBody() else 'Unknown')
                 logger.error(f"❌ 등락률 순위 조회 실패 - rt_cd:{rt_cd}, msg:'{msg1}'")
-                
+
                 # 🔧 일반적인 오류 원인 안내
                 if rt_cd == '1':
                     if '시간' in str(msg1) or 'time' in str(msg1).lower():
                         logger.warning("💡 힌트: 장 운영 시간 외에는 일부 API가 제한될 수 있습니다")
                     elif '조회' in str(msg1) or 'inquiry' in str(msg1).lower():
                         logger.warning("💡 힌트: API 호출 한도 초과이거나 조회 조건이 너무 제한적일 수 있습니다")
-                        
+
             else:
                 logger.error("❌ 등락률 순위 조회 실패 - 응답 없음 (네트워크 또는 인증 문제)")
             return None
@@ -471,15 +471,15 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
 
 def get_gap_trading_candidates(market: str = "0000",
                                min_gap_rate: float = 2.0,  # 🎯 2% 기본 갭
-                               min_change_rate: float = 1.0,  # 🎯 1.0% 기본 변동률 
+                               min_change_rate: float = 1.0,  # 🎯 1.0% 기본 변동률
                                min_volume_ratio: float = 2.0) -> Optional[pd.DataFrame]: # 🎯 2.0배 기본 거래량
     """갭 트레이딩 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
     from datetime import datetime
-    
+
     try:
         current_time = datetime.now()
         is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
-        
+
         # 🎯 시간대별 기준 완화
         if is_pre_market:
             # 프리마켓: 매우 관대한 기준
@@ -496,7 +496,7 @@ def get_gap_trading_candidates(market: str = "0000",
             min_gap_rate = 1.0  # 1.0% 갭
             min_change_rate = 0.5  # 0.5% 변동률
             min_volume_ratio = 1.5  # 1.5배 거래량
-            min_daily_volume = 60000  # 6만주   
+            min_daily_volume = 60000  # 6만주
             min_price = 1000  # 1000원 이상
             max_price = 1000000  # 100만원 이하
             fluctuation_threshold = "0.5"  # 0.5% 이상
@@ -528,7 +528,7 @@ def get_gap_trading_candidates(market: str = "0000",
             logger.warning(f"🎯 1차 필터링 데이터 없음 - {fallback_threshold}% 이상으로 재시도")
             candidate_data = get_fluctuation_rank(
                 fid_input_iscd=market,
-                fid_rank_sort_cls_code="0",  
+                fid_rank_sort_cls_code="0",
                 fid_rsfl_rate1=fallback_threshold
             )
 
@@ -541,7 +541,7 @@ def get_gap_trading_candidates(market: str = "0000",
                     fid_rsfl_rate1="",  # 등락률 조건 제거
                     fid_vol_cnt=""      # 거래량 조건 제거
                 )
-                
+
                 if candidate_data is None or candidate_data.empty:
                     # 🔧 백업 전략 3: 다른 시장으로 시도
                     if market != "0000":
@@ -552,7 +552,7 @@ def get_gap_trading_candidates(market: str = "0000",
                             fid_rsfl_rate1="",
                             fid_vol_cnt=""
                         )
-                    
+
                     if candidate_data is None or candidate_data.empty:
                         # 🔧 최종 백업: 하락률순으로도 시도 (반대 신호)
                         logger.warning("🎯 최종 백업: 하락률순 조회 (반대매매 후보)")
@@ -562,7 +562,7 @@ def get_gap_trading_candidates(market: str = "0000",
                             fid_rsfl_rate1="",
                             fid_vol_cnt=""
                         )
-                        
+
                         if candidate_data is None or candidate_data.empty:
                             logger.error("🎯 갭 트레이딩: 모든 백업 전략에도 데이터 없음")
                             logger.info("💡 가능한 원인: 1) 장 운영시간 외 2) API 제한 3) 시장 참여자 부족 4) 네트워크 문제")
@@ -611,7 +611,7 @@ def get_gap_trading_candidates(market: str = "0000",
                 # 🎯 적응형 갭 트레이딩 조건
                 if gap_rate >= min_gap_rate:  # 상향갭만
                     volume = int(current_info.get('acml_vol', 0))
-                    
+
                     # 평균 거래량 및 변동률 추출
                     avg_volume_raw = current_info.get('avrg_vol', 0)
                     try:
@@ -640,7 +640,7 @@ def get_gap_trading_candidates(market: str = "0000",
                                     vol = int(row.get('acml_vol', 0)) if row.get('acml_vol') else 0
                                     if vol > 0:
                                         volumes.append(vol)
-                                
+
                                 if volumes:
                                     calculated_avg_volume = sum(volumes) // len(volumes)
                                     safe_avg_volume = max(calculated_avg_volume, 5000)  # 최소 5천주
@@ -666,23 +666,23 @@ def get_gap_trading_candidates(market: str = "0000",
                     # 🔧 거래량 비율 계산 및 상한 제한
                     volume_ratio = volume / safe_avg_volume
                     volume_ratio = min(volume_ratio, 100)  # 최대 100배로 제한 (더 현실적)
-                    
+
                     logger.debug(f"🔧 {stock_code} 거래량 계산: 현재={volume:,}주, 평균={safe_avg_volume:,}주, 비율={volume_ratio:.1f}배")
 
                     # 🎯 적응형 조건 체크
-                    if (volume_ratio >= min_volume_ratio and 
-                        change_rate >= min_change_rate and 
+                    if (volume_ratio >= min_volume_ratio and
+                        change_rate >= min_change_rate and
                         volume >= min_daily_volume):
-                        
+
                         # 🎯 가격대별 필터
                         if current_price < min_price:
                             logger.debug(f"🎯 종목 {stock_code}: 저가주 제외 ({current_price}원)")
                             continue
-                        
+
                         if current_price > max_price:
                             logger.debug(f"🎯 종목 {stock_code}: 고가주 제외 ({current_price}원)")
                             continue
-                        
+
                         gap_candidates.append({
                             'stck_shrn_iscd': stock_code,
                             'hts_kor_isnm': row.get('hts_kor_isnm', ''),
@@ -726,23 +726,23 @@ def get_gap_trading_candidates(market: str = "0000",
 def get_volume_breakout_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
     """거래량 돌파 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
     from datetime import datetime
-    
+
     current_time = datetime.now()
     is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
-    
+
     if is_pre_market:
         # 프리마켓: 매우 관대한 기준
         volume_threshold = "5000"  # 5천주
         logger.info("🌅 프리마켓 거래량 기준: 5천주 (관대)")
     elif current_time.hour < 11:
-        # 장 초반: 관대한 기준  
+        # 장 초반: 관대한 기준
         volume_threshold = "20000"  # 2만주
         logger.info("🌄 장초반 거래량 기준: 2만주")
     else:
         # 정규 시간: 기본 기준
         volume_threshold = "50000"  # 5만주
         logger.info("🕐 정규시간 거래량 기준: 5만주")
-    
+
     return get_volume_rank(
         fid_input_iscd=market,
         fid_blng_cls_code="1",  # 거래증가율
@@ -753,23 +753,23 @@ def get_volume_breakout_candidates(market: str = "0000") -> Optional[pd.DataFram
 def get_momentum_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
     """모멘텀 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
     from datetime import datetime
-    
+
     current_time = datetime.now()
     is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
-    
+
     if is_pre_market:
         # 프리마켓: 매우 관대한 기준
         volume_threshold = "3000"  # 3천주
         logger.info("🌅 프리마켓 체결강도 기준: 3천주 (관대)")
     elif current_time.hour < 11:
         # 장 초반: 관대한 기준
-        volume_threshold = "10000"  # 1만주  
+        volume_threshold = "10000"  # 1만주
         logger.info("🌄 장초반 체결강도 기준: 1만주")
     else:
         # 정규 시간: 기본 기준
         volume_threshold = "30000"  # 3만주 (5만주에서 완화)
         logger.info("🕐 정규시간 체결강도 기준: 3만주")
-    
+
     return get_volume_power_rank(
         fid_input_iscd=market,
         fid_vol_cnt=volume_threshold
@@ -986,14 +986,14 @@ def get_quote_balance_rank(fid_cond_mrkt_div_code: str = "J",
 def get_multi_period_disparity(stock_code: str = "0000") -> Optional[Dict]:
     """
     🆕 다중 기간 이격도 종합 분석
-    
+
     Args:
         stock_code: 종목코드 (특정 종목 분석시 사용)
-    
+
     Returns:
         {
             'short_term': DataFrame,   # 5일 이격도
-            'medium_term': DataFrame,  # 20일 이격도  
+            'medium_term': DataFrame,  # 20일 이격도
             'long_term': DataFrame,    # 60일 이격도
             'analysis': Dict          # 종합 분석 결과
         }
@@ -1005,78 +1005,78 @@ def get_multi_period_disparity(stock_code: str = "0000") -> Optional[Dict]:
             'long_term': None,
             'analysis': {}
         }
-        
+
         # 5일 이격도 (단기 과열/침체)
         d5_data = get_disparity_rank(
             fid_input_iscd="0000",
             fid_hour_cls_code="5",
             fid_vol_cnt="30000"  # 3만주 이상
         )
-        
+
         # 20일 이격도 (중기 트렌드)
         d20_data = get_disparity_rank(
-            fid_input_iscd="0000", 
+            fid_input_iscd="0000",
             fid_hour_cls_code="20",
             fid_vol_cnt="30000"
         )
-        
+
         # 60일 이격도 (장기 흐름)
         d60_data = get_disparity_rank(
             fid_input_iscd="0000",
-            fid_hour_cls_code="60", 
+            fid_hour_cls_code="60",
             fid_vol_cnt="30000"
         )
-        
+
         result['short_term'] = d5_data
         result['medium_term'] = d20_data
         result['long_term'] = d60_data
-        
+
         # 🎯 종합 분석: 이격도 divergence 포착
         if all(data is not None and not data.empty for data in [d5_data, d20_data, d60_data]):
             analysis = _analyze_disparity_divergence(d5_data, d20_data, d60_data)
             result['analysis'] = analysis
-            
+
         logger.info(f"다중 기간 이격도 분석 완료")
         return result
-        
+
     except Exception as e:
         logger.error(f"다중 기간 이격도 분석 오류: {e}")
         return None
 
 
-def _analyze_disparity_divergence(d5_data: pd.DataFrame, 
-                                 d20_data: pd.DataFrame, 
+def _analyze_disparity_divergence(d5_data: pd.DataFrame,
+                                 d20_data: pd.DataFrame,
                                  d60_data: pd.DataFrame) -> Dict:
     """🎯 이격도 divergence 분석 (반전 시점 포착)"""
     try:
         analysis = {
             'strong_buy_candidates': [],    # 강매수 후보
-            'buy_candidates': [],           # 매수 후보  
+            'buy_candidates': [],           # 매수 후보
             'sell_candidates': [],          # 매도 후보
             'strong_sell_candidates': [],   # 강매도 후보
             'divergence_signals': []        # divergence 신호
         }
-        
+
         # 공통 종목 찾기 (모든 기간 데이터에 포함된 종목)
         common_stocks = set(d5_data['mksc_shrn_iscd']) & \
                        set(d20_data['mksc_shrn_iscd']) & \
                        set(d60_data['mksc_shrn_iscd'])
-        
+
         for stock_code in list(common_stocks)[:50]:  # 상위 50개 종목만 분석
             try:
                 # 각 기간별 이격도 추출
                 d5_row = d5_data[d5_data['mksc_shrn_iscd'] == stock_code].iloc[0]
                 d20_row = d20_data[d20_data['mksc_shrn_iscd'] == stock_code].iloc[0]
                 d60_row = d60_data[d60_data['mksc_shrn_iscd'] == stock_code].iloc[0]
-                
+
                 d5_val = float(d5_row.get('d5_dsrt', 100))
                 d20_val = float(d20_row.get('d20_dsrt', 100))
                 d60_val = float(d60_row.get('d60_dsrt', 100))
-                
+
                 stock_name = d20_row.get('hts_kor_isnm', '')
                 current_price = int(d20_row.get('stck_prpr', 0))
                 change_rate = float(d20_row.get('prdy_ctrt', 0))
-                
+
                 stock_info = {
                     'stock_code': stock_code,
                     'stock_name': stock_name,
@@ -1086,66 +1086,66 @@ def _analyze_disparity_divergence(d5_data: pd.DataFrame,
                     'd20_disparity': d20_val,
                     'd60_disparity': d60_val
                 }
-                
+
                 # 🎯 이격도 패턴 분석
-                
+
                 # 1. 강매수 신호: 모든 기간 과매도 + 단기 반등
-                if (d60_val <= 85 and d20_val <= 90 and d5_val <= 95 and 
+                if (d60_val <= 85 and d20_val <= 90 and d5_val <= 95 and
                     change_rate >= 0.5):  # 장기/중기 과매도 + 단기 회복 + 상승
                     stock_info['signal_strength'] = 'STRONG_BUY'
                     stock_info['reason'] = f'전기간 과매도 반등 (60일:{d60_val:.1f}, 20일:{d20_val:.1f}, 5일:{d5_val:.1f})'
                     analysis['strong_buy_candidates'].append(stock_info)
-                
+
                 # 2. 매수 신호: 중장기 과매도 + 단기 정상
                 elif (d20_val <= 90 and d60_val <= 92 and d5_val >= 95 and
                       change_rate >= 0):
                     stock_info['signal_strength'] = 'BUY'
                     stock_info['reason'] = f'중장기 과매도 (20일:{d20_val:.1f}, 60일:{d60_val:.1f})'
                     analysis['buy_candidates'].append(stock_info)
-                
+
                 # 3. 매도 신호: 단기 과열 + 중기 고점
                 elif (d5_val >= 115 and d20_val >= 110 and change_rate >= 2.0):
                     stock_info['signal_strength'] = 'SELL'
                     stock_info['reason'] = f'단중기 과열 (5일:{d5_val:.1f}, 20일:{d20_val:.1f})'
                     analysis['sell_candidates'].append(stock_info)
-                
+
                 # 4. 강매도 신호: 모든 기간 과열
                 elif (d5_val >= 120 and d20_val >= 115 and d60_val >= 110):
                     stock_info['signal_strength'] = 'STRONG_SELL'
                     stock_info['reason'] = f'전기간 과열 (60일:{d60_val:.1f}, 20일:{d20_val:.1f}, 5일:{d5_val:.1f})'
                     analysis['strong_sell_candidates'].append(stock_info)
-                
+
                 # 5. 🎯 Divergence 신호 (추세 반전 신호)
                 # 장기상승 + 단기하락 = 조정 시작
                 if (d60_val >= 105 and d20_val >= 102 and d5_val <= 98):
                     stock_info['signal_strength'] = 'DIVERGENCE_SELL'
                     stock_info['reason'] = f'하향 Divergence (장기 과열, 단기 조정)'
                     analysis['divergence_signals'].append(stock_info)
-                
-                # 장기하락 + 단기상승 = 반등 시작  
+
+                # 장기하락 + 단기상승 = 반등 시작
                 elif (d60_val <= 95 and d20_val <= 98 and d5_val >= 102):
                     stock_info['signal_strength'] = 'DIVERGENCE_BUY'
                     stock_info['reason'] = f'상향 Divergence (장기 침체, 단기 회복)'
                     analysis['divergence_signals'].append(stock_info)
-                    
+
             except Exception as e:
                 logger.warning(f"이격도 divergence 분석 오류 ({stock_code}): {e}")
                 continue
-        
+
         # 신호 강도별 정렬
         for category in ['strong_buy_candidates', 'buy_candidates', 'sell_candidates', 'strong_sell_candidates']:
             analysis[category].sort(key=lambda x: abs(x['change_rate']), reverse=True)
             analysis[category] = analysis[category][:10]  # 상위 10개
-        
+
         logger.info(f"🎯 이격도 divergence 분석 완료: "
                    f"강매수{len(analysis['strong_buy_candidates'])} "
                    f"매수{len(analysis['buy_candidates'])} "
                    f"매도{len(analysis['sell_candidates'])} "
                    f"강매도{len(analysis['strong_sell_candidates'])} "
                    f"divergence{len(analysis['divergence_signals'])}")
-        
+
         return analysis
-        
+
     except Exception as e:
         logger.error(f"이격도 divergence 분석 오류: {e}")
         return {}
@@ -1154,29 +1154,29 @@ def _analyze_disparity_divergence(d5_data: pd.DataFrame,
 def get_disparity_trading_signals() -> Optional[Dict]:
     """
     🆕 이격도 기반 실시간 매매 신호 생성
-    
+
     Returns:
         {
             'timestamp': str,
             'buy_signals': List[Dict],
-            'sell_signals': List[Dict], 
+            'sell_signals': List[Dict],
             'market_status': Dict
         }
     """
     try:
         from datetime import datetime
-        
+
         # 다중 기간 이격도 분석 실행
         multi_disparity = get_multi_period_disparity()
         if not multi_disparity or not multi_disparity['analysis']:
             return None
-        
+
         analysis = multi_disparity['analysis']
-        
+
         # 매매 신호 정리
         buy_signals = []
         sell_signals = []
-        
+
         # 강매수 신호 (최우선)
         for candidate in analysis.get('strong_buy_candidates', []):
             buy_signals.append({
@@ -1190,7 +1190,7 @@ def get_disparity_trading_signals() -> Optional[Dict]:
                 'change_rate': candidate['change_rate'],
                 'priority': 1
             })
-        
+
         # 일반 매수 신호
         for candidate in analysis.get('buy_candidates', []):
             buy_signals.append({
@@ -1204,7 +1204,7 @@ def get_disparity_trading_signals() -> Optional[Dict]:
                 'change_rate': candidate['change_rate'],
                 'priority': 2
             })
-        
+
         # Divergence 매수 신호
         for candidate in analysis.get('divergence_signals', []):
             if candidate['signal_strength'] == 'DIVERGENCE_BUY':
@@ -1219,7 +1219,7 @@ def get_disparity_trading_signals() -> Optional[Dict]:
                     'change_rate': candidate['change_rate'],
                     'priority': 3
                 })
-        
+
         # 매도 신호들
         for candidate in analysis.get('sell_candidates', []):
             sell_signals.append({
@@ -1230,10 +1230,10 @@ def get_disparity_trading_signals() -> Optional[Dict]:
                 'current_price': candidate['current_price'],
                 'disparity_level': candidate['d5_disparity']
             })
-        
+
         # 점수별 정렬 (높은 점수 = 더 과매도)
         buy_signals.sort(key=lambda x: (x['priority'], -x['score']))
-        
+
         # 시장 상태 요약
         market_status = {
             'total_analyzed_stocks': len(analysis.get('strong_buy_candidates', [])) + \
@@ -1243,22 +1243,22 @@ def get_disparity_trading_signals() -> Optional[Dict]:
             'oversold_count': len(analysis.get('strong_buy_candidates', [])) + len(analysis.get('buy_candidates', [])),
             'overbought_count': len(analysis.get('sell_candidates', [])) + len(analysis.get('strong_sell_candidates', [])),
             'divergence_count': len(analysis.get('divergence_signals', [])),
-            'market_sentiment': 'OVERSOLD' if len(analysis.get('strong_buy_candidates', [])) > 5 else 
+            'market_sentiment': 'OVERSOLD' if len(analysis.get('strong_buy_candidates', [])) > 5 else
                               'OVERBOUGHT' if len(analysis.get('strong_sell_candidates', [])) > 5 else 'NEUTRAL'
         }
-        
+
         result = {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'buy_signals': buy_signals[:15],  # 상위 15개 매수 신호
             'sell_signals': sell_signals[:10], # 상위 10개 매도 신호
             'market_status': market_status
         }
-        
+
         logger.info(f"🎯 이격도 매매 신호 생성: 매수{len(buy_signals)} 매도{len(sell_signals)} "
                    f"시장상태{market_status['market_sentiment']}")
-        
+
         return result
-        
+
     except Exception as e:
         logger.error(f"이격도 매매 신호 생성 오류: {e}")
         return None

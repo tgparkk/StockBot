@@ -1,12 +1,12 @@
 """
-주문 실행 관리자 (리팩토링 버전 - 수정)
-KIS REST API를 사용한 간소화된 주문 시스템
+거래 관리자 - 주문 실행 및 포지션 관리
 """
 import time
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional, Any
 from utils.logger import setup_logger
-from .rest_api_manager import KISRestAPIManager
-from .kis_data_collector import KISDataCollector
+from ..api.rest_api_manager import KISRestAPIManager
+from ..data.kis_data_collector import KISDataCollector
+from ..websocket.kis_websocket_manager import KISWebSocketManager
 
 logger = setup_logger(__name__)
 
@@ -14,28 +14,10 @@ logger = setup_logger(__name__)
 class TradingManager:
     """간소화된 주문 실행 관리자"""
 
-    def __init__(self, websocket_manager=None, rest_api_manager=None, data_collector=None):
+    def __init__(self, websocket_manager: KISWebSocketManager, rest_api_manager: KISRestAPIManager, data_collector: KISDataCollector):
         """초기화"""
-
-        # 🎯 REST API 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
-        if rest_api_manager is None:
-            raise ValueError("❌ rest_api_manager는 필수입니다. main.py에서 KISRestAPIManager 인스턴스를 생성하여 주입해주세요.")
-        
         self.rest_api = rest_api_manager
-        logger.info("✅ REST API 매니저 주입 완료 (거래 관리자)")
-        
-        # 🎯 웹소켓 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
-        if websocket_manager is None:
-            raise ValueError("❌ websocket_manager는 필수입니다. main.py에서 KISWebSocketManager 인스턴스를 생성하여 주입해주세요.")
-        
-        logger.info("✅ 웹소켓 매니저 주입 완료 (거래 관리자)")
-
-        # 🎯 데이터 수집기는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
-        if data_collector is None:
-            raise ValueError("❌ data_collector는 필수입니다. main.py에서 KISDataCollector 인스턴스를 생성하여 주입해주세요.")
-        
         self.data_collector = data_collector
-        logger.info("✅ 데이터 수집기 주입 완료 (거래 관리자)")
 
         # 주문 추적
         self.pending_orders: Dict[str, Dict] = {}  # {order_no: order_info}
@@ -186,15 +168,15 @@ class TradingManager:
             if balance and balance.get('status') == 'success':
                 summary = balance.get('summary', {})
                 holdings = balance.get('holdings', [])
-                
+
                 # KIS API 응답 구조에 맞게 매핑
                 total_evaluation = int(summary.get('tot_evlu_amt', 0))        # 총평가금액
                 available_cash = int(summary.get('nxdy_excc_amt', 0))        # 익일정산금액(가용현금)
                 stock_evaluation = int(summary.get('scts_evlu_amt', 0))      # 유가증권평가금액
                 profit_loss = int(summary.get('evlu_pfls_smtl_amt', 0))      # 평가손익합계금액
-                
+
                 logger.debug(f"잔고 조회 결과: 총평가={total_evaluation:,}원, 가용현금={available_cash:,}원, 주식평가={stock_evaluation:,}원")
-                
+
                 return {
                     'success': True,
                     'total_assets': total_evaluation,

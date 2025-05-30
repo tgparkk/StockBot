@@ -1,12 +1,11 @@
 """
-신호 처리기 (리팩토링 버전)
-전략별 매매 신호 분석 및 처리 전담
+신호 처리기 - 거래 신호 생성 및 검증
 """
 import time
 import threading
 from typing import Dict, List, Optional, Any
 from utils.logger import setup_logger
-from .kis_data_collector import KISDataCollector
+from ..data.kis_data_collector import KISDataCollector
 # 임시 전략 관리자 (추후 실제 구현 필요)
 class StrategyManager:
     def get_active_strategies(self):
