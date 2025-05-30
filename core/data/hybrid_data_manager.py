@@ -1,16 +1,17 @@
 """
-KIS 하이브리드 데이터 관리자 (간소화 버전)
-데이터 수집기 + 캐시 + 간단한 스케줄링
+하이브리드 데이터 관리자 (리팩토링 버전)
 """
 import time
-import threading
 import asyncio
-from typing import Dict, List, Optional, Callable, Any
+import threading
+from typing import Dict, List, Optional, Any, Callable
+from enum import Enum
 from utils.logger import setup_logger
-from core.data_priority import DataPriority
 from . import kis_data_cache as cache
 from .kis_data_collector import KISDataCollector
-from .kis_websocket_manager import KISWebSocketManager
+from .data_priority import DataPriority
+from ..websocket.kis_websocket_manager import KISWebSocketManager
+from ..api.rest_api_manager import KISRestAPIManager
 
 logger = setup_logger(__name__)
 
@@ -18,31 +19,15 @@ logger = setup_logger(__name__)
 class SimpleHybridDataManager:
     """웹소켓 제한을 고려한 스마트 하이브리드 데이터 관리자"""
 
-    def __init__(self, websocket_manager=None, rest_api_manager=None, data_collector=None):
+    def __init__(self, websocket_manager: KISWebSocketManager, rest_api_manager: KISRestAPIManager, data_collector: KISDataCollector):
         # 웹소켓 제한 상수
         self.WEBSOCKET_LIMIT = 41  # KIS 웹소켓 연결 제한
         self.STREAMS_PER_STOCK = 3  # 종목당 스트림 수 (체결가, 호가, 체결강도)
         self.MAX_REALTIME_STOCKS = self.WEBSOCKET_LIMIT // self.STREAMS_PER_STOCK  # 13개
 
-        # 🎯 웹소켓 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
-        if websocket_manager is None:
-            raise ValueError("❌ websocket_manager는 필수입니다. main.py에서 KISWebSocketManager 인스턴스를 생성하여 주입해주세요.")
-        
         self.websocket_manager = websocket_manager
-        logger.info("✅ 웹소켓 매니저 주입 완료 (하이브리드 데이터 관리자)")
-
-        # 🎯 REST API 매니저는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)  
-        if rest_api_manager is None:
-            raise ValueError("❌ rest_api_manager는 필수입니다. main.py에서 KISRestAPIManager 인스턴스를 생성하여 주입해주세요.")
-        
-        logger.info("✅ REST API 매니저 주입 완료 (하이브리드 데이터 관리자)")
-
-        # 🎯 데이터 수집기는 반드시 외부에서 주입받아야 함 (main.py에서만 초기화)
-        if data_collector is None:
-            raise ValueError("❌ data_collector는 필수입니다. main.py에서 KISDataCollector 인스턴스를 생성하여 주입해주세요.")
-        
         self.collector = data_collector
-        logger.info("✅ 데이터 수집기 주입 완료 (하이브리드 데이터 관리자)")
+        self.rest_api_manager = rest_api_manager
 
         self.websocket_running = False
         self.websocket_task: Optional[asyncio.Task] = None
@@ -304,7 +289,7 @@ class SimpleHybridDataManager:
             # 🆕 첫 구독인 경우 웹소켓 완전 준비 상태 확인
             if len(self.realtime_stocks) == 0:  # 첫 구독
                 logger.info(f"🎯 첫 구독 시도: {stock_code} - 웹소켓 준비 상태 확인")
-                
+
                 # 웹소켓 준비 상태 확인 및 대기
                 if hasattr(self.websocket_manager, 'ensure_ready_for_subscriptions'):
                     ready = self.websocket_manager.ensure_ready_for_subscriptions()
@@ -343,12 +328,12 @@ class SimpleHybridDataManager:
 
                 self._update_stats()
                 logger.info(f"✅ 실시간 구독 추가: {stock_code} ({len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS})")
-                
+
                 # 🆕 구독 현황 자세히 로깅
                 if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
                     actual_subscribed = self.websocket_manager.get_subscribed_stocks()
                     logger.debug(f"📡 실제 웹소켓 구독 현황: {len(actual_subscribed)}개 - {actual_subscribed}")
-                
+
                 return True
             else:
                 logger.error(f"❌ 실시간 구독 실패: {stock_code}")
@@ -375,14 +360,14 @@ class SimpleHybridDataManager:
             # 🆕 동기 방식 구독 메서드 사용 (이벤트 루프 문제 해결)
             if hasattr(self.websocket_manager, 'subscribe_stock_sync'):
                 logger.debug(f"📡 동기 방식 웹소켓 구독 시도: {stock_code}")
-                
+
                 # 🔧 재시도 로직 추가
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
                         logger.debug(f"📡 구독 시도 {attempt + 1}/{max_retries}: {stock_code}")
                         result = self.websocket_manager.subscribe_stock_sync(stock_code, self._websocket_callback)
-                        
+
                         if result:
                             logger.info(f"✅ 웹소켓 구독 성공 (시도 {attempt + 1}): {stock_code}")
                             return True
@@ -390,15 +375,15 @@ class SimpleHybridDataManager:
                             logger.warning(f"⚠️ 웹소켓 구독 실패 (시도 {attempt + 1}): {stock_code}")
                             if attempt < max_retries - 1:  # 마지막 시도가 아니면
                                 time.sleep(1.0 * (attempt + 1))  # 지수적 백오프
-                                
+
                     except Exception as e:
                         logger.error(f"❌ 웹소켓 구독 예외 (시도 {attempt + 1}): {stock_code} - {e}")
                         if attempt < max_retries - 1:
                             time.sleep(1.0 * (attempt + 1))
-                
+
                 logger.error(f"❌ 웹소켓 구독 최종 실패: {stock_code} (모든 재시도 실패)")
                 return False
-            
+
             # 🔧 기존 async 방식 (fallback)
             result_container = []
             exception_container = []
@@ -624,10 +609,10 @@ class SimpleHybridDataManager:
                     if success:
                         self.websocket_running = True
                         logger.info(f"✅ 웹소켓 연결 성공 (시도 {attempt}/{max_retries})")
-                        
+
                         # 연결 확인 대기
                         time.sleep(2)
-                        
+
                         # 실제 연결 상태 재확인
                         if getattr(self.websocket_manager, 'is_connected', False):
                             logger.info("🎉 웹소켓 연결 최종 확인 완료")
@@ -642,7 +627,7 @@ class SimpleHybridDataManager:
                         if attempt < max_retries:
                             time.sleep(3)  # 재시도 전 대기
                             continue
-                        
+
                 except Exception as e:
                     logger.error(f"❌ 웹소켓 연결 시도 {attempt} 오류: {e}")
                     if attempt < max_retries:
@@ -664,19 +649,19 @@ class SimpleHybridDataManager:
         try:
             if hasattr(self, 'websocket_thread') and self.websocket_thread:
                 logger.info("🧹 기존 웹소켓 스레드 정리 중...")
-                
+
                 # 웹소켓 매니저 상태 정리
                 if self.websocket_manager:
                     self.websocket_manager.is_running = False
                     self.websocket_manager.is_connected = False
-                
+
                 # 스레드 종료 대기 (최대 5초)
                 if self.websocket_thread.is_alive():
                     self.websocket_thread.join(timeout=5)
-                    
+
                 self.websocket_thread = None
                 logger.info("✅ 기존 웹소켓 스레드 정리 완료")
-                
+
         except Exception as e:
             logger.warning(f"⚠️ 웹소켓 정리 중 오류: {e}")
 
@@ -686,16 +671,16 @@ class SimpleHybridDataManager:
             if not self.websocket_manager:
                 logger.error("❌ 웹소켓 매니저가 없습니다")
                 return False
-            
+
             # 웹소켓 연결 시도
             logger.debug("🔌 웹소켓 매니저 연결 시도...")
-            
+
             # 웹소켓 매니저의 연결 메서드 호출
             if hasattr(self.websocket_manager, 'connect'):
                 # 비동기 메서드인 경우 올바르게 처리
                 import asyncio
                 import inspect
-                
+
                 if inspect.iscoroutinefunction(self.websocket_manager.connect):
                     # 비동기 메서드인 경우
                     try:
@@ -723,7 +708,7 @@ class SimpleHybridDataManager:
                 else:
                     # 동기 메서드인 경우
                     success = self.websocket_manager.connect()
-                
+
                 if success:
                     logger.info("✅ 웹소켓 연결 성공")
                     return True
@@ -733,7 +718,7 @@ class SimpleHybridDataManager:
             else:
                 # 연결 메서드가 없으면 기본 시작 로직 사용
                 logger.debug("🔄 웹소켓 매니저 기본 시작...")
-                
+
                 # 웹소켓 스레드 시작
                 if not hasattr(self, 'websocket_thread') or not self.websocket_thread or not self.websocket_thread.is_alive():
                     self.websocket_thread = threading.Thread(
@@ -747,7 +732,7 @@ class SimpleHybridDataManager:
                 else:
                     logger.info("✅ 웹소켓 워커 스레드 이미 실행 중")
                     return True
-                    
+
         except Exception as e:
             logger.error(f"❌ 웹소켓 연결 실행 오류: {e}")
             return False
@@ -756,7 +741,7 @@ class SimpleHybridDataManager:
         """웹소켓 워커 스레드"""
         try:
             logger.info("🏃 웹소켓 워커 시작")
-            
+
             if hasattr(self.websocket_manager, 'start') and callable(self.websocket_manager.start):
                 self.websocket_manager.start()
             else:
@@ -769,7 +754,7 @@ class SimpleHybridDataManager:
                     except Exception as e:
                         logger.error(f"❌ 웹소켓 워커 루프 오류: {e}")
                         break
-                        
+
         except Exception as e:
             logger.error(f"❌ 웹소켓 워커 오류: {e}")
         finally:
@@ -782,18 +767,18 @@ class SimpleHybridDataManager:
             if self.websocket_running and getattr(self.websocket_manager, 'is_connected', False):
                 logger.debug("✅ 웹소켓 연결 상태 양호")
                 return True
-            
+
             # 웹소켓 연결 시도
             logger.info("🔄 웹소켓 연결 보장 모드 - 연결 시도")
             success = self._start_websocket_if_needed()
-            
+
             if success:
                 logger.info("✅ 웹소켓 연결 보장 완료")
             else:
                 logger.warning("⚠️ 웹소켓 연결 보장 실패")
-                
+
             return success
-            
+
         except Exception as e:
             logger.error(f"❌ 웹소켓 연결 보장 중 오류: {e}")
             return False
@@ -894,7 +879,7 @@ class SimpleHybridDataManager:
                 'subscription_count': 0,
                 'usage_ratio': "0/41"
             }
-            
+
             if self.websocket_manager:
                 websocket_details['connected'] = getattr(self.websocket_manager, 'is_connected', False)
                 if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
@@ -902,7 +887,7 @@ class SimpleHybridDataManager:
                     websocket_details['subscription_count'] = len(websocket_details['subscribed_stocks'])
                 if hasattr(self.websocket_manager, 'get_websocket_usage'):
                     websocket_details['usage_ratio'] = self.websocket_manager.get_websocket_usage()
-            
+
             return {
                 'total_subscriptions': len(self.subscriptions),
                 'realtime_subscriptions': len(self.realtime_stocks),

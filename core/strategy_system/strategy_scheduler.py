@@ -1,20 +1,20 @@
 """
-전략 스케줄러 (리팩토링 간소화 버전)
-기존 1365줄을 300줄 이하로 간소화
+전략 스케줄러 - 시간대별 전략 실행 관리
 """
+import time
 import asyncio
 import threading
-from datetime import datetime, time
-from typing import Dict, List, Optional, TYPE_CHECKING, Callable
+from typing import Dict, List, Optional, Any, TYPE_CHECKING, Callable
+from datetime import datetime, timedelta
 from enum import Enum
 from utils.logger import setup_logger
 from .time_slot_manager import TimeSlotManager, TimeSlotConfig
 from .stock_discovery import StockDiscovery, StockCandidate
-from core.rest_api_manager import KISRestAPIManager
-from core.hybrid_data_manager import SimpleHybridDataManager
-from core.data_priority import DataPriority
-from core.technical_indicators import TechnicalIndicators
-from core.trade_database import TradeDatabase
+from ..api.rest_api_manager import KISRestAPIManager
+from ..data.hybrid_data_manager import SimpleHybridDataManager
+from ..data.data_priority import DataPriority
+from ..analysis.technical_indicators import TechnicalIndicators
+from ..trading.trade_database import TradeDatabase
 import time as time_module  # time 모듈과 구분
 
 # 순환 import 방지
@@ -32,7 +32,7 @@ class StrategyPhase(Enum):
 class StrategyScheduler:
     """간소화된 전략 스케줄러"""
 
-    def __init__(self, trading_api: KISRestAPIManager, data_manager: SimpleHybridDataManager):
+    def __init__(self, trading_api: KISRestAPIManager, data_manager: SimpleHybridDataManager, trade_db: TradeDatabase):
         """초기화"""
         self.trading_api = trading_api
         self.data_manager = data_manager
@@ -43,7 +43,7 @@ class StrategyScheduler:
         self.stock_discovery.set_data_manager(data_manager)  # 데이터 매니저 연결
 
         # 🆕 거래 데이터베이스 (종목 선정 기록용)
-        self.trade_db = TradeDatabase()
+        self.trade_db = trade_db
 
         # 스케줄러 상태
         self.scheduler_running = False
@@ -214,7 +214,7 @@ class StrategyScheduler:
         """단일 전략 종목 탐색"""
         try:
             logger.info(f"🔍 {strategy_name} 전략 후보 탐색 시작 (가중치: {weight})")
-            
+
             # 별도 스레드에서 탐색 실행
             loop = asyncio.get_event_loop()
             candidates = await loop.run_in_executor(
@@ -227,11 +227,11 @@ class StrategyScheduler:
                 stock_codes = [c.stock_code for c in candidates]
                 self.active_stocks[strategy_name] = stock_codes
                 logger.info(f"✅ {strategy_name} 전략: {len(stock_codes)}개 종목 발견")
-                
+
                 # 후보 종목 상세 로그
                 for i, candidate in enumerate(candidates[:5]):  # 상위 5개만 로그
                     logger.info(f"   {i+1}. {candidate.stock_code} - {candidate.reason} (점수: {candidate.score:.1f})")
-                    
+
                 if len(candidates) > 5:
                     logger.info(f"   ... 외 {len(candidates)-5}개 종목")
 
@@ -269,15 +269,15 @@ class StrategyScheduler:
                     'volume': getattr(candidate, 'volume', 0),
                     'volume_ratio': getattr(candidate, 'volume_ratio', 0.0),
                     'market_cap': getattr(candidate, 'market_cap', 0),
-                    
+
                     # 전략별 특화 지표
                     'gap_rate': getattr(candidate, 'gap_rate', 0.0),
                     'momentum_strength': getattr(candidate, 'momentum_strength', 0.0),
                     'breakout_volume': getattr(candidate, 'breakout_volume', 0.0),
-                    
+
                     # 기술적 신호 (있다면)
                     'technical_signals': getattr(candidate, 'technical_signals', {}),
-                    
+
                     # 메모
                     'notes': f"가중치: {weight}, 전략: {strategy_name}"
                 }
@@ -315,15 +315,15 @@ class StrategyScheduler:
         """단일 전략 활성화"""
         try:
             stock_codes = self.active_stocks.get(strategy_name, [])
-            
+
             if not stock_codes:
                 logger.warning(f"⚠️ {strategy_name} 전략: 활성화할 종목 없음")
                 return
-                
+
             logger.info(f"🎯 {strategy_name} 전략 활성화 시작: {len(stock_codes)}개 종목")
 
             successful_subscriptions = 0
-            
+
             for i, stock_code in enumerate(stock_codes):
                 try:
                     # 데이터 관리자에 종목 추가 (우선순위와 실시간 여부 설정)
@@ -341,11 +341,11 @@ class StrategyScheduler:
                         strategy_name=strategy_name,
                         callback=callback
                     )
-                    
+
                     if success:
                         successful_subscriptions += 1
                         logger.info(f"   ✅ {stock_code} 구독 성공")
-                        
+
                         # 🆕 데이터베이스에 활성화 상태 업데이트
                         try:
                             self.trade_db.update_stock_activation(stock_code, True, True)
@@ -353,13 +353,13 @@ class StrategyScheduler:
                             logger.error(f"활성화 상태 업데이트 오류 ({stock_code}): {e}")
                     else:
                         logger.warning(f"   ❌ {stock_code} 구독 실패")
-                        
+
                         # 🆕 데이터베이스에 활성화 실패 상태 업데이트
                         try:
                             self.trade_db.update_stock_activation(stock_code, True, False)
                         except Exception as e:
                             logger.error(f"활성화 실패 상태 업데이트 오류 ({stock_code}): {e}")
-                        
+
                 except Exception as e:
                     logger.error(f"   ❌ {stock_code} 구독 중 오류: {e}")
 
@@ -369,7 +369,7 @@ class StrategyScheduler:
             if self.data_manager:
                 websocket_status = self.data_manager.get_status()
                 websocket_details = websocket_status.get('websocket_details', {})
-                
+
                 logger.info(
                     f"📡 [{strategy_name}] 웹소켓 상태: "
                     f"연결={websocket_details.get('connected', False)}, "
@@ -465,7 +465,7 @@ class StrategyScheduler:
 
                 # 🆕 시장 센티먼트 확인
                 market_sentiment = self._get_market_sentiment()
-                
+
                 # 기본 시장 데이터 생성
                 market_data = {
                     'stock_code': stock_code,
@@ -479,14 +479,14 @@ class StrategyScheduler:
 
                 # 전략별 신호 생성 로직
                 signal = self._generate_strategy_signal(strategy_name, market_data)
-                
+
                 if signal:
                     logger.info(f"🎯 {strategy_name} 신호 생성: {stock_code} {signal['signal_type']} @ {current_price:,}원")
-                    
+
                     # 봇 인스턴스에 신호 전달
                     if self.bot_instance:
                         self.bot_instance.handle_trading_signal(signal)
-                    
+
                     # 신호 히스토리 업데이트
                     with self.signal_lock:
                         self.signal_history[stock_code] = {
@@ -506,13 +506,13 @@ class StrategyScheduler:
         try:
             # 간단한 시장 상황 분석
             current_time = time_module.time()
-            
+
             # 캐시된 센티먼트 사용 (1분간 유효)
             if hasattr(self, '_market_sentiment_cache'):
                 cache_time, sentiment = self._market_sentiment_cache
                 if current_time - cache_time < 60:  # 1분 캐시
                     return sentiment
-            
+
             # 기본 센티먼트 (실제로는 코스피/코스닥 지수 등을 활용)
             sentiment = {
                 'bullish_score': 50,  # 0-100 (강세 정도)
@@ -520,14 +520,14 @@ class StrategyScheduler:
                 'sector_rotation': 'balanced',  # 섹터 로테이션 상황
                 'volatility': 'normal'  # 변동성 수준
             }
-            
+
             # 🆕 실제 시장 데이터로 센티먼트 업데이트 (시간이 허락하면)
             try:
                 # 여기에 실제 코스피/코스닥 지수 데이터 활용 가능
                 # 현재는 시간대별 기본값 사용
                 from datetime import datetime
                 now_hour = datetime.now().hour
-                
+
                 if 9 <= now_hour <= 10:  # 장초반
                     sentiment['bullish_score'] = 65
                     sentiment['volatility'] = 'high'
@@ -537,15 +537,15 @@ class StrategyScheduler:
                 elif 14 <= now_hour <= 15:  # 장마감 근처
                     sentiment['bullish_score'] = 45
                     sentiment['volatility'] = 'high'
-                    
+
             except Exception as e:
                 logger.debug(f"센티먼트 업데이트 오류: {e}")
-            
+
             # 센티먼트 캐시 저장
             self._market_sentiment_cache = (current_time, sentiment)
-            
+
             return sentiment
-            
+
         except Exception as e:
             logger.error(f"시장 센티먼트 분석 오류: {e}")
             return {
@@ -598,16 +598,16 @@ class StrategyScheduler:
                     base_strength = min(change_rate / 8.0, 1.0)
                     tech_bonus = tech_score / 200
                     final_strength = min(base_strength + tech_bonus, 1.0)
-                    signal = self._create_signal(stock_code, strategy_name, current_price, final_strength, 
+                    signal = self._create_signal(stock_code, strategy_name, current_price, final_strength,
                                                f'갭 상승 {change_rate:.1f}% (기준: {gap_threshold:.1f}%, 기술: {tech_action})', tech_score)
-                
+
                 # 🆕 중간 신호 (센티먼트 반영)
                 elif 1.0 * sentiment_multiplier <= change_rate < gap_threshold and tech_action == 'BUY' and tech_score > 60:
                     final_strength = min((change_rate / 10.0) + (tech_score / 300), 0.8)
                     signal = self._create_signal(stock_code, f"{strategy_name}_moderate", current_price, final_strength,
                                                f'갭 {change_rate:.1f}% + 기술적 강세 (점수: {tech_score})', tech_score)
-                
-                # 🆕 약한 신호 (센티먼트 반영)  
+
+                # 🆕 약한 신호 (센티먼트 반영)
                 elif 0.5 * sentiment_multiplier <= change_rate < 1.0 * sentiment_multiplier and tech_action == 'BUY' and tech_score > 80:
                     final_strength = min(tech_score / 150, 0.6)
                     signal = self._create_signal(stock_code, f"{strategy_name}_weak", current_price, final_strength,
@@ -622,7 +622,7 @@ class StrategyScheduler:
                     final_strength = min(base_strength + tech_bonus, 1.0)
                     signal = self._create_signal(stock_code, strategy_name, current_price, final_strength,
                                                f'거래량 돌파 {change_rate:.1f}% (기준: {volume_threshold:.1f}%, 기술: {tech_action})', tech_score)
-                
+
                 # 🆕 중간 신호 (거래량 + 기술적 지표, 센티먼트 반영)
                 elif 0.8 * sentiment_multiplier <= change_rate < volume_threshold and volume > 0 and tech_action == 'BUY' and tech_score > 70:
                     # 거래량 정보 추가 고려
@@ -640,7 +640,7 @@ class StrategyScheduler:
                     final_strength = min(base_strength + tech_bonus, 1.0)
                     signal = self._create_signal(stock_code, strategy_name, current_price, final_strength,
                                                f'모멘텀 {change_rate:.1f}% (기준: {momentum_threshold:.1f}%, 기술: {tech_action})', tech_score)
-                
+
                 # 🆕 기술적 우선 신호 (센티먼트 반영)
                 elif change_rate > 0.3 * sentiment_multiplier and tech_action == 'BUY' and tech_score > 85:
                     final_strength = min(tech_score / 120, 0.7)
@@ -679,26 +679,26 @@ class StrategyScheduler:
         try:
             with self.signal_lock:
                 current_time = time_module.time()
-                
+
                 # 기존 히스토리 확인
                 if stock_code in self.signal_history:
                     history = self.signal_history[stock_code]
-                    
+
                     # 쿨다운 시간 체크
                     cooldown_until = history.get('cooldown_until', 0)
                     if current_time < cooldown_until:
                         return False
-                    
+
                     # 1분 이내 같은 전략 중복 체크
                     last_signal_time = history.get('last_signal_time', 0)
                     last_strategy = history.get('strategy', '')
-                    
-                    if (strategy_name == last_strategy and 
+
+                    if (strategy_name == last_strategy and
                         current_time - last_signal_time < 60):
                         return False
-                
+
                 return True
-                
+
         except Exception as e:
             logger.error(f"신호 처리 여부 판단 오류: {e}")
             return True  # 오류시 허용
@@ -710,10 +710,10 @@ class StrategyScheduler:
             current_price = market_data['current_price']
             change_rate = market_data['change_rate']
             market_sentiment = market_data.get('market_sentiment', {})
-            
+
             # 🆕 시장 센티먼트 기반 기준 조정
             sentiment_multiplier = self._get_sentiment_multiplier(market_sentiment)
-            
+
             # 기본 신호 생성 로직 사용 (센티먼트 반영)
             data_for_signal = {
                 'current_price': current_price,
@@ -722,9 +722,9 @@ class StrategyScheduler:
                 'timestamp': market_data.get('timestamp', time_module.time()),
                 'sentiment_multiplier': sentiment_multiplier  # 🆕 센티먼트 승수
             }
-            
+
             return self._generate_simple_signal(strategy_name, stock_code, data_for_signal)
-            
+
         except Exception as e:
             logger.error(f"전략별 신호 생성 오류: {e}")
             return None
@@ -735,10 +735,10 @@ class StrategyScheduler:
             bullish_score = sentiment.get('bullish_score', 50)
             volatility = sentiment.get('volatility', 'normal')
             volume_surge = sentiment.get('volume_surge', False)
-            
+
             # 기본 승수
             multiplier = 1.0
-            
+
             # 강세 시장일수록 기준 완화 (더 많은 기회)
             if bullish_score > 70:
                 multiplier *= 0.8  # 20% 기준 완화
@@ -748,23 +748,23 @@ class StrategyScheduler:
                 multiplier *= 1.2  # 20% 기준 강화 (보수적)
             elif bullish_score < 30:
                 multiplier *= 1.4  # 40% 기준 강화 (매우 보수적)
-            
+
             # 높은 변동성 시 기준 완화 (기회 확대)
             if volatility == 'high':
                 multiplier *= 0.85
             elif volatility == 'low':
                 multiplier *= 1.1
-            
+
             # 거래량 급증 시 기준 완화
             if volume_surge:
                 multiplier *= 0.9
-            
+
             # 최종 승수 범위 제한 (0.6 ~ 1.5)
             multiplier = max(0.6, min(multiplier, 1.5))
-            
+
             logger.debug(f"센티먼트 승수: {multiplier:.2f} (강세:{bullish_score}, 변동성:{volatility})")
             return multiplier
-            
+
         except Exception as e:
             logger.error(f"센티먼트 승수 계산 오류: {e}")
             return 1.0

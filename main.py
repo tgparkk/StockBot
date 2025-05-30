@@ -9,7 +9,7 @@ import signal
 import asyncio
 import threading
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, TYPE_CHECKING
 import pytz
 
 # 프로젝트 루트 경로 설정
@@ -20,29 +20,28 @@ sys.path.insert(0, str(project_root))
 from utils.logger import setup_logger
 
 # 핵심 모듈들
-from core.trading_manager import TradingManager
-from core.position_manager import PositionManager
-from core.strategy_scheduler import StrategyScheduler
-from core.rest_api_manager import KISRestAPIManager
-from core.hybrid_data_manager import SimpleHybridDataManager
-from core.kis_websocket_manager import KISWebSocketManager
-from core.trade_database import TradeDatabase
-from core.trade_executor import TradeConfig, TradeExecutor
-from core.worker_manager import WorkerManager
-from core.kis_data_collector import KISDataCollector
+from core import (
+    TradingManager, PositionManager, StrategyScheduler,
+    KISRestAPIManager, SimpleHybridDataManager, KISWebSocketManager,
+    TradeDatabase, TradeConfig, TradeExecutor, WorkerManager, KISDataCollector
+)
 
 # 설정
 from config.settings import (
     IS_DEMO, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LOG_LEVEL
 )
 
+# 🆕 TYPE_CHECKING을 이용한 순환 import 방지
+if TYPE_CHECKING:
+    from telegram_bot.telegram_manager import TelegramBot
+
 logger = setup_logger(__name__)
 
 # 🆕 텔레그램 봇 조건부 import
-TelegramBot = None
+TelegramBotClass = None
 try:
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        from telegram_bot.telegram_manager import TelegramBot
+        from telegram_bot.telegram_manager import TelegramBot as TelegramBotClass
         logger.info("✅ 텔레그램 봇 모듈 로드 완료")
 except ImportError as e:
     logger.warning(f"⚠️ 텔레그램 봇 모듈 로드 실패: {e}")
@@ -64,28 +63,19 @@ class StockBot:
 
         # 1. REST API 관리자 (단일 인스턴스)
         self.rest_api = KISRestAPIManager()
-        logger.info("✅ REST API 관리자 초기화 완료 (단일 인스턴스)")
 
         # 2. 웹소켓 관리자 (단일 인스턴스)
-        self.websocket_manager = None
-        try:
-            logger.info("🔗 웹소켓 관리자 초기화 중... (단일 인스턴스)")
-            self.websocket_manager = KISWebSocketManager()
-            logger.info("✅ WebSocket 관리자 초기화 완료")
-        except Exception as e:
-            logger.error(f"❌ WebSocket 관리자 초기화 실패: {e}")
-            logger.warning("⚠️ 웹소켓은 필수 구성요소입니다 - 연결 문제를 확인하세요")
+        self.websocket_manager = KISWebSocketManager()
 
         # 3. 데이터 수집기 (단일 인스턴스)
         self.data_collector = KISDataCollector(
             websocket_manager=self.websocket_manager,
             rest_api_manager=self.rest_api
         )
-        logger.info("✅ 데이터 수집기 초기화 완료 (단일 인스턴스)")
 
         # 4. 하이브리드 데이터 관리자 (데이터 수집기 주입)
         self.data_manager = SimpleHybridDataManager(
-            websocket_manager=self.websocket_manager, 
+            websocket_manager=self.websocket_manager,
             rest_api_manager=self.rest_api,
             data_collector=self.data_collector
         )
@@ -114,17 +104,17 @@ class StockBot:
         )
 
         # 9. 전략 스케줄러 (핵심!)
-        self.strategy_scheduler = StrategyScheduler(self.rest_api, self.data_manager)
+        self.strategy_scheduler = StrategyScheduler(self.rest_api, self.data_manager, self.trade_db)
         self.strategy_scheduler.set_bot_instance(self)
-        
+
         # 🆕 StockDiscovery에 TradeExecutor 연결
         self.strategy_scheduler.stock_discovery.set_trade_executor(self.trade_executor)
 
         # 10. 워커 매니저 (스레드 관리 전담)
         self.worker_manager = WorkerManager(self.shutdown_event)
 
-        # 11. 텔레그램 봇
-        self.telegram_bot = self._initialize_telegram_bot()
+        # 11. 텔레그램 봇 (타입 힌트 수정)
+        self.telegram_bot: Optional["TelegramBot"] = self._initialize_telegram_bot()
 
         # 통계
         self.stats = {
@@ -143,18 +133,18 @@ class StockBot:
 
         logger.info("🚀 StockBot 초기화 완료!")
 
-    def _initialize_telegram_bot(self) -> Optional[object]:
+    def _initialize_telegram_bot(self) -> Optional["TelegramBot"]:
         """텔레그램 봇 조건부 초기화"""
-        if not TelegramBot:
+        if not TelegramBotClass:
             logger.info("📱 텔레그램 봇 비활성화 (모듈 로드 실패)")
             return None
-            
+
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.info("📱 텔레그램 봇 비활성화 (설정 누락)")
             return None
-            
+
         try:
-            telegram_bot = TelegramBot(stock_bot_instance=self)  # 🆕 명시적 파라미터 전달
+            telegram_bot = TelegramBotClass(stock_bot_instance=self)  # 🆕 명시적 파라미터 전달
             telegram_bot.set_main_bot_reference(self)
             logger.info("✅ 텔레그램 봇 초기화 완료")
             return telegram_bot
@@ -167,39 +157,39 @@ class StockBot:
         """보유 종목 자동 모니터링 설정 (동기 버전) - active_stocks 통합"""
         try:
             logger.info("📊 보유 종목 모니터링 설정 시작")
-            
+
             balance = self.trading_manager.get_balance()
             holdings = balance.get('holdings', [])
-            
+
             if not holdings:
                 logger.info("보유 종목이 없습니다.")
                 return
-            
+
             logger.info(f"📈 보유 종목 {len(holdings)}개 발견 - 자동 모니터링 설정")
-            
+
             # 🆕 웹소켓 준비 상태 확인 및 대기 (웹소켓 매니저 메서드 사용)
             if self.websocket_manager:
                 self.websocket_manager.ensure_ready_for_subscriptions()
-            
+
             # 🆕 기존 보유 종목을 strategy_scheduler에도 등록하기 위한 리스트
             existing_stock_codes = []
-            
+
             for index, holding in enumerate(holdings):
                 stock_code = holding.get('pdno', '')
                 stock_name = holding.get('prdt_name', '')
                 quantity = int(holding.get('hldg_qty', 0))
                 current_price = int(holding.get('prpr', 0))
                 avg_price = int(float(holding.get('pchs_avg_pric', current_price)))
-                
+
                 if stock_code and quantity > 0:
                     # 간소화된 전략 타입 결정 로직
                     strategy_type = "existing_holding"  # 기본값
-                    
+
                     try:
                         # DB에서 해당 종목의 미결제 포지션 확인
                         open_positions = self.trade_db.get_open_positions()
                         for pos in open_positions:
-                            if (pos['stock_code'] == stock_code and 
+                            if (pos['stock_code'] == stock_code and
                                 pos['buy_price'] == avg_price and
                                 pos['quantity'] == quantity):
                                 # 동일한 종목/가격/수량의 미결제 포지션 발견
@@ -209,7 +199,7 @@ class StockBot:
                         else:
                             # DB에 해당하는 미결제 포지션이 없음 -> 순수 기존 보유
                             logger.info(f"📝 {stock_code} 새로운 기존 보유 종목")
-                            
+
                             # 기존 보유 종목으로 DB에 기록
                             trade_id = self.trade_db.record_existing_position_if_not_exists(
                                 stock_code=stock_code,
@@ -218,13 +208,13 @@ class StockBot:
                                 avg_price=avg_price,
                                 current_price=current_price
                             )
-                            
+
                             if trade_id > 0:
                                 logger.info(f"💾 기존 보유 종목 DB 기록: {stock_code}({stock_name}) (ID: {trade_id})")
-                                
+
                     except Exception as e:
                         logger.debug(f"전략 타입 확인 실패 ({stock_code}): {e}")
-                    
+
                     # 1️⃣ 포지션 매니저에 전략 타입과 함께 추가
                     self.position_manager.add_position(
                         stock_code=stock_code,
@@ -232,14 +222,14 @@ class StockBot:
                         buy_price=avg_price,
                         strategy_type=strategy_type
                     )
-                    
+
                     # 2️⃣ 🆕 active_stocks 리스트에 추가
                     existing_stock_codes.append(stock_code)
-                    
+
                     # 3️⃣ 🆕 데이터 관리자에도 실시간 모니터링 등록 (재시도 로직 포함)
                     try:
-                        from core.hybrid_data_manager import DataPriority
-                        
+                        from core import DataPriority
+
                         # 🔧 웹소켓 구독 안정성 보장 (웹소켓 매니저 메서드 사용)
                         subscription_success = self._safe_subscribe_stock(
                             stock_code=stock_code,
@@ -247,21 +237,21 @@ class StockBot:
                             max_retries=3,
                             retry_delay=0.5
                         )
-                        
+
                         if subscription_success:
                             logger.info(f"📡 {stock_code} 실시간 모니터링 등록 성공")
                         else:
                             logger.warning(f"⚠️ {stock_code} 실시간 모니터링 등록 실패 - REST API 백업 사용")
-                            
+
                     except Exception as e:
                         logger.error(f"데이터 관리자 등록 오류 ({stock_code}): {e}")
-                    
+
                     logger.info(f"✅ 보유종목 등록: {stock_code}({stock_name}) {quantity:,}주 @ {avg_price:,}원")
-                    
+
                     # 🕐 종목 간 간격 (웹소켓 안정성)
                     if index < len(holdings) - 1:  # 마지막이 아니면
                         time.sleep(0.5)  # 🔧 간격 증가 (300ms → 500ms)
-            
+
             # 4️⃣ 🆕 strategy_scheduler의 active_stocks에 기존 보유 종목 추가
             if existing_stock_codes:
                 if hasattr(self.strategy_scheduler, 'active_stocks'):
@@ -269,28 +259,28 @@ class StockBot:
                     logger.info(f"📋 기존 보유 종목 {len(existing_stock_codes)}개를 active_stocks에 등록 완료")
                 else:
                     logger.warning("⚠️ strategy_scheduler.active_stocks가 초기화되지 않음")
-            
+
             logger.info(f"📊 보유 종목 자동 모니터링 설정 완료: {len(existing_stock_codes)}개 (통합 관리)")
-            
+
         except Exception as e:
             logger.error(f"보유 종목 모니터링 설정 오류: {e}")
 
-    def _safe_subscribe_stock(self, stock_code: str, strategy_name: str, 
+    def _safe_subscribe_stock(self, stock_code: str, strategy_name: str,
                              max_retries: int = 3, retry_delay: float = 0.5) -> bool:
         """🔧 안전한 종목 구독 (재시도 로직 포함)"""
         try:
-            from core.hybrid_data_manager import DataPriority
-            
+            from core import DataPriority
+
             for attempt in range(1, max_retries + 1):
                 try:
                     logger.debug(f"📡 {stock_code} 구독 시도 {attempt}/{max_retries}")
-                    
+
                     # 🆕 재시도 전에 기존 실패한 구독 상태 정리 (웹소켓 매니저 메서드 사용)
                     if attempt > 1:
                         if self.websocket_manager:
                             self.websocket_manager.cleanup_failed_subscription(stock_code)
                         time.sleep(0.3)  # 정리 후 잠시 대기
-                    
+
                     # 구독 시도
                     success = self.data_manager.add_stock_request(
                         stock_code=stock_code,
@@ -298,11 +288,11 @@ class StockBot:
                         strategy_name=strategy_name,
                         callback=self._create_existing_holding_callback(stock_code)
                     )
-                    
+
                     if success:
                         # 구독 성공 확인 (짧은 대기 후)
                         time.sleep(0.5)  # 더 충분한 대기 시간
-                        
+
                         # 실제 구독 상태 확인
                         if self._verify_subscription_success(stock_code):
                             logger.debug(f"✅ {stock_code} 구독 성공 (시도 {attempt})")
@@ -317,12 +307,12 @@ class StockBot:
                         # 🆕 구독 실패 시 정리 (웹소켓 매니저 메서드 사용)
                         if self.websocket_manager:
                             self.websocket_manager.cleanup_failed_subscription(stock_code)
-                    
+
                     # 재시도 전 대기
                     if attempt < max_retries:
                         time.sleep(retry_delay)
                         retry_delay *= 1.5  # 점진적 대기 시간 증가
-                    
+
                 except Exception as e:
                     logger.debug(f"❌ {stock_code} 구독 시도 {attempt} 중 오류: {e}")
                     # 🆕 오류 시에도 정리 (웹소켓 매니저 메서드 사용)
@@ -330,13 +320,13 @@ class StockBot:
                         self.websocket_manager.cleanup_failed_subscription(stock_code)
                     if attempt < max_retries:
                         time.sleep(retry_delay)
-            
+
             logger.warning(f"❌ {stock_code} 모든 구독 시도 실패 ({max_retries}회)")
             # 🆕 최종 실패 시에도 정리 (웹소켓 매니저 메서드 사용)
             if self.websocket_manager:
                 self.websocket_manager.cleanup_failed_subscription(stock_code)
             return False
-            
+
         except Exception as e:
             logger.error(f"안전한 구독 프로세스 오류 ({stock_code}): {e}")
             if self.websocket_manager:
@@ -348,14 +338,14 @@ class StockBot:
         try:
             if not self.data_manager:
                 return False
-            
+
             # 데이터 매니저의 구독 상태 확인
             status = self.data_manager.get_status()
             websocket_details = status.get('websocket_details', {})
             subscribed_stocks = websocket_details.get('subscribed_stocks', [])
-            
+
             return stock_code in subscribed_stocks
-            
+
         except Exception as e:
             logger.debug(f"구독 상태 확인 오류 ({stock_code}): {e}")
             return False
@@ -379,16 +369,21 @@ class StockBot:
 
                 # 변화율 기반 알림 (기존 보유 종목용)
                 change_rate = data.get('change_rate', 0)
-                
+
                 # 큰 변화가 있을 때만 로그
                 if abs(change_rate) >= 3.0:  # 3% 이상 변화
                     direction = "📈" if change_rate > 0 else "📉"
                     logger.info(f"{direction} 기존보유 {stock_code}: {current_price:,}원 ({change_rate:+.1f}%)")
-                
+
                 # 5% 이상 급등/급락 시 텔레그램 알림
                 if abs(change_rate) >= 5.0 and hasattr(self, 'telegram_bot') and self.telegram_bot:
                     alert_msg = f"🚨 기존보유 종목 급변동\n📊 {stock_code}: {current_price:,}원 ({change_rate:+.1f}%)"
-                    self.telegram_bot.send_message_async(alert_msg)
+                    try:
+                        self.telegram_bot.send_notification_sync(alert_msg)
+                    except AttributeError:
+                        logger.debug("⚠️ 텔레그램 봇 알림 메서드 없음")
+                    except Exception as e:
+                        logger.error(f"❌ 텔레그램 알림 전송 실패: {e}")
 
             except Exception as e:
                 logger.error(f"기존 보유 종목 콜백 오류 ({stock_code}): {e}")
@@ -399,21 +394,21 @@ class StockBot:
         """보유 종목 설정을 별도 스레드에서 실행 (더 안전한 버전)"""
         try:
             logger.info("📊 보유 종목 모니터링 설정 시작 (별도 스레드)")
-            
+
             def run_setup():
                 """별도 스레드에서 보유 종목 설정 실행"""
                 try:
                     # 🔧 웹소켓이 완전히 준비될 때까지 더 오래 대기
                     time.sleep(5)  # 5초 대기 (기존 2초에서 증가)
-                    
+
                     # 🆕 웹소켓 상태 강제 확인 및 재연결 (웹소켓 매니저 메서드 사용)
                     if self.websocket_manager:
                         self.websocket_manager.force_ready()
-                    
+
                     self._setup_existing_positions_sync()
                 except Exception as e:
                     logger.error(f"보유 종목 설정 오류: {e}")
-            
+
             # 별도 스레드에서 실행
             setup_thread = threading.Thread(
                 target=run_setup,
@@ -421,9 +416,9 @@ class StockBot:
                 daemon=True
             )
             setup_thread.start()
-            
+
             logger.info("✅ 보유 종목 모니터링 설정 스레드 시작")
-            
+
         except Exception as e:
             logger.error(f"보유 종목 설정 스레드 시작 실패: {e}")
 
@@ -438,30 +433,35 @@ class StockBot:
             logger.info("🔄 StockBot 가동 시작...")
 
             signal.signal(signal.SIGINT, self._signal_handler)
-            
+
             # 🆕 워커 매니저를 통한 백그라운드 작업 시작
             self.worker_manager.start_all_workers(self)
-            
+
             # 🆕 전략 스케줄러 백그라운드 시작
             self._start_strategy_scheduler()
-            
+
             # 🆕 텔레그램 봇 시작
             self._start_telegram_bot()
-            
+
             # 🆕 웹소켓 연결 상태 확인 (이벤트 루프 충돌 방지)
             self._check_websocket_status()
-            
+
             # 🆕 보유 종목 자동 모니터링 설정
             self._setup_existing_positions_threaded()
-            
+
             logger.info("✅ StockBot 완전 가동!")
-            
+
             # 🆕 텔레그램 시작 알림 전송
             if self.telegram_bot:
-                self.telegram_bot.send_startup_notification()
+                try:
+                    self.telegram_bot.send_startup_notification()
+                except AttributeError:
+                    logger.warning("⚠️ 텔레그램 봇 메서드 호출 실패 (메서드 없음)")
+                except Exception as e:
+                    logger.error(f"❌ 텔레그램 시작 알림 전송 실패: {e}")
             else:
                 logger.debug("📱 텔레그램 봇이 비활성화되어 시작 알림을 보내지 않습니다")
-            
+
             self._main_loop()
 
         except Exception as e:
@@ -474,21 +474,21 @@ class StockBot:
         """전략 스케줄러 백그라운드 시작"""
         try:
             logger.info("📅 전략 스케줄러 백그라운드 시작...")
-            
+
             def run_scheduler():
                 """스케줄러 실행 함수"""
                 try:
                     # 새 이벤트 루프 생성
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    
+
                     # 스케줄러 시작
                     loop.run_until_complete(self.strategy_scheduler.start_scheduler())
                 except Exception as e:
                     logger.error(f"전략 스케줄러 실행 오류: {e}")
                 finally:
                     loop.close()
-            
+
             # 별도 스레드에서 스케줄러 실행
             scheduler_thread = threading.Thread(
                 target=run_scheduler,
@@ -496,9 +496,9 @@ class StockBot:
                 daemon=True
             )
             scheduler_thread.start()
-            
+
             logger.info("✅ 전략 스케줄러 백그라운드 시작 완료")
-            
+
         except Exception as e:
             logger.error(f"전략 스케줄러 시작 실패: {e}")
 
@@ -561,12 +561,12 @@ class StockBot:
     def _main_loop(self):
         """메인 실행 루프"""
         logger.info("🔄 메인 루프 시작")
-        
+
         # 초기 상태 확인 및 로깅
         initial_market_status = self._check_market_status()
         logger.info(f"📅 현재 시간: {initial_market_status['current_date']} {initial_market_status['current_time']} (KST)")
         logger.info(f"📈 시장 상태: {initial_market_status['status']}")
-        
+
         if initial_market_status['is_premarket']:
             logger.info("🌅 프리마켓 시간 - 전략 스케줄러가 프리마켓 준비를 시작합니다")
         elif initial_market_status['is_open']:
@@ -580,19 +580,19 @@ class StockBot:
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 loop_count += 1
-                
+
                 # 10분마다 상세 상태 로깅
                 if loop_count % 60 == 1:  # 10초 * 60 = 10분
                     market_status = self._check_market_status()
                     system_status = self.get_system_status()
-                    
+
                     logger.info(f"🔄 시스템 상태 체크 #{loop_count//60 + 1}")
                     logger.info(f"   📅 시간: {market_status['current_time']} ({market_status['status']})")
                     logger.info(f"   🤖 봇 가동시간: {system_status['uptime']//60:.0f}분")
                     logger.info(f"   📊 처리된 신호: {system_status['stats']['signals_processed']}개")
                     logger.info(f"   💰 실행된 주문: {system_status['stats']['orders_executed']}개")
                     logger.info(f"   🔗 웹소켓 연결: {'✅' if system_status['websocket_connected'] else '❌'}")
-                    
+
                     # 전략 스케줄러 상태
                     scheduler_status = self.strategy_scheduler.get_status()
                     logger.info(f"   📅 현재 시간대: {scheduler_status.get('current_slot', 'None')}")
@@ -621,13 +621,13 @@ class StockBot:
         """거래 신호 처리 - TradeExecutor 사용"""
         try:
             logger.info(f"📊 거래 신호 수신: {signal.get('stock_code', 'UNKNOWN')}")
-            
+
             # TradeExecutor를 통한 신호 처리
             result = self.trade_executor.handle_signal(signal)
-            
+
             if result.get('success'):
                 logger.info(f"✅ 거래 신호 처리 성공: {result.get('message', '')}")
-                
+
                 # 통계 업데이트
                 self.stats['signals_processed'] += 1
                 if result.get('order_executed'):
@@ -638,7 +638,7 @@ class StockBot:
                         self.stats['positions_closed'] += 1
             else:
                 logger.warning(f"⚠️ 거래 신호 처리 실패: {result.get('message', '')}")
-                
+
         except Exception as e:
             logger.error(f"❌ 거래 신호 처리 오류: {e}")
 
@@ -646,27 +646,27 @@ class StockBot:
         """시장 상태 확인"""
         try:
             from datetime import datetime
-            
+
             # 한국 시간대 사용
             kst = pytz.timezone('Asia/Seoul')
             now = datetime.now(kst)
-            
+
             # 평일 체크 (월~금: 0~4)
             is_weekday = now.weekday() < 5
-            
+
             # 시장 시간 체크 (9:00~15:30)
             current_time = now.time()
             market_open = datetime.strptime("09:00", "%H:%M").time()
             market_close = datetime.strptime("15:30", "%H:%M").time()
             is_market_hours = market_open <= current_time <= market_close
-            
+
             # 프리마켓 시간 체크 (8:30~9:00)
             premarket_open = datetime.strptime("08:30", "%H:%M").time()
             is_premarket = premarket_open <= current_time < market_open
-            
+
             # 전체 거래 가능 시간 (프리마켓 + 정규장)
             is_trading_time = is_weekday and (is_premarket or is_market_hours)
-            
+
             status_text = "휴장"
             if is_weekday:
                 if is_premarket:
@@ -677,7 +677,7 @@ class StockBot:
                     status_text = "장외시간"
             else:
                 status_text = "주말"
-            
+
             return {
                 'is_open': is_market_hours,
                 'is_trading_time': is_trading_time,
@@ -698,7 +698,7 @@ class StockBot:
             uptime = time.time() - self.stats['start_time']
             hours = int(uptime // 3600)
             minutes = int((uptime % 3600) // 60)
-            
+
             print("\n" + "="*50)
             print("📊 StockBot 실행 통계")
             print("="*50)
@@ -708,7 +708,7 @@ class StockBot:
             print(f"📊 열린 포지션: {self.stats['positions_opened']}개")
             print(f"💵 닫힌 포지션: {self.stats['positions_closed']}개")
             print("="*50)
-            
+
         except Exception as e:
             logger.error(f"최종 통계 출력 오류: {e}")
 
@@ -727,7 +727,7 @@ class StockBot:
                 'market_status': self._check_market_status(),
                 'positions': len(self.position_manager.get_positions('active')),
                 'websocket_connected': (
-                    self.websocket_manager.is_connected 
+                    self.websocket_manager.is_connected
                     if self.websocket_manager else False
                 )
             }
@@ -740,17 +740,18 @@ class StockBot:
         if self.telegram_bot:
             try:
                 # 봇이 이미 실행 중인지 더 확실히 확인
-                if hasattr(self.telegram_bot, 'running') and self.telegram_bot.running:
+                if hasattr(self.telegram_bot, 'running') and getattr(self.telegram_bot, 'running', False):
                     logger.info("📨 텔레그램 봇이 이미 실행 중입니다")
                     return
-                
-                if hasattr(self.telegram_bot, 'application') and self.telegram_bot.application:
-                    if hasattr(self.telegram_bot.application, 'running') and self.telegram_bot.application.running:
+
+                if hasattr(self.telegram_bot, 'application') and getattr(self.telegram_bot, 'application', None):
+                    application = getattr(self.telegram_bot, 'application', None)
+                    if application and hasattr(application, 'running') and getattr(application, 'running', False):
                         logger.info("📨 텔레그램 애플리케이션이 이미 실행 중입니다")
                         return
-                
+
                 logger.info("📨 텔레그램 봇 시작 시도")
-                
+
                 # 기존 인스턴스 정리
                 if hasattr(self.telegram_bot, 'stop_bot'):
                     try:
@@ -758,18 +759,22 @@ class StockBot:
                         time.sleep(1)  # 정리 대기
                     except Exception as e:
                         logger.debug(f"기존 텔레그램 봇 정리 중 오류 (무시): {e}")
-                
+
                 # 새로 시작
-                self.telegram_bot.start_bot()
-                
+                if hasattr(self.telegram_bot, 'start_bot'):
+                    self.telegram_bot.start_bot()
+                else:
+                    logger.warning("⚠️ 텔레그램 봇에 start_bot 메서드가 없습니다")
+                    return
+
                 # 시작 확인
                 time.sleep(2)  # 충분한 대기
-                
-                if hasattr(self.telegram_bot, 'running') and self.telegram_bot.running:
+
+                if hasattr(self.telegram_bot, 'running') and getattr(self.telegram_bot, 'running', False):
                     logger.info("✅ 텔레그램 봇 시작 완료")
                 else:
                     logger.warning("⚠️ 텔레그램 봇 시작 상태 확인 불가")
-                    
+
             except Exception as e:
                 logger.error(f"❌ 텔레그램 봇 시작 실패: {e}")
                 logger.info("📱 텔레그램 봇이 비활성화되어 시작하지 않습니다")
@@ -780,16 +785,16 @@ class StockBot:
         """웹소켓 연결 상태 확인 (안전한 방식)"""
         try:
             logger.info("🔗 웹소켓 연결 상태 확인")
-            
+
             if self.websocket_manager:
                 # 현재 연결 상태만 확인
                 is_connected = getattr(self.websocket_manager, 'is_connected', False)
-                
+
                 if is_connected:
                     logger.info("✅ 웹소켓 이미 연결됨")
                 else:
                     logger.warning("⚠️ 웹소켓 연결되지 않음 - 백그라운드에서 자동 연결됩니다")
-                    
+
                     # 별도 스레드에서 안전하게 연결 시도
                     def websocket_connect_thread():
                         try:
@@ -798,7 +803,7 @@ class StockBot:
                             logger.info("✅ 웹소켓 백그라운드 연결 완료")
                         except Exception as e:
                             logger.error(f"❌ 웹소켓 백그라운드 연결 실패: {e}")
-                    
+
                     import threading
                     websocket_thread = threading.Thread(
                         target=websocket_connect_thread,
@@ -808,7 +813,7 @@ class StockBot:
                     websocket_thread.start()
             else:
                 logger.error("❌ 웹소켓 매니저가 없습니다")
-                
+
         except Exception as e:
             logger.error(f"❌ 웹소켓 상태 확인 실패: {e}")
             logger.warning("⚠️ 웹소켓은 필수 구성요소입니다 - 연결 문제를 확인하세요")
@@ -817,16 +822,25 @@ class StockBot:
 def main():
     """메인 함수"""
     try:
+        print("DEBUG: main() 함수 시작")
         logger.info("🚀 StockBot 시작...")
-        
+
+        print("DEBUG: StockBot 인스턴스 생성 중...")
         bot = StockBot()
+        print("DEBUG: StockBot 인스턴스 생성 완료")
+
+        print("DEBUG: bot.start() 호출 중...")
         bot.start()
-        
+        print("DEBUG: bot.start() 완료")
+
     except KeyboardInterrupt:
+        print("DEBUG: KeyboardInterrupt 발생")
         logger.info("⌨️ 사용자가 중단했습니다.")
     except Exception as e:
+        print(f"DEBUG: Exception 발생: {e}")
         logger.error(f"❌ 예상치 못한 오류: {e}")
     finally:
+        print("DEBUG: main() 함수 종료")
         logger.info("👋 StockBot 종료")
 
 
