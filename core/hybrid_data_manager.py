@@ -314,8 +314,8 @@ class SimpleHybridDataManager:
                         logger.warning("⚠️ 웹소켓 구독 준비 실패 - 동기 방식으로 시도")
                 else:
                     # 준비 상태 확인 메서드가 없는 경우 기본 대기
-                    logger.info("🔄 웹소켓 안정화 대기 (기본 3초)")
-                    time.sleep(3)
+                    logger.info("🔄 웹소켓 안정화 대기 (기본 2초)")
+                    time.sleep(2)  # 🔧 대기 시간 단축 (3초 → 2초)
 
             # 이미 구독 중인지 확인
             if hasattr(self.websocket_manager, 'subscribed_stocks'):
@@ -343,26 +343,61 @@ class SimpleHybridDataManager:
 
                 self._update_stats()
                 logger.info(f"✅ 실시간 구독 추가: {stock_code} ({len(self.realtime_stocks)}/{self.MAX_REALTIME_STOCKS})")
+                
+                # 🆕 구독 현황 자세히 로깅
+                if hasattr(self.websocket_manager, 'get_subscribed_stocks'):
+                    actual_subscribed = self.websocket_manager.get_subscribed_stocks()
+                    logger.debug(f"📡 실제 웹소켓 구독 현황: {len(actual_subscribed)}개 - {actual_subscribed}")
+                
                 return True
             else:
                 logger.error(f"❌ 실시간 구독 실패: {stock_code}")
+                # 🔧 실패해도 폴링으로 대체하여 계속 진행
+                self._add_to_polling(stock_code)
+                logger.info(f"📡 {stock_code} 폴링으로 대체하여 계속 진행")
                 return False
 
         except Exception as e:
             logger.error(f"실시간 구독 오류: {stock_code} - {e}")
+            # 🔧 예외 발생시에도 폴링으로 대체
+            try:
+                self._add_to_polling(stock_code)
+                logger.info(f"📡 {stock_code} 예외 발생으로 폴링 대체")
+            except Exception as fallback_e:
+                logger.error(f"폴링 대체도 실패: {stock_code} - {fallback_e}")
             return False
 
     def _execute_websocket_subscription(self, stock_code: str) -> bool:
-        """웹소켓 구독 실행 (별도 스레드)"""
+        """웹소켓 구독 실행 (안정성 강화 버전)"""
         try:
             logger.debug(f"🔗 웹소켓 구독 실행: {stock_code}")
 
             # 🆕 동기 방식 구독 메서드 사용 (이벤트 루프 문제 해결)
             if hasattr(self.websocket_manager, 'subscribe_stock_sync'):
                 logger.debug(f"📡 동기 방식 웹소켓 구독 시도: {stock_code}")
-                result = self.websocket_manager.subscribe_stock_sync(stock_code, self._websocket_callback)
-                logger.debug(f"📡 동기 방식 웹소켓 구독 결과: {stock_code} = {result}")
-                return result
+                
+                # 🔧 재시도 로직 추가
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        logger.debug(f"📡 구독 시도 {attempt + 1}/{max_retries}: {stock_code}")
+                        result = self.websocket_manager.subscribe_stock_sync(stock_code, self._websocket_callback)
+                        
+                        if result:
+                            logger.info(f"✅ 웹소켓 구독 성공 (시도 {attempt + 1}): {stock_code}")
+                            return True
+                        else:
+                            logger.warning(f"⚠️ 웹소켓 구독 실패 (시도 {attempt + 1}): {stock_code}")
+                            if attempt < max_retries - 1:  # 마지막 시도가 아니면
+                                time.sleep(1.0 * (attempt + 1))  # 지수적 백오프
+                                
+                    except Exception as e:
+                        logger.error(f"❌ 웹소켓 구독 예외 (시도 {attempt + 1}): {stock_code} - {e}")
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0 * (attempt + 1))
+                
+                logger.error(f"❌ 웹소켓 구독 최종 실패: {stock_code} (모든 재시도 실패)")
+                return False
             
             # 🔧 기존 async 방식 (fallback)
             result_container = []
@@ -664,15 +699,26 @@ class SimpleHybridDataManager:
                 if inspect.iscoroutinefunction(self.websocket_manager.connect):
                     # 비동기 메서드인 경우
                     try:
-                        # 새로운 이벤트 루프에서 실행
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
+                        # 🔧 이벤트 루프 상태 확인 및 안전한 처리
                         try:
-                            success = loop.run_until_complete(self.websocket_manager.connect())
-                        finally:
-                            loop.close()
+                            # 현재 실행 중인 루프가 있는지 확인
+                            current_loop = asyncio.get_running_loop()
+                            logger.warning("⚠️ 이미 실행 중인 이벤트 루프 감지 - 웹소켓 연결 스킵")
+                            # 기존 루프가 실행 중이면 연결을 건너뛰고 성공으로 처리
+                            # (백그라운드에서 웹소켓이 실행될 것으로 가정)
+                            return True
+                        except RuntimeError:
+                            # 실행 중인 루프가 없음 - 새로운 루프에서 실행
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                success = loop.run_until_complete(self.websocket_manager.connect())
+                            finally:
+                                loop.close()
+                                asyncio.set_event_loop(None)  # 루프 정리
                     except Exception as e:
                         logger.warning(f"⚠️ 비동기 웹소켓 연결 오류: {e}")
+                        # 웹소켓 연결 실패해도 시스템은 계속 동작 (폴링 모드로)
                         success = False
                 else:
                     # 동기 메서드인 경우
@@ -682,7 +728,7 @@ class SimpleHybridDataManager:
                     logger.info("✅ 웹소켓 연결 성공")
                     return True
                 else:
-                    logger.warning("⚠️ 웹소켓 연결 실패")
+                    logger.warning("⚠️ 웹소켓 연결 실패 - 폴링 모드로 계속 진행")
                     return False
             else:
                 # 연결 메서드가 없으면 기본 시작 로직 사용

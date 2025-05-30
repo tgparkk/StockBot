@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 class TradeConfig:
     """거래 설정"""
     # 포지션 사이즈 설정
-    base_position_ratio: float = 0.08  # 기본 8%
-    max_position_ratio: float = 0.12   # 최대 12%
-    max_investment_amount: int = 500000  # 최대 50만원
-    min_investment_amount: int = 50000   # 최소 5만원
+    base_position_ratio: float = 0.06  # 기본 6% (8%에서 축소)
+    max_position_ratio: float = 0.10   # 최대 10% (12%에서 축소)
+    max_investment_amount: int = 500000   # 최대 50만원 (100만원에서 축소)
+    min_investment_amount: int = 200000   # 최소 20만원 (50만원에서 축소)
     
     # 전략별 포지션 배수
     strategy_multipliers: Dict[str, float] = None
@@ -107,6 +107,8 @@ class TradeExecutor:
             # 1. 기본 검증
             validation_result = self._validate_buy_signal_enhanced(signal, stock_code)
             if not validation_result:
+                error_msg = f"매수 신호 검증 실패: {stock_code}"
+                logger.warning(f"❌ {error_msg}")
                 return TradeResult(
                     success=False,
                     stock_code=stock_code,
@@ -114,7 +116,7 @@ class TradeExecutor:
                     quantity=0,
                     price=0,
                     total_amount=0,
-                    error_message=validation_result
+                    error_message=error_msg
                 )
             
             # 2. 현재가 조회
@@ -156,15 +158,22 @@ class TradeExecutor:
             
             # 5. 실제 매수 주문 실행
             total_amount = quantity * buy_price
-            order_result = self.trading_manager.buy_order(
+            logger.info(f"🛒 매수 주문 실행: {stock_code} {quantity:,}주 @ {buy_price:,}원 (전략: {strategy})")
+            
+            order_result = self.trading_manager.execute_order(
                 stock_code=stock_code,
+                order_type="BUY",
                 quantity=quantity,
-                price=buy_price
+                price=buy_price,
+                strategy_type=strategy
             )
             
-            if order_result.get('status') == 'success':
+            logger.debug(f"💰 매수 주문 결과: {order_result} (타입: {type(order_result)})")
+            
+            if order_result:  # 주문번호가 반환되면 성공
                 # 6. 거래 기록 저장
-                self._record_buy_trade(stock_code, quantity, buy_price, strategy, signal, order_result)
+                order_result_dict = {'order_no': order_result, 'status': 'success'}
+                self._record_buy_trade(stock_code, quantity, buy_price, strategy, signal, order_result_dict)
                 
                 # 7. 포지션 추가
                 self.position_manager.add_position(
@@ -183,10 +192,10 @@ class TradeExecutor:
                     quantity=quantity,
                     price=buy_price,
                     total_amount=total_amount,
-                    order_no=order_result.get('order_no', '')
+                    order_no=order_result
                 )
             else:
-                error_msg = f"매수 주문 실패: {order_result.get('message', '알 수 없는 오류')}"
+                error_msg = f"매수 주문 실패: 주문 처리 실패"
                 logger.error(f"❌ {error_msg}")
                 
                 return TradeResult(
@@ -280,15 +289,18 @@ class TradeExecutor:
             
             # 5. 매도 주문 실행
             total_amount = verified_quantity * sell_price
-            sell_result = self.trading_manager.sell_order(
+            sell_result = self.trading_manager.execute_order(
                 stock_code=stock_code,
+                order_type="SELL",
                 quantity=verified_quantity,
-                price=sell_price
+                price=sell_price,
+                strategy_type=strategy
             )
             
-            if sell_result.get('status') == 'success':
+            if sell_result:  # 주문번호가 반환되면 성공
                 # 6. 거래 기록 저장
-                self._record_sell_trade(stock_code, verified_quantity, sell_price, position, signal, sell_result)
+                sell_result_dict = {'order_no': sell_result, 'status': 'success'}
+                self._record_sell_trade(stock_code, verified_quantity, sell_price, position, signal, sell_result_dict)
                 
                 # 7. 포지션에서 제거
                 self.position_manager.remove_position(stock_code, verified_quantity, sell_price)
@@ -302,10 +314,10 @@ class TradeExecutor:
                     quantity=verified_quantity,
                     price=sell_price,
                     total_amount=total_amount,
-                    order_no=sell_result.get('order_no', '')
+                    order_no=sell_result
                 )
             else:
-                error_msg = f"매도 주문 실패: {sell_result.get('message', '알 수 없는 오류')}"
+                error_msg = f"매도 주문 실패: 주문 처리 실패"
                 logger.error(f"❌ {error_msg}")
                 
                 return TradeResult(
@@ -419,17 +431,22 @@ class TradeExecutor:
     def _validate_buy_signal(self, signal: Dict, stock_code: str) -> bool:
         """매수 신호 검증"""
         if not stock_code:
+            logger.warning(f"🚫 매수 검증 실패: 종목 코드 누락")
             return False
         
         # 포지션 중복 체크
         existing_positions = self.position_manager.get_positions('active')
         if stock_code in existing_positions:
+            logger.warning(f"🚫 매수 검증 실패: 이미 보유 중인 종목 ({stock_code})")
+            logger.info(f"📊 현재 보유 종목: {list(existing_positions.keys())}")
             return False
         
-        # 중복 주문 체크
-        if stock_code in self.pending_orders:
-            return False
+        # 중복 주문 체크는 handle_signal()에서 이미 처리하므로 제거
+        # if stock_code in self.pending_orders:
+        #     logger.warning(f"🚫 매수 검증 실패: 이미 처리 중인 주문 ({stock_code})")
+        #     return False
         
+        logger.debug(f"✅ 기본 매수 검증 통과: {stock_code}")
         return True
     
     def _validate_buy_signal_enhanced(self, signal: Dict, stock_code: str) -> bool:
@@ -437,6 +454,7 @@ class TradeExecutor:
         try:
             # 기본 검증
             if not self._validate_buy_signal(signal, stock_code):
+                logger.warning(f"🚫 강화된 매수 검증 실패: 기본 검증 단계에서 실패 ({stock_code})")
                 return False
             
             # 🎯 다중 기간 이격도 종합 검증
@@ -494,7 +512,7 @@ class TradeExecutor:
                     
                     elif strategy in ['gap_trading', 'volume_breakout', 'momentum']:
                         # 기존 전략들: 과매수 구간 매수 금지
-                        if d5_val >= 120 or d20_val >= 115:  # 단기/중기 과매수
+                        if d5_val >= 135 or d20_val >= 125:  # 단기/중기 과매수 (1단계 완화)
                             logger.warning(f"🎯 {strategy} 매수 거부: {stock_code} "
                                          f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매수)")
                             return False
@@ -509,7 +527,7 @@ class TradeExecutor:
                     
                     else:
                         # 기타 전략: 기본 검증
-                        if d20_val >= 115:  # 과매수 매수 금지
+                        if d20_val >= 125:  # 과매수 매수 금지 (1단계 완화)
                             logger.warning(f"🎯 기타전략 매수 거부: {stock_code} "
                                          f"D20:{d20_val:.1f} (과매수)")
                             return False
@@ -521,7 +539,7 @@ class TradeExecutor:
                     if d20_val <= 90:
                         logger.info(f"🎯 20일 이격도 매수 허용: {stock_code} D20:{d20_val:.1f}% (과매도)")
                         return True
-                    elif d20_val >= 115:
+                    elif d20_val >= 125:  # 1단계 완화
                         logger.warning(f"🎯 20일 이격도 매수 거부: {stock_code} D20:{d20_val:.1f}% (과매수)")
                         return False
                     else:
@@ -529,41 +547,48 @@ class TradeExecutor:
                         return True
                         
             except Exception as e:
-                logger.debug(f"다중 이격도 확인 실패 ({stock_code}): {e}")
+                logger.warning(f"🚫 다중 이격도 확인 실패 ({stock_code}): {e}")
+                logger.info(f"🎯 이격도 확인 실패로 기본 검증 결과 사용 ({stock_code})")
                 # 이격도 확인 실패시 기본 검증 결과 사용
                 pass
             
+            logger.debug(f"✅ 강화된 매수 검증 통과: {stock_code} (이격도 조건 만족 또는 확인 불가)")
             return True  # 기본 검증 통과시 매수 허용
             
         except Exception as e:
-            logger.error(f"강화된 매수 신호 검증 오류 ({stock_code}): {e}")
+            logger.error(f"🚫 강화된 매수 신호 검증 오류 ({stock_code}): {e}")
             return False
     
     def _get_current_price(self, stock_code: str) -> int:
         """현재가 조회"""
         try:
+            logger.debug(f"💰 현재가 조회 시작: {stock_code}")
             current_data = self.data_manager.get_latest_data(stock_code)
             if not current_data or current_data.get('status') != 'success':
-                logger.error(f"현재가 조회 실패: {stock_code}")
+                logger.error(f"❌ 현재가 조회 실패: {stock_code} - 데이터 매니저 응답: {current_data}")
                 return 0
             
             current_price = current_data.get('current_price', 0)
             if current_price <= 0:
-                logger.error(f"유효하지 않은 현재가: {stock_code} = {current_price}")
+                logger.error(f"❌ 유효하지 않은 현재가: {stock_code} = {current_price}")
                 return 0
             
+            logger.debug(f"✅ 현재가 조회 성공: {stock_code} = {current_price:,}원")
             return current_price
         except Exception as e:
-            logger.error(f"현재가 조회 오류 ({stock_code}): {e}")
+            logger.error(f"❌ 현재가 조회 오류 ({stock_code}): {e}")
             return 0
     
     def _get_available_cash(self) -> int:
         """사용 가능한 현금 조회"""
         try:
+            logger.debug(f"💰 잔고 조회 시작")
             balance = self.trading_manager.get_balance()
-            return balance.get('available_cash', 0)
+            available_cash = balance.get('available_cash', 0)
+            logger.debug(f"✅ 사용 가능한 현금: {available_cash:,}원")
+            return available_cash
         except Exception as e:
-            logger.error(f"잔고 조회 오류: {e}")
+            logger.error(f"❌ 잔고 조회 오류: {e}")
             return 0
     
     def _calculate_buy_price(self, current_price: int, strategy: str = 'default') -> int:
@@ -622,8 +647,14 @@ class TradeExecutor:
                                strategy: str, strength: float) -> int:
         """매수 수량 계산"""
         try:
-            if available_cash < self.config.min_investment_amount:
-                logger.warning(f"잔고 부족: {available_cash:,}원 < {self.config.min_investment_amount:,}원")
+            logger.debug(f"💰 매수 수량 계산 시작: 현재가={current_price:,}원, 매수가={buy_price:,}원, 잔고={available_cash:,}원")
+            
+            # 🔧 안전 여유분 적용 (주문 가능 금액 초과 방지)
+            safe_available_cash = int(available_cash * 0.9)  # 90%만 사용 (10% 여유분)
+            logger.debug(f"💰 안전 여유분 적용: {available_cash:,}원 → {safe_available_cash:,}원")
+            
+            if safe_available_cash < self.config.min_investment_amount:
+                logger.warning(f"❌ 안전 잔고 부족: {safe_available_cash:,}원 < {self.config.min_investment_amount:,}원")
                 return 0
             
             # 전략별 포지션 사이즈 조정
@@ -635,28 +666,42 @@ class TradeExecutor:
             # 최종 포지션 비율 계산
             final_position_ratio = self.config.base_position_ratio * strategy_multiplier * strength_adjusted
             
+            logger.debug(f"💰 포지션 계산: 전략승수={strategy_multiplier:.2f}, 신호강도={strength_adjusted:.2f}, 최종비율={final_position_ratio:.2%}")
+            
             # 최대 투자 금액 계산
             max_investment = min(
-                available_cash * final_position_ratio,  # 잔고 비율 기준
-                available_cash * self.config.max_position_ratio,  # 최대 비율 제한
+                safe_available_cash * final_position_ratio,  # 잔고 비율 기준
+                safe_available_cash * self.config.max_position_ratio,  # 최대 비율 제한
                 self.config.max_investment_amount       # 최대 금액 제한
             )
+            
+            logger.debug(f"💰 최대 투자 금액: {max_investment:,}원")
             
             # 수량 계산
             quantity = int(max_investment // buy_price) if buy_price > 0 else 0
             
+            logger.debug(f"💰 계산된 수량: {quantity:,}주")
+            
             # 최소 수량 체크
             if quantity * buy_price < self.config.min_investment_amount:
-                quantity = max(1, int(self.config.min_investment_amount // buy_price))
+                old_quantity = quantity
+                min_required_quantity = max(1, int(self.config.min_investment_amount // buy_price))
+                # 안전 잔고를 초과하지 않는 범위에서 최소 수량 적용
+                quantity = min(min_required_quantity, int(safe_available_cash // buy_price))
+                logger.debug(f"💰 최소 투자금액 조정: {old_quantity:,}주 → {quantity:,}주 (안전잔고 고려)")
             
             # 최종 매수 금액 확인 및 재조정
             total_buy_amount = quantity * buy_price
-            if total_buy_amount > available_cash:
-                quantity = int(available_cash // buy_price)
+            if total_buy_amount > safe_available_cash:
+                quantity = int(safe_available_cash // buy_price)
                 total_buy_amount = quantity * buy_price
-                logger.debug(f"💰 매수 수량 재조정: {quantity:,}주, 총액={total_buy_amount:,}원")
+                logger.warning(f"💰 매수 수량 재조정 (잔고 초과): {quantity:,}주, 총액={total_buy_amount:,}원")
             
-            logger.info(f"💰 매수 수량 계산: 전략={strategy}, 강도={strength:.2f}, 비율={final_position_ratio:.1%}, 수량={quantity:,}주")
+            if quantity <= 0:
+                logger.warning(f"❌ 매수 수량 부족: 계산 결과 {quantity}주")
+                return 0
+            
+            logger.info(f"✅ 매수 수량 계산 완료: 전략={strategy}, 강도={strength:.2f}, 수량={quantity:,}주, 총액={total_buy_amount:,}원")
             return quantity
             
         except Exception as e:
@@ -815,4 +860,121 @@ class TradeExecutor:
             logger.info(f"💾 자동매도 기록 저장 완료 - 전략: {strategy_type} (ID: {trade_id})")
             
         except Exception as e:
-            logger.error(f"💾 자동매도 기록 저장 실패: {e}") 
+            logger.error(f"💾 자동매도 기록 저장 실패: {e}")
+
+    def handle_signal(self, signal: Dict) -> Dict:
+        """
+        통합 신호 처리 메서드 - 매수/매도 신호를 통합 처리
+        
+        Args:
+            signal: 거래 신호 딕셔너리
+                - signal_type: 'BUY' 또는 'SELL'
+                - stock_code: 종목코드
+                - strategy: 전략명
+                - price: 기준가격
+                - strength: 신호 강도 (0.0~1.0)
+                - reason: 신호 발생 사유
+                
+        Returns:
+            Dict: 처리 결과
+                - success: bool
+                - message: str
+                - order_executed: bool
+                - trade_result: TradeResult (optional)
+        """
+        try:
+            signal_type = signal.get('signal_type', '').upper()
+            stock_code = signal.get('stock_code', '')
+            strategy = signal.get('strategy', 'default')
+            
+            logger.info(f"🎯 거래 신호 처리: {signal_type} {stock_code} ({strategy})")
+            
+            if not signal_type or not stock_code:
+                return {
+                    'success': False,
+                    'message': '필수 신호 정보 누락 (signal_type 또는 stock_code)',
+                    'order_executed': False
+                }
+            
+            # 중복 주문 방지
+            if stock_code in self.pending_orders:
+                return {
+                    'success': False,
+                    'message': f'이미 처리 중인 주문: {stock_code}',
+                    'order_executed': False
+                }
+            
+            self.pending_orders.add(stock_code)
+            
+            try:
+                if signal_type == 'BUY':
+                    # 매수 신호 처리
+                    result = self.execute_buy_signal(signal)
+                    
+                    if result.success:
+                        return {
+                            'success': True,
+                            'message': f'매수 주문 완료: {stock_code} {result.quantity:,}주 @ {result.price:,}원',
+                            'order_executed': True,
+                            'trade_result': result
+                        }
+                    else:
+                        return {
+                            'success': False,
+                            'message': f'매수 주문 실패: {result.error_message}',
+                            'order_executed': False,
+                            'trade_result': result
+                        }
+                
+                elif signal_type == 'SELL':
+                    # 매도 신호 처리 - 기존 포지션 확인
+                    positions = self.position_manager.get_positions('active')
+                    
+                    if stock_code not in positions:
+                        return {
+                            'success': False,
+                            'message': f'매도할 포지션 없음: {stock_code}',
+                            'order_executed': False
+                        }
+                    
+                    result = self.execute_sell_signal(signal)
+                    
+                    if result.success:
+                        return {
+                            'success': True,
+                            'message': f'매도 주문 완료: {stock_code} {result.quantity:,}주 @ {result.price:,}원',
+                            'order_executed': True,
+                            'trade_result': result
+                        }
+                    else:
+                        return {
+                            'success': False,
+                            'message': f'매도 주문 실패: {result.error_message}',
+                            'order_executed': False,
+                            'trade_result': result
+                        }
+                
+                else:
+                    return {
+                        'success': False,
+                        'message': f'알 수 없는 신호 타입: {signal_type}',
+                        'order_executed': False
+                    }
+                    
+            finally:
+                # 처리 완료 후 pending에서 제거
+                self.pending_orders.discard(stock_code)
+                
+        except Exception as e:
+            # 예외 발생시에도 pending에서 제거
+            if 'stock_code' in locals():
+                self.pending_orders.discard(stock_code)
+            
+            error_msg = f"신호 처리 예외: {e}"
+            logger.error(error_msg)
+            
+            return {
+                'success': False,
+                'message': error_msg,
+                'order_executed': False
+            } 

@@ -364,6 +364,24 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
     url = '/uapi/domestic-stock/v1/ranking/fluctuation'
     tr_id = "FHPST01700000"  # 등락률 순위
 
+    # 🆕 등락률 범위 자동 설정 로직
+    if fid_rsfl_rate1 and not fid_rsfl_rate2:
+        # fid_rsfl_rate1만 있는 경우 상한을 자동 설정
+        try:
+            min_rate = float(fid_rsfl_rate1)
+            if fid_rank_sort_cls_code == "0":  # 상승률순
+                fid_rsfl_rate2 = "30.0"  # 최대 30% 상승까지
+            else:  # 하락률순
+                fid_rsfl_rate2 = "0.0"   # 최대 0%까지 (하락)
+            logger.debug(f"📊 등락률 범위 자동 설정: {fid_rsfl_rate1}% ~ {fid_rsfl_rate2}%")
+        except ValueError:
+            # 변환 실패시 기본값 사용
+            fid_rsfl_rate2 = "30.0" if fid_rank_sort_cls_code == "0" else "0.0"
+    elif not fid_rsfl_rate1 and not fid_rsfl_rate2:
+        # 둘 다 없는 경우 전체 범위
+        fid_rsfl_rate1 = ""
+        fid_rsfl_rate2 = ""
+
     params = {
         "fid_rsfl_rate2": fid_rsfl_rate2,
         "fid_cond_mrkt_div_code": fid_cond_mrkt_div_code,
@@ -382,32 +400,68 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
     }
 
     try:
-        logger.debug(f"등락률 순위 API 호출 - 파라미터: {params}")
+        # 🔧 시간대별 컨텍스트 정보 추가
+        from datetime import datetime
+        current_time = datetime.now()
+        time_context = f"현재시간:{current_time.strftime('%H:%M:%S')}"
+        is_market_open = 9 <= current_time.hour < 16
+        time_context += f" 장운영:{'Y' if is_market_open else 'N'}"
+        
+        logger.info(f"🔍 등락률순위 API 호출 - {time_context}")
+        logger.debug(f"📋 요청파라미터: 시장={fid_input_iscd}, 등락률={fid_rsfl_rate1}~{fid_rsfl_rate2}%, 정렬={fid_rank_sort_cls_code}")
+        
         res = kis._url_fetch(url, tr_id, tr_cont, params)
 
         if res and res.isOK():
             try:
-                output_data = res.getBody().output
-                if output_data:
-                    current_data = pd.DataFrame(output_data)
-                    logger.info(f"등락률 순위 조회 성공: {len(current_data)}건")
-                    return current_data
+                # 🔧 응답 구조 상세 분석
+                body = res.getBody()
+                logger.debug(f"📄 응답 body 타입: {type(body)}")
+                
+                # rt_cd, msg_cd, msg1 확인
+                rt_cd = getattr(body, 'rt_cd', 'Unknown')
+                msg_cd = getattr(body, 'msg_cd', 'Unknown')
+                msg1 = getattr(body, 'msg1', 'Unknown')
+                
+                logger.info(f"📡 API 응답상태: rt_cd={rt_cd}, msg_cd={msg_cd}, msg1='{msg1}'")
+                
+                # output 확인
+                if hasattr(body, 'output'):
+                    output_data = body.output
+                    if output_data:
+                        current_data = pd.DataFrame(output_data)
+                        logger.info(f"✅ 등락률 순위 조회 성공: {len(current_data)}건")
+                        return current_data
+                    else:
+                        logger.warning(f"⚠️ 등락률 순위: output이 빈 리스트 (조건 만족 종목 없음)")
+                        logger.info(f"🔍 필터조건: 시장={fid_input_iscd}, 등락률={fid_rsfl_rate1}~{fid_rsfl_rate2}%, 정렬={fid_rank_sort_cls_code}")
+                        return pd.DataFrame()
                 else:
-                    logger.warning("등락률 순위 조회: output 데이터 없음")
+                    logger.error(f"❌ 응답에 output 필드 없음 - body 구조: {dir(body)}")
                     return pd.DataFrame()
+                    
             except AttributeError as e:
-                logger.error(f"등락률 순위 응답 구조 오류: {e}")
+                logger.error(f"❌ 등락률 순위 응답 구조 오류: {e}")
                 logger.debug(f"응답 구조: {type(res.getBody())}")
                 return pd.DataFrame()
         else:
             if res:
-                logger.error(f"등락률 순위 조회 실패 - 응답코드: {getattr(res, 'rt_cd', 'Unknown')}")
-                logger.error(f"오류 메시지: {getattr(res, 'msg1', 'Unknown')}")
+                rt_cd = getattr(res, 'rt_cd', getattr(res.getBody(), 'rt_cd', 'Unknown') if res.getBody() else 'Unknown')
+                msg1 = getattr(res, 'msg1', getattr(res.getBody(), 'msg1', 'Unknown') if res.getBody() else 'Unknown')
+                logger.error(f"❌ 등락률 순위 조회 실패 - rt_cd:{rt_cd}, msg:'{msg1}'")
+                
+                # 🔧 일반적인 오류 원인 안내
+                if rt_cd == '1':
+                    if '시간' in str(msg1) or 'time' in str(msg1).lower():
+                        logger.warning("💡 힌트: 장 운영 시간 외에는 일부 API가 제한될 수 있습니다")
+                    elif '조회' in str(msg1) or 'inquiry' in str(msg1).lower():
+                        logger.warning("💡 힌트: API 호출 한도 초과이거나 조회 조건이 너무 제한적일 수 있습니다")
+                        
             else:
-                logger.error("등락률 순위 조회 실패 - 응답 없음")
+                logger.error("❌ 등락률 순위 조회 실패 - 응답 없음 (네트워크 또는 인증 문제)")
             return None
     except Exception as e:
-        logger.error(f"등락률 순위 조회 오류: {e}")
+        logger.error(f"❌ 등락률 순위 조회 예외: {e}")
         return None
 
 
@@ -415,40 +469,112 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
 # 통합된 전략별 후보 조회 함수들
 # =============================================================================
 
-def get_gap_trading_candidates(market: str = "0000", 
-                               min_gap_rate: float = 1.1,    # 🎯 1.1%로 상향 (기존 0.1%)
-                               min_change_rate: float = 1.0,  # 🎯 1.0%로 상향 (기존 -5.0%) 
-                               min_volume_ratio: float = 2.0) -> Optional[pd.DataFrame]: # 🎯 2.0배로 상향 (기존 1.0배)
-    """갭 트레이딩 후보 조회 - 🎯 수익성 중심 엄격한 기준"""
+def get_gap_trading_candidates(market: str = "0000",
+                               min_gap_rate: float = 2.0,  # 🎯 2% 기본 갭
+                               min_change_rate: float = 1.0,  # 🎯 1.0% 기본 변동률 
+                               min_volume_ratio: float = 2.0) -> Optional[pd.DataFrame]: # 🎯 2.0배 기본 거래량
+    """갭 트레이딩 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
+    from datetime import datetime
+    
     try:
-        # 1단계: 상승률 상위 종목을 1차 필터링 (🎯 더 엄격한 조건)
-        logger.info("🎯 갭 트레이딩 후보 엄격 필터링 중...")
+        current_time = datetime.now()
+        is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
+        
+        # 🎯 시간대별 기준 완화
+        if is_pre_market:
+            # 프리마켓: 매우 관대한 기준
+            min_gap_rate = 0.5  # 0.5% 갭
+            min_change_rate = 0.3  # 0.3% 변동률
+            min_volume_ratio = 1.2  # 1.2배 거래량
+            min_daily_volume = 40000  # 4만주
+            min_price = 1000  # 1000원 이상
+            max_price = 1000000  # 100만원 이하
+            fluctuation_threshold = "0.3"  # 0.3% 이상
+            logger.info("🌅 프리마켓 갭트레이딩 기준: 갭0.5% 변동0.3% 거래량1.2배 (매우 관대)")
+        elif current_time.hour < 11:
+            # 장 초반: 관대한 기준
+            min_gap_rate = 1.0  # 1.0% 갭
+            min_change_rate = 0.5  # 0.5% 변동률
+            min_volume_ratio = 1.5  # 1.5배 거래량
+            min_daily_volume = 60000  # 6만주   
+            min_price = 1000  # 1000원 이상
+            max_price = 1000000  # 100만원 이하
+            fluctuation_threshold = "0.5"  # 0.5% 이상
+            logger.info("🌄 장초반 갭트레이딩 기준: 갭1.0% 변동0.5% 거래량1.5배 (관대)")
+        else:
+            # 정규 시간: 기본 기준 (기존보다 약간 완화)
+            min_gap_rate = 1.5  # 1.5% 갭
+            min_change_rate = 0.8  # 0.8% 변동률
+            min_volume_ratio = 1.8  # 1.8배 거래량
+            min_daily_volume = 80000  # 8만주
+            min_price = 1000  # 1000원 이상
+            max_price = 1000000  # 100만원 이하
+            fluctuation_threshold = "0.8"  # 0.8% 이상
+            logger.info("🕐 정규시간 갭트레이딩 기준: 갭1.5% 변동0.8% 거래량1.8배 (완화)")
 
-        # 상승률 2% 이상 종목만 1차 필터링
+        # 1단계: 상승률 상위 종목을 1차 필터링 (🎯 적응형 조건)
+        logger.info("🎯 갭 트레이딩 후보 적응형 필터링 중...")
+
+        # 적응형 상승률 기준 적용
         candidate_data = get_fluctuation_rank(
             fid_input_iscd=market,
             fid_rank_sort_cls_code="0",  # 상승률순
-            fid_rsfl_rate1="2.0"  # 🎯 2% 이상 상승 종목만
+            fid_rsfl_rate1=fluctuation_threshold
         )
 
         if candidate_data is None or candidate_data.empty:
-            logger.warning("🎯 엄격 필터링에서 데이터 없음 - 1% 이상으로 완화하여 재시도")
+            # 🔧 백업 전략 1: 더 관대한 기준으로 재시도
+            fallback_threshold = str(float(fluctuation_threshold) * 0.5)
+            logger.warning(f"🎯 1차 필터링 데이터 없음 - {fallback_threshold}% 이상으로 재시도")
             candidate_data = get_fluctuation_rank(
                 fid_input_iscd=market,
                 fid_rank_sort_cls_code="0",  
-                fid_rsfl_rate1="1.0"  # 1% 이상으로 완화
+                fid_rsfl_rate1=fallback_threshold
             )
 
             if candidate_data is None or candidate_data.empty:
-                logger.error("🎯 갭 트레이딩: 1% 이상 상승 종목도 없음")
-                return pd.DataFrame()
+                # 🔧 백업 전략 2: 조건 없이 전체 조회
+                logger.warning("🎯 2차 필터링도 데이터 없음 - 조건 제거하고 전체 조회")
+                candidate_data = get_fluctuation_rank(
+                    fid_input_iscd=market,
+                    fid_rank_sort_cls_code="0",  # 상승률순만 유지
+                    fid_rsfl_rate1="",  # 등락률 조건 제거
+                    fid_vol_cnt=""      # 거래량 조건 제거
+                )
+                
+                if candidate_data is None or candidate_data.empty:
+                    # 🔧 백업 전략 3: 다른 시장으로 시도
+                    if market != "0000":
+                        logger.warning("🎯 3차 백업: 전체 시장(0000)으로 재시도")
+                        candidate_data = get_fluctuation_rank(
+                            fid_input_iscd="0000",  # 전체 시장
+                            fid_rank_sort_cls_code="0",
+                            fid_rsfl_rate1="",
+                            fid_vol_cnt=""
+                        )
+                    
+                    if candidate_data is None or candidate_data.empty:
+                        # 🔧 최종 백업: 하락률순으로도 시도 (반대 신호)
+                        logger.warning("🎯 최종 백업: 하락률순 조회 (반대매매 후보)")
+                        candidate_data = get_fluctuation_rank(
+                            fid_input_iscd="0000",
+                            fid_rank_sort_cls_code="1",  # 하락률순
+                            fid_rsfl_rate1="",
+                            fid_vol_cnt=""
+                        )
+                        
+                        if candidate_data is None or candidate_data.empty:
+                            logger.error("🎯 갭 트레이딩: 모든 백업 전략에도 데이터 없음")
+                            logger.info("💡 가능한 원인: 1) 장 운영시간 외 2) API 제한 3) 시장 참여자 부족 4) 네트워크 문제")
+                            return pd.DataFrame()
 
-        logger.info(f"🎯 엄격 1차 필터링 완료: {len(candidate_data)}개 종목")
+        logger.info(f"🎯 적응형 필터링 완료: {len(candidate_data)}개 종목 확보")
 
-        # 2단계: 각 종목의 실제 갭 계산 (🎯 더 엄격한 기준 적용)
+        # 2단계: 각 종목의 실제 갭 계산 (🎯 적응형 기준 적용)
         gap_candidates = []
+        max_candidates = 30 if is_pre_market else 20  # 프리마켓엔 더 많은 후보
 
-        for idx, row in candidate_data.head(20).iterrows():  # 🎯 상위 20개만 (기존 30개)
+        for idx, row in candidate_data.head(max_candidates).iterrows():
             try:
                 stock_code = row.get('stck_shrn_iscd', '')
                 if not stock_code:
@@ -466,9 +592,12 @@ def get_gap_trading_candidates(market: str = "0000",
                 open_price = int(current_info.get('stck_oprc', 0))
                 prev_close = int(current_info.get('stck_sdpr', 0))
 
-                # 🎯 장 시작 전 종목 제외 (더 확실한 데이터만 사용)
-                if open_price <= 0:
-                    logger.debug(f"🎯 종목 {stock_code}: 시가 없음(장전) - 제외")
+                # 🎯 프리마켓에는 시가 없을 수 있으므로 더 관대하게
+                if is_pre_market and open_price <= 0:
+                    logger.debug(f"🌅 프리마켓 종목 {stock_code}: 시가 없음 - 현재가로 추정")
+                    open_price = current_price  # 현재가로 추정
+                elif not is_pre_market and open_price <= 0:
+                    logger.debug(f"🎯 종목 {stock_code}: 시가 없음 - 제외")
                     continue
 
                 if prev_close <= 0 or current_price <= 0:
@@ -479,10 +608,17 @@ def get_gap_trading_candidates(market: str = "0000",
                 gap_size = open_price - prev_close
                 gap_rate = (gap_size / prev_close) * 100
 
-                # 🎯 엄격한 갭 트레이딩 조건
-                if gap_rate >= min_gap_rate:  # 상향갭만 (2% 이상)
+                # 🎯 적응형 갭 트레이딩 조건
+                if gap_rate >= min_gap_rate:  # 상향갭만
                     volume = int(current_info.get('acml_vol', 0))
                     
+                    # 평균 거래량 및 변동률 추출
+                    avg_volume_raw = current_info.get('avrg_vol', 0)
+                    try:
+                        avg_volume = int(avg_volume_raw) if avg_volume_raw else 0
+                    except (ValueError, TypeError):
+                        avg_volume = 0
+
                     # 안전한 변동률 변환
                     change_rate_raw = current_info.get('prdy_ctrt', '0')
                     try:
@@ -491,29 +627,59 @@ def get_gap_trading_candidates(market: str = "0000",
                         logger.debug(f"🎯 종목 {stock_code}: 변동률 변환 오류 - 제외")
                         continue
 
-                    # 거래량 비율 계산
-                    avg_volume = int(current_info.get('avrg_vol', 1))
-                    volume_ratio = volume / max(avg_volume, 1)
+                    # 🔧 거래량 비율 계산 (API 조회 포함)
+                    if avg_volume <= 0:
+                        # 🆕 API를 통해 실제 평균 거래량 계산
+                        try:
+                            logger.debug(f"🔍 {stock_code}: 평균 거래량 정보 없음 - API 조회 시작")
+                            historical_data = get_inquire_daily_price("J", stock_code)
+                            if historical_data is not None and not historical_data.empty and len(historical_data) >= 5:
+                                # 최근 5일간 거래량 평균 계산
+                                volumes = []
+                                for _, row in historical_data.head(5).iterrows():
+                                    vol = int(row.get('acml_vol', 0)) if row.get('acml_vol') else 0
+                                    if vol > 0:
+                                        volumes.append(vol)
+                                
+                                if volumes:
+                                    calculated_avg_volume = sum(volumes) // len(volumes)
+                                    safe_avg_volume = max(calculated_avg_volume, 5000)  # 최소 5천주
+                                    logger.debug(f"📊 {stock_code}: 5일 평균 거래량 계산 완료 - {safe_avg_volume:,}주")
+                                else:
+                                    safe_avg_volume = max(volume // 5, 10000)  # fallback
+                                    logger.debug(f"📊 {stock_code}: 거래량 데이터 부족 - 추정치 사용: {safe_avg_volume:,}주")
+                            else:
+                                # API 조회 실패시 추정치 사용
+                                safe_avg_volume = max(volume // 5, 10000)  # 현재의 1/5 또는 최소 1만주
+                                logger.debug(f"📊 {stock_code}: API 조회 실패 - 추정치 사용: {safe_avg_volume:,}주")
+                        except Exception as e:
+                            logger.warning(f"📊 {stock_code}: 평균 거래량 계산 오류 - {e}")
+                            safe_avg_volume = max(volume // 5, 10000)  # fallback
+                    elif avg_volume < 5000:
+                        # 너무 작은 평균 거래량 보정
+                        safe_avg_volume = 5000
+                        logger.debug(f"📊 {stock_code}: 평균 거래량 보정 - {avg_volume:,}주 → {safe_avg_volume:,}주")
+                    else:
+                        # 정상적인 평균 거래량 사용
+                        safe_avg_volume = avg_volume
 
-                    # 🎯 수익성 중심 엄격 조건
-                    # 1. 상향갭 2% 이상 (강한 갭)
-                    # 2. 현재 변동률 1% 이상 (지속적 상승)
-                    # 3. 거래량 2배 이상 (강한 관심)
-                    # 4. 최소 거래량 5만주 이상 (유동성 확보)
+                    # 🔧 거래량 비율 계산 및 상한 제한
+                    volume_ratio = volume / safe_avg_volume
+                    volume_ratio = min(volume_ratio, 100)  # 최대 100배로 제한 (더 현실적)
                     
-                    min_daily_volume = 50000  # 🎯 최소 5만주
-                    
+                    logger.debug(f"🔧 {stock_code} 거래량 계산: 현재={volume:,}주, 평균={safe_avg_volume:,}주, 비율={volume_ratio:.1f}배")
+
+                    # 🎯 적응형 조건 체크
                     if (volume_ratio >= min_volume_ratio and 
                         change_rate >= min_change_rate and 
                         volume >= min_daily_volume):
                         
-                        # 🎯 추가 수익성 필터
-                        # 가격대별 최소 기준 적용
-                        if current_price < 1000:  # 저가주 제외
+                        # 🎯 가격대별 필터
+                        if current_price < min_price:
                             logger.debug(f"🎯 종목 {stock_code}: 저가주 제외 ({current_price}원)")
                             continue
                         
-                        if current_price > 500000:  # 고가주 제외 (유동성 문제)
+                        if current_price > max_price:
                             logger.debug(f"🎯 종목 {stock_code}: 고가주 제외 ({current_price}원)")
                             continue
                         
@@ -534,7 +700,7 @@ def get_gap_trading_candidates(market: str = "0000",
 
                         logger.info(f"🎯 갭 후보: {stock_code}({row.get('hts_kor_isnm', '')}) 갭{gap_rate:.1f}% 거래량{volume_ratio:.1f}배 변동률{change_rate:.1f}%")
                     else:
-                        logger.debug(f"🎯 종목 {stock_code}: 엄격 조건 미달 - 거래량{volume_ratio:.1f}배 변동률{change_rate:.1f}% 볼륨{volume:,}주")
+                        logger.debug(f"🎯 종목 {stock_code}: 조건 미달 - 거래량{volume_ratio:.1f}배 변동률{change_rate:.1f}% 볼륨{volume:,}주")
                 else:
                     logger.debug(f"🎯 종목 {stock_code}: 갭 부족 - {gap_rate:.2f}%")
 
@@ -546,10 +712,10 @@ def get_gap_trading_candidates(market: str = "0000",
         if gap_candidates:
             gap_df = pd.DataFrame(gap_candidates)
             gap_df = gap_df.sort_values('profit_score', ascending=False)  # 🎯 수익성 점수 내림차순
-            logger.info(f"🎯 엄격 갭 트레이딩 후보 {len(gap_df)}개 발견 (수익성 중심)")
+            logger.info(f"🎯 적응형 갭 트레이딩 후보 {len(gap_df)}개 발견")
             return gap_df
         else:
-            logger.info("🎯 엄격한 갭 트레이딩 조건을 만족하는 종목 없음")
+            logger.info("🎯 적응형 갭 트레이딩 조건을 만족하는 종목 없음")
             return pd.DataFrame()
 
     except Exception as e:
@@ -558,19 +724,55 @@ def get_gap_trading_candidates(market: str = "0000",
 
 
 def get_volume_breakout_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """거래량 돌파 후보 조회 - 🎯 수익성 중심 엄격한 기준"""
+    """거래량 돌파 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
+    from datetime import datetime
+    
+    current_time = datetime.now()
+    is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
+    
+    if is_pre_market:
+        # 프리마켓: 매우 관대한 기준
+        volume_threshold = "5000"  # 5천주
+        logger.info("🌅 프리마켓 거래량 기준: 5천주 (관대)")
+    elif current_time.hour < 11:
+        # 장 초반: 관대한 기준  
+        volume_threshold = "20000"  # 2만주
+        logger.info("🌄 장초반 거래량 기준: 2만주")
+    else:
+        # 정규 시간: 기본 기준
+        volume_threshold = "50000"  # 5만주
+        logger.info("🕐 정규시간 거래량 기준: 5만주")
+    
     return get_volume_rank(
         fid_input_iscd=market,
         fid_blng_cls_code="1",  # 거래증가율
-        fid_vol_cnt="100000"    # 🎯 10만주 이상 (기존 1만주)
+        fid_vol_cnt=volume_threshold
     )
 
 
 def get_momentum_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """모멘텀 후보 조회 - 🎯 수익성 중심 엄격한 기준"""
+    """모멘텀 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
+    from datetime import datetime
+    
+    current_time = datetime.now()
+    is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
+    
+    if is_pre_market:
+        # 프리마켓: 매우 관대한 기준
+        volume_threshold = "3000"  # 3천주
+        logger.info("🌅 프리마켓 체결강도 기준: 3천주 (관대)")
+    elif current_time.hour < 11:
+        # 장 초반: 관대한 기준
+        volume_threshold = "10000"  # 1만주  
+        logger.info("🌄 장초반 체결강도 기준: 1만주")
+    else:
+        # 정규 시간: 기본 기준
+        volume_threshold = "30000"  # 3만주 (5만주에서 완화)
+        logger.info("🕐 정규시간 체결강도 기준: 3만주")
+    
     return get_volume_power_rank(
         fid_input_iscd=market,
-        fid_vol_cnt="50000"     # 🎯 5만주 이상 (기존 5천주)
+        fid_vol_cnt=volume_threshold
     )
 
 

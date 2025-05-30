@@ -27,7 +27,7 @@ from core.rest_api_manager import KISRestAPIManager
 from core.hybrid_data_manager import SimpleHybridDataManager
 from core.kis_websocket_manager import KISWebSocketManager
 from core.trade_database import TradeDatabase
-from core.trade_executor import TradeExecutor, TradeConfig
+from core.trade_executor import TradeConfig, TradeExecutor
 from core.worker_manager import WorkerManager
 from core.kis_data_collector import KISDataCollector
 
@@ -116,6 +116,9 @@ class StockBot:
         # 9. 전략 스케줄러 (핵심!)
         self.strategy_scheduler = StrategyScheduler(self.rest_api, self.data_manager)
         self.strategy_scheduler.set_bot_instance(self)
+        
+        # 🆕 StockDiscovery에 TradeExecutor 연결
+        self.strategy_scheduler.stock_discovery.set_trade_executor(self.trade_executor)
 
         # 10. 워커 매니저 (스레드 관리 전담)
         self.worker_manager = WorkerManager(self.shutdown_event)
@@ -257,7 +260,7 @@ class StockBot:
                     
                     # 🕐 종목 간 간격 (웹소켓 안정성)
                     if index < len(holdings) - 1:  # 마지막이 아니면
-                        time.sleep(0.3)  # 300ms 간격
+                        time.sleep(0.5)  # 🔧 간격 증가 (300ms → 500ms)
             
             # 4️⃣ 🆕 strategy_scheduler의 active_stocks에 기존 보유 종목 추가
             if existing_stock_codes:
@@ -267,7 +270,7 @@ class StockBot:
                 else:
                     logger.warning("⚠️ strategy_scheduler.active_stocks가 초기화되지 않음")
             
-            logger.info(f"📊 보유 종목 자동 모니터링 설정 완료: {len(holdings)}개 (통합 관리)")
+            logger.info(f"📊 보유 종목 자동 모니터링 설정 완료: {len(existing_stock_codes)}개 (통합 관리)")
             
         except Exception as e:
             logger.error(f"보유 종목 모니터링 설정 오류: {e}")

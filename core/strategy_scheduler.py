@@ -236,14 +236,14 @@ class StrategyScheduler:
                     logger.info(f"   ... 외 {len(candidates)-5}개 종목")
 
                 # 🆕 데이터베이스에 종목 선정 기록 저장
-                await self._record_selected_stocks(strategy_name, candidates)
+                await self._record_selected_stocks(strategy_name, candidates, weight)
             else:
                 logger.warning(f"⚠️ {strategy_name} 전략: 후보 없음")
 
         except Exception as e:
             logger.error(f"단일 전략 탐색 오류 ({strategy_name}): {e}")
 
-    async def _record_selected_stocks(self, strategy_name: str, candidates: List):
+    async def _record_selected_stocks(self, strategy_name: str, candidates: List, weight: float = 1.0):
         """선정된 종목들을 데이터베이스에 기록"""
         try:
             if not candidates or not self.current_slot:
@@ -463,6 +463,9 @@ class StrategyScheduler:
                 if not self._should_process_signal(stock_code, strategy_name):
                     return
 
+                # 🆕 시장 센티먼트 확인
+                market_sentiment = self._get_market_sentiment()
+                
                 # 기본 시장 데이터 생성
                 market_data = {
                     'stock_code': stock_code,
@@ -470,7 +473,8 @@ class StrategyScheduler:
                     'volume': data.get('volume', 0),
                     'change_rate': data.get('change_rate', 0),
                     'timestamp': data.get('timestamp', time_module.time()),
-                    'source': source
+                    'source': source,
+                    'market_sentiment': market_sentiment  # 🆕 시장 센티먼트 추가
                 }
 
                 # 전략별 신호 생성 로직
@@ -497,6 +501,60 @@ class StrategyScheduler:
 
         return strategy_callback
 
+    def _get_market_sentiment(self) -> Dict:
+        """🆕 실시간 시장 센티먼트 분석"""
+        try:
+            # 간단한 시장 상황 분석
+            current_time = time_module.time()
+            
+            # 캐시된 센티먼트 사용 (1분간 유효)
+            if hasattr(self, '_market_sentiment_cache'):
+                cache_time, sentiment = self._market_sentiment_cache
+                if current_time - cache_time < 60:  # 1분 캐시
+                    return sentiment
+            
+            # 기본 센티먼트 (실제로는 코스피/코스닥 지수 등을 활용)
+            sentiment = {
+                'bullish_score': 50,  # 0-100 (강세 정도)
+                'volume_surge': False,  # 거래량 급증 여부
+                'sector_rotation': 'balanced',  # 섹터 로테이션 상황
+                'volatility': 'normal'  # 변동성 수준
+            }
+            
+            # 🆕 실제 시장 데이터로 센티먼트 업데이트 (시간이 허락하면)
+            try:
+                # 여기에 실제 코스피/코스닥 지수 데이터 활용 가능
+                # 현재는 시간대별 기본값 사용
+                from datetime import datetime
+                now_hour = datetime.now().hour
+                
+                if 9 <= now_hour <= 10:  # 장초반
+                    sentiment['bullish_score'] = 65
+                    sentiment['volatility'] = 'high'
+                elif 10 <= now_hour <= 14:  # 장중
+                    sentiment['bullish_score'] = 55
+                    sentiment['volatility'] = 'normal'
+                elif 14 <= now_hour <= 15:  # 장마감 근처
+                    sentiment['bullish_score'] = 45
+                    sentiment['volatility'] = 'high'
+                    
+            except Exception as e:
+                logger.debug(f"센티먼트 업데이트 오류: {e}")
+            
+            # 센티먼트 캐시 저장
+            self._market_sentiment_cache = (current_time, sentiment)
+            
+            return sentiment
+            
+        except Exception as e:
+            logger.error(f"시장 센티먼트 분석 오류: {e}")
+            return {
+                'bullish_score': 50,
+                'volume_surge': False,
+                'sector_rotation': 'balanced',
+                'volatility': 'normal'
+            }
+
     def _generate_simple_signal(self, strategy_name: str, stock_code: str, data: Dict) -> Optional[Dict]:
         """간단한 신호 생성 (기술적 지표 통합 버전)"""
         try:
@@ -508,8 +566,9 @@ class StrategyScheduler:
             # 가격 변화율 확인
             change_rate = data.get('change_rate', 0)
             volume = data.get('volume', 0)
+            sentiment_multiplier = data.get('sentiment_multiplier', 1.0)  # 🆕 센티먼트 승수
 
-            logger.debug(f"신호 생성 체크: {stock_code} 전략={strategy_name}, 현재가={current_price:,}, 변화율={change_rate:.2f}%, 거래량={volume:,}")
+            logger.debug(f"신호 생성 체크: {stock_code} 전략={strategy_name}, 현재가={current_price:,}, 변화율={change_rate:.2f}%, 거래량={volume:,}, 센티먼트승수={sentiment_multiplier:.2f}")
 
             # 기술적 지표 확인을 위한 일봉 데이터 조회 (캐시 활용)
             try:
@@ -531,72 +590,68 @@ class StrategyScheduler:
 
             signal = None
 
-            # 전략별 신호 생성 (기술적 지표 고려)
-            if strategy_name == 'gap_trading' and change_rate > 1.8:  # 2.0에서 1.8로 추가 완화
-                # 기술적 지표가 매수 신호이거나 중립일 때만
-                if tech_action in ['BUY', 'HOLD']:
-                    # 기술적 지표 점수에 따라 신호 강도 조정
+            # 🆕 다단계 민감도 전략 - 기회 확대 (센티먼트 반영)
+            if strategy_name == 'gap_trading':
+                # 강력한 신호 (센티먼트 반영)
+                gap_threshold = 1.8 * sentiment_multiplier
+                if change_rate > gap_threshold and tech_action in ['BUY', 'HOLD']:
                     base_strength = min(change_rate / 8.0, 1.0)
-                    tech_bonus = tech_score / 200  # 최대 0.5 보너스
+                    tech_bonus = tech_score / 200
                     final_strength = min(base_strength + tech_bonus, 1.0)
+                    signal = self._create_signal(stock_code, strategy_name, current_price, final_strength, 
+                                               f'갭 상승 {change_rate:.1f}% (기준: {gap_threshold:.1f}%, 기술: {tech_action})', tech_score)
+                
+                # 🆕 중간 신호 (센티먼트 반영)
+                elif 1.0 * sentiment_multiplier <= change_rate < gap_threshold and tech_action == 'BUY' and tech_score > 60:
+                    final_strength = min((change_rate / 10.0) + (tech_score / 300), 0.8)
+                    signal = self._create_signal(stock_code, f"{strategy_name}_moderate", current_price, final_strength,
+                                               f'갭 {change_rate:.1f}% + 기술적 강세 (점수: {tech_score})', tech_score)
+                
+                # 🆕 약한 신호 (센티먼트 반영)  
+                elif 0.5 * sentiment_multiplier <= change_rate < 1.0 * sentiment_multiplier and tech_action == 'BUY' and tech_score > 80:
+                    final_strength = min(tech_score / 150, 0.6)
+                    signal = self._create_signal(stock_code, f"{strategy_name}_weak", current_price, final_strength,
+                                               f'기술적 매수 신호 우선 (갭: {change_rate:.1f}%, 기술: {tech_score})', tech_score)
 
-                    signal = {
-                        'stock_code': stock_code,
-                        'signal_type': 'BUY',
-                        'strategy': strategy_name,
-                        'price': current_price,
-                        'strength': final_strength,
-                        'reason': f'갭 상승 {change_rate:.1f}% (기술: {tech_action})',
-                        'tech_score': tech_score
-                    }
-                    logger.info(f"🎯 갭 트레이딩 신호 생성: {stock_code} {change_rate:.1f}% (기술점수: {tech_score})")
-
-            elif strategy_name == 'volume_breakout' and change_rate > 1.2:  # 1.5에서 1.2로 추가 완화
-                if volume > 0 and tech_action in ['BUY', 'HOLD']:
+            elif strategy_name == 'volume_breakout':
+                # 강력한 신호 (센티먼트 반영)
+                volume_threshold = 1.2 * sentiment_multiplier
+                if change_rate > volume_threshold and volume > 0 and tech_action in ['BUY', 'HOLD']:
                     base_strength = min(change_rate / 6.0, 1.0)
                     tech_bonus = tech_score / 200
                     final_strength = min(base_strength + tech_bonus, 1.0)
+                    signal = self._create_signal(stock_code, strategy_name, current_price, final_strength,
+                                               f'거래량 돌파 {change_rate:.1f}% (기준: {volume_threshold:.1f}%, 기술: {tech_action})', tech_score)
+                
+                # 🆕 중간 신호 (거래량 + 기술적 지표, 센티먼트 반영)
+                elif 0.8 * sentiment_multiplier <= change_rate < volume_threshold and volume > 0 and tech_action == 'BUY' and tech_score > 70:
+                    # 거래량 정보 추가 고려
+                    volume_score = min(volume / 1000000, 2.0)  # 거래량 점수화
+                    final_strength = min((change_rate / 8.0) + (tech_score / 250) + (volume_score / 10), 0.8)
+                    signal = self._create_signal(stock_code, f"{strategy_name}_moderate", current_price, final_strength,
+                                               f'볼륨 {change_rate:.1f}% + 기술 우세 (기준: {0.8 * sentiment_multiplier:.1f}%)', tech_score)
 
-                    signal = {
-                        'stock_code': stock_code,
-                        'signal_type': 'BUY',
-                        'strategy': strategy_name,
-                        'price': current_price,
-                        'strength': final_strength,
-                        'reason': f'거래량 돌파 {change_rate:.1f}% (기술: {tech_action})',
-                        'tech_score': tech_score
-                    }
-                    logger.info(f"🎯 볼륨 브레이크아웃 신호 생성: {stock_code} {change_rate:.1f}% (기술점수: {tech_score})")
-
-            elif strategy_name == 'momentum' and change_rate > 0.6:  # 0.8에서 0.6으로 추가 완화
-                if tech_action in ['BUY', 'HOLD']:
+            elif strategy_name == 'momentum':
+                # 강력한 신호 (센티먼트 반영)
+                momentum_threshold = 0.6 * sentiment_multiplier
+                if change_rate > momentum_threshold and tech_action in ['BUY', 'HOLD']:
                     base_strength = min(change_rate / 4.0, 1.0)
                     tech_bonus = tech_score / 200
                     final_strength = min(base_strength + tech_bonus, 1.0)
+                    signal = self._create_signal(stock_code, strategy_name, current_price, final_strength,
+                                               f'모멘텀 {change_rate:.1f}% (기준: {momentum_threshold:.1f}%, 기술: {tech_action})', tech_score)
+                
+                # 🆕 기술적 우선 신호 (센티먼트 반영)
+                elif change_rate > 0.3 * sentiment_multiplier and tech_action == 'BUY' and tech_score > 85:
+                    final_strength = min(tech_score / 120, 0.7)
+                    signal = self._create_signal(stock_code, f"{strategy_name}_tech", current_price, final_strength,
+                                               f'기술적 강력 매수 (모멘텀: {change_rate:.1f}%, 기준: {0.3 * sentiment_multiplier:.1f}%)', tech_score)
 
-                    signal = {
-                        'stock_code': stock_code,
-                        'signal_type': 'BUY',
-                        'strategy': strategy_name,
-                        'price': current_price,
-                        'strength': final_strength,
-                        'reason': f'모멘텀 {change_rate:.1f}% (기술: {tech_action})',
-                        'tech_score': tech_score
-                    }
-                    logger.info(f"🎯 모멘텀 신호 생성: {stock_code} {change_rate:.1f}% (기술점수: {tech_score})")
-
-            # 기술적 지표가 강력한 매수 신호일 때 추가 신호 생성
-            elif tech_action == 'BUY' and tech_score > 70 and change_rate > 0.5:
-                signal = {
-                    'stock_code': stock_code,
-                    'signal_type': 'BUY',
-                    'strategy': f'{strategy_name}_tech',
-                    'price': current_price,
-                    'strength': min(tech_score / 100, 1.0),
-                    'reason': f'기술적 강세 신호 (점수: {tech_score})',
-                    'tech_score': tech_score
-                }
-                logger.info(f"🎯 기술적 신호 생성: {stock_code} 점수={tech_score}")
+            # 🆕 순수 기술적 신호 (기존 전략과 무관, 센티먼트 반영)
+            if not signal and tech_action == 'BUY' and tech_score > 90 and change_rate > 0.2 * sentiment_multiplier:
+                final_strength = min(tech_score / 110, 0.9)
+                signal = self._create_signal(stock_code, "technical_priority", current_price, final_strength,
+                                           f'기술적 최우선 매수 (점수: {tech_score}, 변화: {change_rate:.1f}%, 기준: {0.2 * sentiment_multiplier:.1f}%)', tech_score)
 
             if signal:
                 logger.info(f"✅ 신호 생성 완료: {signal}")
@@ -606,6 +661,18 @@ class StrategyScheduler:
         except Exception as e:
             logger.error(f"신호 생성 오류: {strategy_name} {stock_code} - {e}")
             return None
+
+    def _create_signal(self, stock_code: str, strategy: str, price: int, strength: float, reason: str, tech_score: int) -> Dict:
+        """신호 생성 헬퍼 메서드"""
+        return {
+            'stock_code': stock_code,
+            'signal_type': 'BUY',
+            'strategy': strategy,
+            'price': price,
+            'strength': strength,
+            'reason': reason,
+            'tech_score': tech_score
+        }
 
     def _should_process_signal(self, stock_code: str, strategy_name: str) -> bool:
         """신호 처리 여부 판단 (중복 방지)"""
@@ -642,13 +709,18 @@ class StrategyScheduler:
             stock_code = market_data['stock_code']
             current_price = market_data['current_price']
             change_rate = market_data['change_rate']
+            market_sentiment = market_data.get('market_sentiment', {})
             
-            # 기본 신호 생성 로직 사용
+            # 🆕 시장 센티먼트 기반 기준 조정
+            sentiment_multiplier = self._get_sentiment_multiplier(market_sentiment)
+            
+            # 기본 신호 생성 로직 사용 (센티먼트 반영)
             data_for_signal = {
                 'current_price': current_price,
                 'change_rate': change_rate,
                 'volume': market_data.get('volume', 0),
-                'timestamp': market_data.get('timestamp', time_module.time())
+                'timestamp': market_data.get('timestamp', time_module.time()),
+                'sentiment_multiplier': sentiment_multiplier  # 🆕 센티먼트 승수
             }
             
             return self._generate_simple_signal(strategy_name, stock_code, data_for_signal)
@@ -656,6 +728,46 @@ class StrategyScheduler:
         except Exception as e:
             logger.error(f"전략별 신호 생성 오류: {e}")
             return None
+
+    def _get_sentiment_multiplier(self, sentiment: Dict) -> float:
+        """🆕 시장 센티먼트에 따른 승수 계산"""
+        try:
+            bullish_score = sentiment.get('bullish_score', 50)
+            volatility = sentiment.get('volatility', 'normal')
+            volume_surge = sentiment.get('volume_surge', False)
+            
+            # 기본 승수
+            multiplier = 1.0
+            
+            # 강세 시장일수록 기준 완화 (더 많은 기회)
+            if bullish_score > 70:
+                multiplier *= 0.8  # 20% 기준 완화
+            elif bullish_score > 60:
+                multiplier *= 0.9  # 10% 기준 완화
+            elif bullish_score < 40:
+                multiplier *= 1.2  # 20% 기준 강화 (보수적)
+            elif bullish_score < 30:
+                multiplier *= 1.4  # 40% 기준 강화 (매우 보수적)
+            
+            # 높은 변동성 시 기준 완화 (기회 확대)
+            if volatility == 'high':
+                multiplier *= 0.85
+            elif volatility == 'low':
+                multiplier *= 1.1
+            
+            # 거래량 급증 시 기준 완화
+            if volume_surge:
+                multiplier *= 0.9
+            
+            # 최종 승수 범위 제한 (0.6 ~ 1.5)
+            multiplier = max(0.6, min(multiplier, 1.5))
+            
+            logger.debug(f"센티먼트 승수: {multiplier:.2f} (강세:{bullish_score}, 변동성:{volatility})")
+            return multiplier
+            
+        except Exception as e:
+            logger.error(f"센티먼트 승수 계산 오류: {e}")
+            return 1.0
 
     def send_signal_to_main_bot(self, signal: Dict, source: str = "unknown"):
         """메인 봇에게 거래 신호 전달 (중복 방지 버전)"""
