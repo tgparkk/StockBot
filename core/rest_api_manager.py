@@ -3,9 +3,10 @@ KIS REST API 통합 관리자 (리팩토링 버전)
 공식 문서 기반 + 모듈화
 """
 import time
+import logging
 import pandas as pd
 from datetime import datetime
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 from utils.logger import setup_logger
 
 # KIS 모듈 import
@@ -13,6 +14,10 @@ from . import kis_auth as kis
 from . import kis_order_api as order_api
 from . import kis_account_api as account_api
 from . import kis_market_api as market_api
+from .kis_market_api import (
+    get_gap_trading_candidates, get_volume_breakout_candidates, get_momentum_candidates,
+    get_fluctuation_rank, get_volume_rank, get_volume_power_rank
+)
 
 # 데이터 모델은 필요할 때 지연 import (순환 import 방지)
 
@@ -231,458 +236,500 @@ class KISRestAPIManager:
 
     # === 시장 스크리닝 관련 ===
 
-    def get_market_screening_candidates(self, screening_type: str = "all") -> Dict:
-        """
-        시장 스크리닝 후보 조회
-
-        Args:
-            screening_type: 스크리닝 타입 ("all", "gap", "volume", "momentum")
-
-        Returns:
-            Dict: 전략별 후보 종목들
-        """
+    def get_market_screening_candidates(self, market_type: str = "all") -> Dict:
+        """🎯 수익성 중심 시장 스크리닝 - 적응형 백업 로직 포함"""
+        logger.info(f"시장 스크리닝 시작: {market_type}")
+        
         candidates = {
-            'gap_candidates': [],      # 갭 트레이딩 후보
-            'volume_candidates': [],   # 거래량 돌파 후보
-            'momentum_candidates': [], # 모멘텀 후보
-            'screening_time': datetime.now(),
-            'total_candidates': 0,
-            'status': 'success'
+            'gap': [],
+            'volume': [],
+            'momentum': []
         }
-
-        try:
-            logger.info(f"시장 스크리닝 시작: {screening_type}")
-
-            if screening_type in ["all", "gap"]:
-                # 갭 트레이딩: 등락률 상위 조회
-                logger.debug("갭 트레이딩 후보 탐색 중...")
-                gap_data = market_api.get_gap_trading_candidates()
-                candidates['gap_candidates'] = self._parse_gap_candidates(gap_data)
-
-            if screening_type in ["all", "volume"]:
-                # 거래량 돌파: 거래량 증가율 상위 조회
-                logger.debug("거래량 돌파 후보 탐색 중...")
-                volume_data = market_api.get_volume_breakout_candidates()
-                candidates['volume_candidates'] = self._parse_volume_candidates(volume_data)
-
-            if screening_type in ["all", "momentum"]:
-                # 모멘텀: 체결강도 상위 조회
-                logger.debug("모멘텀 후보 탐색 중...")
-                momentum_data = market_api.get_momentum_candidates()
-                candidates['momentum_candidates'] = self._parse_momentum_candidates(momentum_data)
-
-            # 총 후보 수 계산
-            candidates['total_candidates'] = (
-                len(candidates['gap_candidates']) +
-                len(candidates['volume_candidates']) +
-                len(candidates['momentum_candidates'])
-            )
-
-            logger.info(f"✅ 시장 스크리닝 완료: 총 {candidates['total_candidates']}개 후보")
-            logger.info(f"   갭({len(candidates['gap_candidates'])}) 볼륨({len(candidates['volume_candidates'])}) 모멘텀({len(candidates['momentum_candidates'])})")
-
-            return candidates
-
-        except Exception as e:
-            logger.error(f"❌ 시장 스크리닝 오류: {e}")
-            candidates.update({
-                'status': 'error',
-                'error_message': str(e)
-            })
-            return candidates
-
-    def _parse_gap_candidates(self, data: Optional[pd.DataFrame]) -> List[Dict]:
-        """갭 트레이딩 후보 파싱 (실제 갭 데이터)"""
-        candidates = []
-
-        if data is not None and not data.empty:
-            logger.debug(f"갭 후보 원본 데이터: {len(data)}건")
-
-            for _, row in data.iterrows():  # 이미 필터링된 갭 데이터
+        
+        markets = ["0000", "0001", "1001"] if market_type == "all" else [market_type]
+        
+        # 🎯 시간대별 적응형 전략
+        from datetime import datetime
+        current_time = datetime.now()
+        is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
+        is_early_market = current_time.hour < 11
+        
+        for market in markets:
+            try:
+                # === 갭 트레이딩 후보 ===
                 try:
-                    gap_rate = float(row.get('gap_rate', 0))
-                    change_rate = float(row.get('prdy_ctrt', 0))
-                    volume_ratio = float(row.get('volume_ratio', 0))
-
-                    # 갭 트레이딩 후보 조건 재확인
-                    if gap_rate >= 2.0 and change_rate > 0 and volume_ratio >= 1.5:
-                        candidates.append({
-                            'stock_code': row.get('stck_shrn_iscd', ''),
-                            'stock_name': row.get('hts_kor_isnm', ''),
-                            'current_price': int(row.get('stck_prpr', 0)),
-                            'open_price': int(row.get('stck_oprc', 0)),
-                            'prev_close': int(row.get('stck_sdpr', 0)),
-                            'gap_size': int(row.get('gap_size', 0)),
-                            'gap_rate': gap_rate,
-                            'change_rate': change_rate,
-                            'volume': int(row.get('acml_vol', 0)),
-                            'volume_ratio': volume_ratio,
-                            'strategy': 'gap_trading',
-                            'rank': int(row.get('data_rank', 0))
-                        })
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"갭 후보 파싱 오류: {e}")
-                    continue
-
-        logger.debug(f"갭 트레이딩 후보: {len(candidates)}개")
-        return candidates
-
-    def _parse_volume_candidates(self, data: Optional[pd.DataFrame]) -> List[Dict]:
-        """거래량 돌파 후보 파싱"""
-        candidates = []
-
-        if data is not None and not data.empty:
-            logger.debug(f"거래량 후보 원본 데이터: {len(data)}건")
-
-            for _, row in data.head(30).iterrows():  # 상위 30개
-                try:
-                    volume = int(row.get('acml_vol', 0))
-                    volume_increase_rate = float(row.get('vol_inrt', 0))
-
-                    if volume >= 10000 and volume_increase_rate > 0:  # 1만주 이상 + 증가율 양수
-                        candidates.append({
-                            'stock_code': row.get('mksc_shrn_iscd', ''),
-                            'stock_name': row.get('hts_kor_isnm', ''),
-                            'current_price': int(row.get('stck_prpr', 0)),
-                            'change_rate': float(row.get('prdy_ctrt', 0)),
-                            'volume': volume,
-                            'volume_increase_rate': volume_increase_rate,
-                            'strategy': 'volume_breakout',
-                            'rank': int(row.get('data_rank', 0))
-                        })
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"거래량 후보 파싱 오류: {e}")
-                    continue
-
-        logger.debug(f"거래량 돌파 후보: {len(candidates)}개")
-        return candidates
-
-    def _parse_momentum_candidates(self, data: Optional[pd.DataFrame]) -> List[Dict]:
-        """모멘텀 후보 파싱 - 🎯 수익성 중심 엄격한 기준"""
-        candidates = []
-
-        if data is not None and not data.empty:
-            logger.debug(f"🎯 모멘텀 후보 원본 데이터: {len(data)}건")
-
-            for _, row in data.head(5).iterrows():  # 🎯 상위 5개로 제한 (기존 8개)
-                try:
-                    execution_strength = float(row.get('tday_rltv', 0))
-                    change_rate = float(row.get('prdy_ctrt', 0))
-                    current_price = int(row.get('stck_prpr', 0))
-                    volume = int(row.get('acml_vol', 0))
-
-                    # 🎯 엄격한 모멘텀 조건
-                    if (execution_strength >= 100 and     # 🎯 체결강도 100 이상 (기존 70)
-                        change_rate >= 2.0 and            # 🎯 상승률 2% 이상 (기존 >0)
-                        current_price >= 1000 and         # 🎯 최소 1,000원 이상
-                        current_price <= 200000 and       # 🎯 최대 20만원 이하
-                        volume >= 100000):                # 🎯 거래량 10만주 이상
+                    gap_candidates = market_api.get_gap_trading_candidates(market)
+                    if gap_candidates is not None and not gap_candidates.empty:
+                        gap_data = self._process_gap_candidates(gap_candidates)
+                        candidates['gap'].extend(gap_data)
+                        logger.info(f"📊 갭 후보: {len(gap_data)}개 ({market})")
+                    else:
+                        logger.warning(f"⚠️ 갭 후보 없음 - 백업 전략 시도 ({market})")
+                        # 🆕 백업 전략: 더 관대한 기준으로 재시도
+                        backup_gap_candidates = self._get_backup_gap_candidates(market, is_pre_market)
+                        if backup_gap_candidates:
+                            candidates['gap'].extend(backup_gap_candidates)
+                            logger.info(f"🔄 갭 백업 후보: {len(backup_gap_candidates)}개 ({market})")
                         
-                        stock_code = row.get('stck_shrn_iscd', '')
+                except Exception as e:
+                    logger.error(f"갭 후보 조회 오류 ({market}): {e}")
 
-                        # 🎯 수익성 점수 계산
-                        profit_score = execution_strength * change_rate * (volume / 100000)
+                # === 거래량 돌파 후보 ===
+                try:
+                    volume_candidates = market_api.get_volume_breakout_candidates(market)
+                    if volume_candidates is not None and not volume_candidates.empty:
+                        volume_data = self._process_volume_candidates(volume_candidates)
+                        candidates['volume'].extend(volume_data)
+                        logger.info(f"📊 거래량 후보: {len(volume_data)}개 ({market})")
+                    else:
+                        logger.warning(f"⚠️ 거래량 후보 없음 - 백업 전략 시도 ({market})")
+                        # 🆕 백업 전략: 더 관대한 기준으로 재시도
+                        backup_volume_candidates = self._get_backup_volume_candidates(market, is_pre_market)
+                        if backup_volume_candidates:
+                            candidates['volume'].extend(backup_volume_candidates)
+                            logger.info(f"🔄 거래량 백업 후보: {len(backup_volume_candidates)}개 ({market})")
+                        
+                except Exception as e:
+                    logger.error(f"거래량 후보 조회 오류 ({market}): {e}")
 
-                        basic_info = {
+                # === 모멘텀 후보 ===
+                try:
+                    momentum_candidates = market_api.get_momentum_candidates(market)
+                    if momentum_candidates is not None and not momentum_candidates.empty:
+                        momentum_data = self._process_momentum_candidates(momentum_candidates)
+                        candidates['momentum'].extend(momentum_data)
+                        logger.info(f"📊 모멘텀 후보: {len(momentum_data)}개 ({market})")
+                    else:
+                        logger.warning(f"⚠️ 모멘텀 후보 없음 - 백업 전략 시도 ({market})")
+                        # 🆕 백업 전략: 더 관대한 기준으로 재시도
+                        backup_momentum_candidates = self._get_backup_momentum_candidates(market, is_pre_market)
+                        if backup_momentum_candidates:
+                            candidates['momentum'].extend(backup_momentum_candidates)
+                            logger.info(f"🔄 모멘텀 백업 후보: {len(backup_momentum_candidates)}개 ({market})")
+                        
+                except Exception as e:
+                    logger.error(f"모멘텀 후보 조회 오류 ({market}): {e}")
+
+                # 짧은 대기 (API 호출 간격)
+                time.sleep(0.2)
+
+            except Exception as e:
+                logger.error(f"시장 {market} 스크리닝 오류: {e}")
+
+        # 🎯 결과 통합 및 중복 제거
+        total_count = len(candidates['gap']) + len(candidates['volume']) + len(candidates['momentum'])
+        all_candidates = self._merge_and_deduplicate_candidates(candidates)
+        
+        logger.info(f"✅ 시장 스크리닝 완료: 총 {total_count}개 후보")
+        logger.info(f"   갭({len(candidates['gap'])}) 볼륨({len(candidates['volume'])}) 모멘텀({len(candidates['momentum'])})")
+        
+        # 🔧 stock_discovery에서 기대하는 형태로 반환
+        return {
+            'status': 'success',
+            'gap_candidates': candidates['gap'],
+            'volume_candidates': candidates['volume'], 
+            'momentum_candidates': candidates['momentum'],
+            'background': all_candidates,  # 기존 호환성 유지
+            'total_count': total_count,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+    
+    def _get_backup_gap_candidates(self, market: str, is_pre_market: bool) -> List[Dict]:
+        """🔄 갭 트레이딩 백업 후보 조회 (매우 관대한 기준)"""
+        try:
+            logger.info(f"🔄 갭 백업 후보 조회 시작 ({market})")
+            
+            # 🎯 매우 관대한 기준으로 등락률 상위 조회
+            if is_pre_market:
+                min_fluctuation = "0.1"  # 0.1% 이상
+            else:
+                min_fluctuation = "0.3"  # 0.3% 이상
+            
+            backup_data = market_api.get_fluctuation_rank(
+                fid_input_iscd=market,
+                fid_rank_sort_cls_code="0",  # 상승률순
+                fid_rsfl_rate1=min_fluctuation
+            )
+            
+            if backup_data is None or backup_data.empty:
+                logger.warning(f"갭 백업 조회에서도 데이터 없음 ({market})")
+                return []
+            
+            backup_candidates = []
+            for idx, row in backup_data.head(10).iterrows():  # 상위 10개만
+                try:
+                    stock_code = row.get('stck_shrn_iscd', '')
+                    stock_name = row.get('hts_kor_isnm', '')
+                    current_price = int(row.get('stck_prpr', 0))
+                    change_rate = float(row.get('prdy_ctrt', 0))
+                    
+                    if stock_code and current_price > 500 and change_rate > 0:  # 최소 조건
+                        backup_candidates.append({
                             'stock_code': stock_code,
-                            'stock_name': row.get('hts_kor_isnm', ''),
+                            'stock_name': stock_name,
                             'current_price': current_price,
                             'change_rate': change_rate,
+                            'strategy_type': 'gap_backup',
+                            'score': change_rate,  # 간단한 점수
+                            'source': f'backup_fluctuation_{market}'
+                        })
+                        
+                except Exception as e:
+                    logger.debug(f"갭 백업 후보 처리 오류: {e}")
+                    continue
+            
+            logger.info(f"🔄 갭 백업 후보: {len(backup_candidates)}개 발견")
+            return backup_candidates
+            
+        except Exception as e:
+            logger.error(f"갭 백업 후보 조회 오류: {e}")
+            return []
+    
+    def _get_backup_volume_candidates(self, market: str, is_pre_market: bool) -> List[Dict]:
+        """🔄 거래량 백업 후보 조회 (매우 관대한 기준)"""
+        try:
+            logger.info(f"🔄 거래량 백업 후보 조회 시작 ({market})")
+            
+            # 🎯 매우 관대한 거래량 기준으로 조회
+            if is_pre_market:
+                volume_threshold = "1000"  # 1천주
+            else:
+                volume_threshold = "5000"  # 5천주
+            
+            backup_data = market_api.get_volume_rank(
+                fid_input_iscd=market,
+                fid_blng_cls_code="1",  # 거래증가율
+                fid_vol_cnt=volume_threshold
+            )
+            
+            if backup_data is None or backup_data.empty:
+                logger.warning(f"거래량 백업 조회에서도 데이터 없음 ({market})")
+                return []
+            
+            backup_candidates = []
+            for idx, row in backup_data.head(8).iterrows():  # 상위 8개만
+                try:
+                    stock_code = row.get('mksc_shrn_iscd', '')
+                    stock_name = row.get('hts_kor_isnm', '')
+                    current_price = int(row.get('stck_prpr', 0))
+                    volume = int(row.get('acml_vol', 0))
+                    
+                    if stock_code and current_price > 500 and volume > 1000:  # 최소 조건
+                        backup_candidates.append({
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'current_price': current_price,
                             'volume': volume,
-                            'execution_strength': execution_strength,
-                            'profit_score': profit_score,  # 🎯 수익성 점수
-                            'strategy': 'momentum',
-                            'rank': int(row.get('data_rank', 0))
-                        }
-
-                        candidates.append(basic_info)
-                        logger.info(f"🎯 모멘텀 후보: {stock_code} 체결강도{execution_strength:.0f} 상승률{change_rate:.1f}% 수익점수{profit_score:.1f}")
-
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"🎯 모멘텀 후보 파싱 오류: {e}")
-                    continue
-
-        # 🎯 수익성 점수 기준 정렬
-        candidates.sort(key=lambda x: x.get('profit_score', 0), reverse=True)
-        result = candidates[:3]  # 🎯 최종 3개만 선정
-        logger.debug(f"🎯 엄격 모멘텀 후보: {len(result)}개")
-        return result
-
-    def _parse_enhanced_gap_candidates(self, gap_data: Optional[pd.DataFrame], disparity_data: Optional[pd.DataFrame]) -> List[Dict]:
-        """향상된 갭 트레이딩 후보 파싱 (등락률 + 이격도 조합)"""
-        candidates = []
-
-        # 기본 등락률 상위 종목
-        gap_candidates = self._parse_gap_candidates(gap_data)
-        candidates.extend(gap_candidates)
-
-        # 이격도 기반 과매도 종목 추가
-        if disparity_data is not None and not disparity_data.empty:
-            logger.debug(f"이격도 후보 원본 데이터: {len(disparity_data)}건")
-
-            for _, row in disparity_data.head(15).iterrows():  # 상위 15개
-                try:
-                    disparity_20 = float(row.get('d20_dsrt', 100))
-                    change_rate = float(row.get('prdy_ctrt', 0))
-
-                    # 이격도 85 이하(과매도) + 상승률 0.5% 이상
-                    if disparity_20 <= 85 and change_rate >= 0.5:
-                        candidates.append({
-                            'stock_code': row.get('mksc_shrn_iscd', ''),
-                            'stock_name': row.get('hts_kor_isnm', ''),
-                            'current_price': int(row.get('stck_prpr', 0)),
-                            'change_rate': change_rate,
-                            'volume': int(row.get('acml_vol', 0)),
-                            'disparity_20': disparity_20,
-                            'strategy': 'gap_trading_enhanced',
-                            'rank': int(row.get('data_rank', 0))
+                            'strategy_type': 'volume_backup',
+                            'score': volume / 10000,  # 간단한 점수
+                            'source': f'backup_volume_{market}'
                         })
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"이격도 후보 파싱 오류: {e}")
+                        
+                except Exception as e:
+                    logger.debug(f"거래량 백업 후보 처리 오류: {e}")
                     continue
-
-        # 중복 제거 (종목코드 기준)
-        unique_candidates = {}
-        for candidate in candidates:
-            stock_code = candidate.get('stock_code', '')
-            if stock_code and stock_code not in unique_candidates:
-                unique_candidates[stock_code] = candidate
-
-        result = list(unique_candidates.values())
-        logger.debug(f"향상된 갭 트레이딩 후보: {len(result)}개")
-        return result
-
-    def _parse_enhanced_volume_candidates(self, volume_data: Optional[pd.DataFrame], bulk_trans_data: Optional[pd.DataFrame]) -> List[Dict]:
-        """향상된 거래량 돌파 후보 파싱 (거래량 순위 + 대량체결건수 조합)"""
-        candidates = []
-
-        # 기본 거래량 순위 종목
-        volume_candidates = self._parse_volume_candidates(volume_data)
-        candidates.extend(volume_candidates)
-
-        # 대량체결건수 상위 종목 추가
-        if bulk_trans_data is not None and not bulk_trans_data.empty:
-            logger.debug(f"대량체결 후보 원본 데이터: {len(bulk_trans_data)}건")
-
-            for _, row in bulk_trans_data.head(20).iterrows():  # 상위 20개
+            
+            logger.info(f"🔄 거래량 백업 후보: {len(backup_candidates)}개 발견")
+            return backup_candidates
+            
+        except Exception as e:
+            logger.error(f"거래량 백업 후보 조회 오류: {e}")
+            return []
+    
+    def _get_backup_momentum_candidates(self, market: str, is_pre_market: bool) -> List[Dict]:
+        """🔄 모멘텀 백업 후보 조회 (매우 관대한 기준)"""
+        try:
+            logger.info(f"🔄 모멘텀 백업 후보 조회 시작 ({market})")
+            
+            # 🎯 매우 관대한 체결강도 기준으로 조회
+            if is_pre_market:
+                power_threshold = "500"  # 500주
+            else:
+                power_threshold = "2000"  # 2천주
+            
+            backup_data = market_api.get_volume_power_rank(
+                fid_input_iscd=market,
+                fid_vol_cnt=power_threshold
+            )
+            
+            if backup_data is None or backup_data.empty:
+                # 🔄 최후의 수단: 등락률 상위로 대체
+                logger.warning(f"모멘텀 백업 조회 실패 - 등락률로 대체 ({market})")
+                return self._get_fallback_momentum_candidates(market)
+            
+            backup_candidates = []
+            for idx, row in backup_data.head(6).iterrows():  # 상위 6개만
                 try:
-                    buy_count = int(row.get('shnu_cntg_csnu', 0))
-                    sell_count = int(row.get('seln_cntg_csnu', 0))
-                    change_rate = float(row.get('prdy_ctrt', 0))
-
-                    # 매수체결건수가 매도보다 많고 상승률 양수
-                    if buy_count > sell_count and change_rate > 0:
-                        buy_sell_ratio = buy_count / max(sell_count, 1)
-                        if buy_sell_ratio >= 1.2:  # 매수가 20% 이상 많음
-                            candidates.append({
-                                'stock_code': row.get('mksc_shrn_iscd', ''),
-                                'stock_name': row.get('hts_kor_isnm', ''),
-                                'current_price': int(row.get('stck_prpr', 0)),
-                                'change_rate': change_rate,
-                                'volume': int(row.get('acml_vol', 0)),
-                                'buy_count': buy_count,
-                                'sell_count': sell_count,
-                                'buy_sell_ratio': buy_sell_ratio,
-                                'strategy': 'volume_breakout_enhanced',
-                                'rank': int(row.get('data_rank', 0))
-                            })
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"대량체결 후보 파싱 오류: {e}")
+                    stock_code = row.get('mksc_shrn_iscd', '')
+                    stock_name = row.get('hts_kor_isnm', '')
+                    current_price = int(row.get('stck_prpr', 0))
+                    power = float(row.get('cttr', 0))
+                    
+                    if stock_code and current_price > 500 and power > 50:  # 최소 조건
+                        backup_candidates.append({
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'current_price': current_price,
+                            'power': power,
+                            'strategy_type': 'momentum_backup',
+                            'score': power,  # 간단한 점수
+                            'source': f'backup_power_{market}'
+                        })
+                        
+                except Exception as e:
+                    logger.debug(f"모멘텀 백업 후보 처리 오류: {e}")
                     continue
+            
+            logger.info(f"🔄 모멘텀 백업 후보: {len(backup_candidates)}개 발견")
+            return backup_candidates
+            
+        except Exception as e:
+            logger.error(f"모멘텀 백업 후보 조회 오류: {e}")
+            return self._get_fallback_momentum_candidates(market)
+    
+    def _get_fallback_momentum_candidates(self, market: str) -> List[Dict]:
+        """🆘 최후의 수단: 등락률 상위로 모멘텀 후보 대체"""
+        try:
+            logger.info(f"🆘 최후 대안: 등락률 상위로 모멘텀 대체 ({market})")
+            
+            fallback_data = market_api.get_fluctuation_rank(
+                fid_input_iscd=market,
+                fid_rank_sort_cls_code="0",  # 상승률순
+                fid_rsfl_rate1="0.5"  # 0.5% 이상
+            )
+            
+            if fallback_data is None or fallback_data.empty:
+                return []
+            
+            fallback_candidates = []
+            for idx, row in fallback_data.head(5).iterrows():  # 상위 5개만
+                try:
+                    stock_code = row.get('stck_shrn_iscd', '')
+                    stock_name = row.get('hts_kor_isnm', '')
+                    current_price = int(row.get('stck_prpr', 0))
+                    change_rate = float(row.get('prdy_ctrt', 0))
+                    
+                    if stock_code and current_price > 500 and change_rate > 0.5:
+                        fallback_candidates.append({
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'current_price': current_price,
+                            'change_rate': change_rate,
+                            'strategy_type': 'momentum_fallback',
+                            'score': change_rate,
+                            'source': f'fallback_fluctuation_{market}'
+                        })
+                        
+                except Exception as e:
+                    continue
+            
+            logger.info(f"🆘 최후 대안 후보: {len(fallback_candidates)}개 발견")
+            return fallback_candidates
+            
+        except Exception as e:
+            logger.error(f"최후 대안 후보 조회 오류: {e}")
+            return []
 
-        # 중복 제거 (종목코드 기준)
-        unique_candidates = {}
-        for candidate in candidates:
-            stock_code = candidate.get('stock_code', '')
-            if stock_code and stock_code not in unique_candidates:
-                unique_candidates[stock_code] = candidate
+    def _process_gap_candidates(self, gap_candidates: pd.DataFrame) -> List[Dict]:
+        """갭 후보 데이터 처리"""
+        try:
+            processed = []
+            for idx, row in gap_candidates.iterrows():
+                try:
+                    # 🔧 안전한 타입 변환
+                    stock_code = str(row.get('stck_shrn_iscd', ''))
+                    stock_name = str(row.get('hts_kor_isnm', ''))
+                    
+                    try:
+                        current_price = int(row.get('stck_prpr', 0)) if row.get('stck_prpr', 0) != '' else 0
+                    except (ValueError, TypeError):
+                        current_price = 0
+                    
+                    try:
+                        gap_rate = float(row.get('gap_rate', 0)) if row.get('gap_rate', 0) != '' else 0.0
+                    except (ValueError, TypeError):
+                        gap_rate = 0.0
+                    
+                    try:
+                        change_rate = float(row.get('prdy_ctrt', 0)) if row.get('prdy_ctrt', 0) != '' else 0.0
+                    except (ValueError, TypeError):
+                        change_rate = 0.0
+                    
+                    try:
+                        volume_ratio = float(row.get('volume_ratio', 0)) if row.get('volume_ratio', 0) != '' else 0.0
+                    except (ValueError, TypeError):
+                        volume_ratio = 0.0
+                    
+                    try:
+                        score = float(row.get('profit_score', 0)) if row.get('profit_score', 0) != '' else max(gap_rate, change_rate)  # 백업 점수
+                    except (ValueError, TypeError):
+                        score = max(gap_rate, change_rate)  # 백업 점수
+                    
+                    if stock_code and current_price > 0:
+                        processed.append({
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'current_price': current_price,
+                            'gap_rate': gap_rate,
+                            'change_rate': change_rate,
+                            'volume_ratio': volume_ratio,
+                            'strategy_type': 'gap_trading',
+                            'score': score,
+                            'source': 'gap_screening'
+                        })
+                except Exception as e:
+                    logger.debug(f"갭 후보 행 처리 오류: {e}")
+                    continue
+                    
+            return processed
+        except Exception as e:
+            logger.error(f"갭 후보 처리 오류: {e}")
+            return []
 
-        result = list(unique_candidates.values())
-        logger.debug(f"향상된 거래량 돌파 후보: {len(result)}개")
-        return result
+    def _process_volume_candidates(self, volume_candidates: pd.DataFrame) -> List[Dict]:
+        """거래량 후보 데이터 처리"""
+        try:
+            processed = []
+            for idx, row in volume_candidates.iterrows():
+                try:
+                    # 🔧 안전한 타입 변환
+                    stock_code = str(row.get('mksc_shrn_iscd', ''))
+                    stock_name = str(row.get('hts_kor_isnm', ''))
+                    
+                    try:
+                        current_price = int(row.get('stck_prpr', 0)) if row.get('stck_prpr', 0) != '' else 0
+                    except (ValueError, TypeError):
+                        current_price = 0
+                    
+                    try:
+                        volume = int(row.get('acml_vol', 0)) if row.get('acml_vol', 0) != '' else 0
+                    except (ValueError, TypeError):
+                        volume = 0
+                    
+                    try:
+                        volume_ratio = float(row.get('vol_inrt', 0)) if row.get('vol_inrt', 0) != '' else 0.0
+                    except (ValueError, TypeError):
+                        volume_ratio = 0.0
+                    
+                    try:
+                        score = float(row.get('vol_inrt', 0)) if row.get('vol_inrt', 0) != '' else volume / 100000
+                    except (ValueError, TypeError):
+                        score = volume / 100000  # 백업 점수
+                    
+                    if stock_code and current_price > 0:
+                        processed.append({
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'current_price': current_price,
+                            'volume': volume,
+                            'volume_ratio': volume_ratio,
+                            'strategy_type': 'volume_breakout',
+                            'score': score,
+                            'source': 'volume_screening'
+                        })
+                except Exception as e:
+                    logger.debug(f"거래량 후보 행 처리 오류: {e}")
+                    continue
+                    
+            return processed
+        except Exception as e:
+            logger.error(f"거래량 후보 처리 오류: {e}")
+            return []
 
-    def _parse_enhanced_momentum_candidates(self, momentum_data: Optional[pd.DataFrame], bulk_trans_data: Optional[pd.DataFrame]) -> List[Dict]:
-        """향상된 모멘텀 후보 파싱 (체결강도 + 대량체결건수 조합)"""
-        candidates = []
+    def _process_momentum_candidates(self, momentum_candidates: pd.DataFrame) -> List[Dict]:
+        """모멘텀 후보 데이터 처리"""
+        try:
+            processed = []
+            for idx, row in momentum_candidates.iterrows():
+                try:
+                    # 🔧 안전한 타입 변환
+                    stock_code = str(row.get('mksc_shrn_iscd', ''))
+                    stock_name = str(row.get('hts_kor_isnm', ''))
+                    
+                    try:
+                        current_price = int(row.get('stck_prpr', 0)) if row.get('stck_prpr', 0) != '' else 0
+                    except (ValueError, TypeError):
+                        current_price = 0
+                    
+                    try:
+                        power = float(row.get('cttr', 0)) if row.get('cttr', 0) != '' else 0.0
+                    except (ValueError, TypeError):
+                        power = 0.0
+                    
+                    try:
+                        volume = int(row.get('acml_vol', 0)) if row.get('acml_vol', 0) != '' else 0
+                    except (ValueError, TypeError):
+                        volume = 0
+                    
+                    try:
+                        score = float(row.get('cttr', 0)) if row.get('cttr', 0) != '' else power
+                    except (ValueError, TypeError):
+                        score = power  # 백업 점수
+                    
+                    if stock_code and current_price > 0:
+                        processed.append({
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'current_price': current_price,
+                            'power': power,
+                            'volume': volume,
+                            'strategy_type': 'momentum',
+                            'score': score,
+                            'source': 'momentum_screening'
+                        })
+                except Exception as e:
+                    logger.debug(f"모멘텀 후보 행 처리 오류: {e}")
+                    continue
+                    
+            return processed
+        except Exception as e:
+            logger.error(f"모멘텀 후보 처리 오류: {e}")
+            return []
 
-        # 기본 체결강도 상위 종목
-        momentum_candidates = self._parse_momentum_candidates(momentum_data)
-        candidates.extend(momentum_candidates)
-
-        # 대량체결건수와 교차 검증
-        if bulk_trans_data is not None and not bulk_trans_data.empty:
-            logger.debug(f"모멘텀 교차검증 데이터: {len(bulk_trans_data)}건")
-
-            # 대량체결 종목 코드 세트 생성
-            bulk_trans_codes = set()
-            for _, row in bulk_trans_data.iterrows():
-                stock_code = row.get('mksc_shrn_iscd', '')
+    def _merge_and_deduplicate_candidates(self, candidates: Dict) -> List[Dict]:
+        """후보 통합 및 중복 제거"""
+        try:
+            all_candidates = []
+            
+            # 모든 후보 통합
+            for strategy_type, candidate_list in candidates.items():
+                all_candidates.extend(candidate_list)
+            
+            # 종목 코드 기준 중복 제거 (높은 점수 우선)
+            unique_candidates = {}
+            for candidate in all_candidates:
+                stock_code = candidate.get('stock_code', '')
                 if stock_code:
-                    bulk_trans_codes.add(stock_code)
-
-            # 기존 모멘텀 후보 중 대량체결에도 포함된 종목들에 가점
-            for candidate in candidates:
-                if candidate.get('stock_code', '') in bulk_trans_codes:
-                    candidate['enhanced_score'] = candidate.get('execution_strength', 0) * 1.2
-                    candidate['strategy'] = 'momentum_enhanced'
-                else:
-                    candidate['enhanced_score'] = candidate.get('execution_strength', 0)
-
-        # 향상된 점수 기준으로 정렬
-        candidates.sort(key=lambda x: x.get('enhanced_score', 0), reverse=True)
-
-        result = candidates[:25]  # 상위 25개
-        logger.debug(f"향상된 모멘텀 후보: {len(result)}개")
-        return result
-
-    def _parse_unified_gap_candidates(self, gap_data: Dict[str, Optional[pd.DataFrame]]) -> List[Dict]:
-        """통합된 갭 트레이딩 후보 파싱"""
-        candidates = []
-
-        # 기본 등락률 상위 종목
-        if gap_data.get("basic") is not None:
-            basic_candidates = self._parse_gap_candidates(gap_data["basic"])
-            candidates.extend(basic_candidates)
-
-        # 이격도 기반 과매도 종목 추가
-        if gap_data.get("enhanced") is not None:
-            enhanced_candidates = self._parse_enhanced_gap_candidates(None, gap_data["enhanced"])
-            candidates.extend(enhanced_candidates)
-
-        # 중복 제거 (종목코드 기준)
-        unique_candidates = {}
-        for candidate in candidates:
-            stock_code = candidate.get('stock_code', '')
-            if stock_code and stock_code not in unique_candidates:
-                unique_candidates[stock_code] = candidate
-
-        result = list(unique_candidates.values())
-        logger.debug(f"통합 갭 트레이딩 후보: {len(result)}개")
-        return result
-
-    def _parse_unified_volume_candidates(self, volume_data: Dict[str, Optional[pd.DataFrame]],
-                                       quote_balance_data: Optional[pd.DataFrame]) -> List[Dict]:
-        """통합된 거래량 돌파 후보 파싱"""
-        candidates = []
-
-        # 기본 거래량 순위 종목
-        if volume_data.get("basic") is not None:
-            basic_candidates = self._parse_volume_candidates(volume_data["basic"])
-            candidates.extend(basic_candidates)
-
-        # 대량체결건수 종목
-        if volume_data.get("enhanced") is not None:
-            enhanced_candidates = self._parse_enhanced_volume_candidates(None, volume_data["enhanced"])
-            candidates.extend(enhanced_candidates)
-
-        # 호가잔량 순매수 우세 종목 추가
-        if quote_balance_data is not None and not quote_balance_data.empty:
-            logger.debug(f"호가잔량 후보 원본 데이터: {len(quote_balance_data)}건")
-
-            for _, row in quote_balance_data.head(15).iterrows():  # 상위 15개
-                try:
-                    net_buy_volume = int(row.get('total_ntsl_bidp_rsqn', 0))
-                    buy_ratio = float(row.get('shnu_rsqn_rate', 0))
-                    change_rate = float(row.get('prdy_ctrt', 0))
-
-                    # 순매수잔량 > 0 + 매수비율 60% 이상 + 상승률 > 0
-                    if net_buy_volume > 0 and buy_ratio >= 60 and change_rate > 0:
-                        candidates.append({
-                            'stock_code': row.get('mksc_shrn_iscd', ''),
-                            'stock_name': row.get('hts_kor_isnm', ''),
-                            'current_price': int(row.get('stck_prpr', 0)),
-                            'change_rate': change_rate,
-                            'volume': int(row.get('acml_vol', 0)),
-                            'net_buy_volume': net_buy_volume,
-                            'buy_ratio': buy_ratio,
-                            'strategy': 'volume_quote_balance',
-                            'rank': int(row.get('data_rank', 0))
-                        })
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"호가잔량 후보 파싱 오류: {e}")
-                    continue
-
-        # 중복 제거 (종목코드 기준)
-        unique_candidates = {}
-        for candidate in candidates:
-            stock_code = candidate.get('stock_code', '')
-            if stock_code and stock_code not in unique_candidates:
-                unique_candidates[stock_code] = candidate
-
-        result = list(unique_candidates.values())
-        logger.debug(f"통합 거래량 돌파 후보: {len(result)}개")
-        return result
-
-    def _parse_unified_momentum_candidates(self, momentum_data: Dict[str, Optional[pd.DataFrame]],
-                                         quote_balance_data: Optional[pd.DataFrame]) -> List[Dict]:
-        """통합된 모멘텀 후보 파싱"""
-        candidates = []
-
-        # 기본 체결강도 상위 종목
-        if momentum_data.get("basic") is not None:
-            basic_candidates = self._parse_momentum_candidates(momentum_data["basic"])
-            candidates.extend(basic_candidates)
-
-        # 대량체결건수 교차검증 종목
-        if momentum_data.get("enhanced") is not None:
-            enhanced_candidates = self._parse_enhanced_momentum_candidates(None, momentum_data["enhanced"])
-            candidates.extend(enhanced_candidates)
-
-        # 호가잔량 매수비율 우세 종목 추가
-        if quote_balance_data is not None and not quote_balance_data.empty:
-            logger.debug(f"호가잔량 매수비율 후보 원본 데이터: {len(quote_balance_data)}건")
-
-            for _, row in quote_balance_data.head(20).iterrows():  # 상위 20개
-                try:
-                    buy_ratio = float(row.get('shnu_rsqn_rate', 0))
-                    sell_ratio = float(row.get('seln_rsqn_rate', 0))
-                    change_rate = float(row.get('prdy_ctrt', 0))
-
-                    # 매수비율 70% 이상 + 매수우세 + 상승률 > 0.5%
-                    if buy_ratio >= 70 and buy_ratio > sell_ratio and change_rate >= 0.5:
-                        candidates.append({
-                            'stock_code': row.get('mksc_shrn_iscd', ''),
-                            'stock_name': row.get('hts_kor_isnm', ''),
-                            'current_price': int(row.get('stck_prpr', 0)),
-                            'change_rate': change_rate,
-                            'volume': int(row.get('acml_vol', 0)),
-                            'buy_ratio': buy_ratio,
-                            'sell_ratio': sell_ratio,
-                            'strategy': 'momentum_quote_balance',
-                            'rank': int(row.get('data_rank', 0))
-                        })
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"호가잔량 매수비율 후보 파싱 오류: {e}")
-                    continue
-
-        # 향상된 점수 계산 및 정렬
-        for candidate in candidates:
-            execution_strength = candidate.get('execution_strength', 0)
-            buy_ratio = candidate.get('buy_ratio', 0)
-            change_rate = candidate.get('change_rate', 0)
-
-            # 복합 점수 계산 (체결강도 + 매수비율 + 상승률)
-            candidate['momentum_score'] = (execution_strength * 0.5) + (buy_ratio * 0.3) + (change_rate * 20)
-
-        # 모멘텀 점수 기준 정렬
-        candidates.sort(key=lambda x: x.get('momentum_score', 0), reverse=True)
-
-        result = candidates[:25]  # 상위 25개
-        logger.debug(f"통합 모멘텀 후보: {len(result)}개")
-        return result
+                    existing = unique_candidates.get(stock_code)
+                    if not existing or candidate.get('score', 0) > existing.get('score', 0):
+                        unique_candidates[stock_code] = candidate
+            
+            # 점수 순으로 정렬
+            sorted_candidates = sorted(
+                unique_candidates.values(),
+                key=lambda x: x.get('score', 0),
+                reverse=True
+            )
+            
+            logger.info(f"후보 통합 완료: {len(all_candidates)}개 → {len(sorted_candidates)}개 (중복제거)")
+            return sorted_candidates[:20]  # 상위 20개만
+            
+        except Exception as e:
+            logger.error(f"후보 통합 오류: {e}")
+            return []
 
     def get_screening_summary(self) -> Dict:
         """스크리닝 요약 정보"""
         try:
-            candidates = self.get_market_screening_candidates("all")
+            screening_results = self.get_market_screening_candidates("all")
 
             return {
                 "status": "success",
-                "total_candidates": candidates.get('total_candidates', 0),
-                "gap_count": len(candidates.get('gap_candidates', [])),
-                "volume_count": len(candidates.get('volume_candidates', [])),
-                "momentum_count": len(candidates.get('momentum_candidates', [])),
-                "last_screening": candidates.get('screening_time', datetime.now()).strftime('%H:%M:%S')
+                "total_candidates": screening_results.get('total_count', 0),
+                "gap_count": len(screening_results.get('gap_candidates', [])),
+                "volume_count": len(screening_results.get('volume_candidates', [])),
+                "momentum_count": len(screening_results.get('momentum_candidates', [])),
+                "last_screening": screening_results.get('timestamp', datetime.now().strftime('%H:%M:%S'))
             }
         except Exception as e:
             logger.error(f"스크리닝 요약 오류: {e}")

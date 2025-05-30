@@ -208,12 +208,12 @@ class PositionManager:
         return targets
 
     def _get_default_targets(self) -> Dict:
-        """기본 손익 목표 (백업용)"""
+        """기본 손익 목표 (백업용) - 🎯 더 합리적인 보유 시간 적용"""
         return {
-            # 기본 전략: 안정적이고 수익성 있는 매도 (개선)
+            # 기본 전략: 안정적이고 수익성 있는 매도 (최소 보유 시간 개선)
             'default': {
-                'stop_loss': -3.5, 'take_profit': 5.5, 'min_holding_minutes': 30,
-                'early_stop_loss': -2.0, 'early_stop_minutes': 15,
+                'stop_loss': -3.5, 'take_profit': 5.5, 'min_holding_minutes': 45,
+                'early_stop_loss': -2.0, 'early_stop_minutes': 20,  # 15분 → 20분
                 'trailing_stop_trigger': 3.0, 'trailing_stop_gap': 1.5,
                 'dynamic_stop_loss': True
             },
@@ -229,31 +229,31 @@ class PositionManager:
             # 🆕 이격도 반등: 과매도 반등 기대하며 여유 있게 (개선)
             'disparity_reversal': {
                 'stop_loss': -3.0, 'take_profit': 6.5, 'min_holding_minutes': 45,
-                'early_stop_loss': -2.0, 'early_stop_minutes': 20,
+                'early_stop_loss': -2.0, 'early_stop_minutes': 25,  # 20분 → 25분
                 'trailing_stop_trigger': 3.5, 'trailing_stop_gap': 1.8,
                 'dynamic_stop_loss': True
             },
             
-            # 갭 거래: 빠른 수익 실현 (개선)
+            # 갭 거래: 빠른 수익 실현이지만 더 여유 있게 (개선)
             'gap_trading': {
-                'stop_loss': -2.5, 'take_profit': 4.5, 'min_holding_minutes': 20,
-                'early_stop_loss': -1.5, 'early_stop_minutes': 10,
+                'stop_loss': -2.5, 'take_profit': 4.5, 'min_holding_minutes': 30,  # 20분 → 30분
+                'early_stop_loss': -1.5, 'early_stop_minutes': 15,  # 10분 → 15분
                 'trailing_stop_trigger': 2.5, 'trailing_stop_gap': 1.2,
                 'dynamic_stop_loss': True
             },
             
             # 거래량 돌파: 트렌드 지속 기대 (개선)
             'volume_breakout': {
-                'stop_loss': -3.2, 'take_profit': 6.8, 'min_holding_minutes': 35,
-                'early_stop_loss': -2.2, 'early_stop_minutes': 18,
+                'stop_loss': -3.2, 'take_profit': 6.8, 'min_holding_minutes': 40,  # 35분 → 40분
+                'early_stop_loss': -2.2, 'early_stop_minutes': 20,  # 18분 → 20분
                 'trailing_stop_trigger': 3.8, 'trailing_stop_gap': 2.0,
                 'dynamic_stop_loss': True
             },
             
-            # 모멘텀: 트렌드 최대한 활용 (개선)
+            # 모멘텀: 트렌드 최대한 활용하되 너무 짧지 않게 (개선)
             'momentum': {
-                'stop_loss': -2.2, 'take_profit': 8.0, 'min_holding_minutes': 20,
-                'early_stop_loss': -1.5, 'early_stop_minutes': 8,
+                'stop_loss': -2.2, 'take_profit': 8.0, 'min_holding_minutes': 25,  # 20분 → 25분
+                'early_stop_loss': -1.5, 'early_stop_minutes': 15,  # 8분 → 15분
                 'trailing_stop_trigger': 4.5, 'trailing_stop_gap': 2.2,
                 'dynamic_stop_loss': True
             }
@@ -262,10 +262,57 @@ class PositionManager:
     # === 수익률 계산 헬퍼 메서드들 ===
     
     def _calculate_profit_rate(self, current_price: int, buy_price: int) -> float:
-        """수익률 계산"""
+        """수익률 계산 (세전)"""
         if buy_price <= 0:
             return 0.0
         return ((current_price - buy_price) / buy_price) * 100
+    
+    def _calculate_after_tax_profit_rate(self, current_price: int, buy_price: int, 
+                                        market_type: str = "KOSPI") -> float:
+        """🎯 세후 실제 수익률 계산"""
+        if buy_price <= 0:
+            return 0.0
+        
+        # 한국 주식 거래 비용 (2024년 기준)
+        brokerage_fee_rate = 0.00015  # 0.015% (매수/매도 각각)
+        
+        if market_type.upper() == "KOSDAQ":
+            transaction_tax_rate = 0.003  # 0.3% (코스닥, 매도시만)
+        else:
+            transaction_tax_rate = 0.0023  # 0.23% (코스피, 매도시만)
+        
+        securities_tax_rate = 0.0015  # 0.15% (매도시만)
+        rural_tax_rate = transaction_tax_rate * 0.2  # 농특세 (거래세의 20%)
+        
+        # 총 거래 비용 계산
+        buy_cost = buy_price * brokerage_fee_rate  # 매수 수수료
+        sell_cost = current_price * (
+            brokerage_fee_rate +  # 매도 수수료
+            transaction_tax_rate +  # 거래세
+            securities_tax_rate +  # 증권거래세
+            rural_tax_rate  # 농특세
+        )
+        
+        # 실제 손익
+        gross_profit = current_price - buy_price
+        net_profit = gross_profit - buy_cost - sell_cost
+        
+        # 세후 수익률
+        after_tax_rate = (net_profit / buy_price) * 100
+        
+        return round(after_tax_rate, 2)
+    
+    def _get_market_type(self, stock_code: str) -> str:
+        """종목 코드로 시장 구분 (코스피/코스닥)"""
+        try:
+            # 간단한 구분 로직 (정확하지 않을 수 있음)
+            code_int = int(stock_code)
+            if code_int < 100000:  # 6자리 미만은 대체로 코스피
+                return "KOSPI"
+            else:
+                return "KOSDAQ"
+        except:
+            return "KOSPI"  # 기본값
     
     def _calculate_profit_loss(self, sell_price: int, buy_price: int, quantity: int) -> int:
         """손익 계산"""
@@ -273,14 +320,36 @@ class PositionManager:
     
     def _update_position_profit_info(self, position: Dict, current_price: int) -> None:
         """포지션 수익 정보 업데이트"""
-        profit_rate = self._calculate_profit_rate(current_price, position['buy_price'])
+        stock_code = position['stock_code']
+        buy_price = position['buy_price']
+        
+        # 세전 수익률 (기존)
+        profit_rate = self._calculate_profit_rate(current_price, buy_price)
+        
+        # 🎯 세후 실제 수익률 (신규 추가)
+        market_type = self._get_market_type(stock_code)
+        after_tax_profit_rate = self._calculate_after_tax_profit_rate(current_price, buy_price, market_type)
+        
+        # 포지션 정보 업데이트
         position['current_price'] = current_price
-        position['profit_rate'] = profit_rate
+        position['profit_rate'] = profit_rate  # 세전 수익률 (기존 호환성)
+        position['after_tax_profit_rate'] = after_tax_profit_rate  # 🆕 세후 수익률
+        position['market_type'] = market_type  # 시장 구분 정보
         position['last_update'] = time.time()
         
-        # 최대 수익률 업데이트
+        # 최대 수익률 업데이트 (세후 기준으로 변경)
+        if after_tax_profit_rate > position.get('max_after_tax_profit_rate', 0):
+            position['max_after_tax_profit_rate'] = after_tax_profit_rate
+            
+        # 최대 손실률 추적 (세후 기준으로 변경)
+        if after_tax_profit_rate < position.get('min_after_tax_profit_rate', 0):
+            position['min_after_tax_profit_rate'] = after_tax_profit_rate
+            
+        # 기존 호환성을 위해 세전 기준도 유지
         if profit_rate > position.get('max_profit_rate', 0):
             position['max_profit_rate'] = profit_rate
+        if profit_rate < position.get('min_profit_rate', 0):
+            position['min_profit_rate'] = profit_rate
 
     def add_position(self, stock_code: str, quantity: int, buy_price: int,
                     strategy_type: str = "manual") -> bool:
@@ -311,6 +380,10 @@ class PositionManager:
                         'buy_time': time.time(),
                         'last_update': time.time(),
                         'max_profit_rate': 0.0,
+                        'min_profit_rate': 0.0,  # 🆕 최대 손실률 추적용 추가
+                        'max_after_tax_profit_rate': 0.0,  # 🎯 세후 최대 수익률
+                        'min_after_tax_profit_rate': 0.0,  # 🎯 세후 최대 손실률
+                        'market_type': self._get_market_type(stock_code),  # 시장 구분
                         'status': 'active'
                     }
 
@@ -642,7 +715,7 @@ class PositionManager:
 
     def _evaluate_sell_conditions(self, profit_rate: float, max_profit_rate: float, 
                                  holding_minutes: float, targets: Dict, position: Dict = None) -> Optional[str]:
-        """매도 조건 평가 (🎯 개선된 안전한 로직)"""
+        """매도 조건 평가 (🎯 손절 범위 내 보유 연장 로직 추가)"""
         stop_loss = targets['stop_loss']
         take_profit = targets['take_profit']
         min_holding_minutes = targets.get('min_holding_minutes', 30)
@@ -653,6 +726,18 @@ class PositionManager:
         early_stop_loss = targets.get('early_stop_loss', -2.0)
         early_stop_minutes = targets.get('early_stop_minutes', 15)
         dynamic_stop_loss = targets.get('dynamic_stop_loss', True)
+
+        # 📅 장 마감 30분 전 체크 (14:50 이후)
+        from datetime import datetime
+        current_time = datetime.now()
+        market_close_hour = 15
+        market_close_minute = 20
+        
+        # 14:50 이후면 강제 정리 모드
+        is_near_market_close = (
+            current_time.hour > 14 or 
+            (current_time.hour == 14 and current_time.minute >= 50)
+        )
 
         # 1. 극심한 손실 시 즉시 손절 (기존 유지)
         if profit_rate <= stop_loss - 2.5:  # 더 빠른 긴급손절
@@ -675,21 +760,125 @@ class PositionManager:
             if intelligent_signal:
                 return intelligent_signal
         
-        # 5. 최소 홀딩 시간 후 정상 매도 조건
+        # 5. 🎯 장 마감 30분 전 강제 정리 (안전장치)
+        elif is_near_market_close:
+            if profit_rate <= -0.5:  # 손실 0.5% 이상시 즉시 정리
+                return f"마감전정리-손실 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+            elif profit_rate >= 1.0:  # 수익 1% 이상시 즉시 정리  
+                return f"마감전정리-수익 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+            elif holding_minutes >= min_holding_minutes * 2:  # 너무 오래 보유시 정리
+                return f"마감전정리-시간 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+        
+        # 6. 🎯 손절 범위 내 보유 연장 로직 (핵심 개선사항)
         elif holding_minutes >= min_holding_minutes:
+            
+            # 6-1. 명확한 손절 조건 (변동 없음)
             if profit_rate <= stop_loss:
                 return f"손절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+            
+            # 6-2. 명확한 익절 조건 (변동 없음)  
             elif profit_rate >= take_profit:
                 return f"익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+            
+            # 6-3. 🎯 손절 범위 내 보유 연장 (-3% ~ 0% 구간)
+            elif stop_loss < profit_rate <= 0:
+                # 과매도 상황 체크
+                disparity_signal = self._check_disparity_sell_signal(position) if position else None
+                
+                if disparity_signal is None:  # 과매도로 판단되면 보유 연장
+                    # 최대 보유 시간 연장 (기존 2배까지 허용)
+                    max_extended_minutes = min_holding_minutes * 3  # 3배까지 연장
+                    
+                    if holding_minutes < max_extended_minutes:
+                        # 보유 연장 조건 체크
+                        extension_reason = self._check_holding_extension_conditions(position, profit_rate, holding_minutes)
+                        if extension_reason:
+                            logger.info(f"🔄 보유연장: {position['stock_code']} - {extension_reason}")
+                            return None  # 매도하지 않음
+                    else:
+                        return f"연장한계도달 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
+                else:
+                    # 과매수 상황에서는 기존 로직 적용
+                    pass
+            
+            # 6-4. 기본 추격매도
             elif (max_profit_rate >= trailing_stop_trigger and 
                   profit_rate <= max_profit_rate - trailing_stop_gap):
                 return f"기본추격매도 (최고 {max_profit_rate:.2f}% → {profit_rate:.2f}%, {holding_minutes:.0f}분)"
+            
+            # 6-5. 시간 기반 매도 (손절 범위 밖에서만 적용)
+            elif profit_rate > 0 and holding_minutes >= min_holding_minutes * 2:  # 수익구간에서만 시간매도
+                return f"시간기반매도 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
         
-        # 6. 조기 익절 조건 (더 관대하게 조정)
+        # 7. 조기 익절 조건 (더 관대하게 조정)
         elif holding_minutes < min_holding_minutes and profit_rate >= take_profit + 1.5:
             return f"조기익절 ({profit_rate:.2f}%, {holding_minutes:.0f}분)"
 
         return None
+
+    def _check_holding_extension_conditions(self, position: Dict, profit_rate: float, holding_minutes: float) -> Optional[str]:
+        """🎯 손절 범위 내 보유 연장 조건 체크"""
+        try:
+            stock_code = position['stock_code']
+            
+            # 1. 기본 연장 조건: 손실이 줄어들고 있는 추세
+            max_loss_rate = position.get('min_profit_rate', profit_rate)  # 최대 손실률 추적
+            if profit_rate > max_loss_rate:  # 손실이 회복되고 있음
+                position['min_profit_rate'] = profit_rate  # 업데이트
+                return f"손실회복추세 ({max_loss_rate:.1f}%→{profit_rate:.1f}%)"
+            
+            # 2. 과매도 구간 확인 (이격도 기반)
+            try:
+                disparity_data = get_disparity_rank(
+                    fid_input_iscd="0000",
+                    fid_hour_cls_code="20",
+                    fid_vol_cnt="5000"
+                )
+                
+                if disparity_data is not None and not disparity_data.empty:
+                    stock_row = disparity_data[disparity_data['mksc_shrn_iscd'] == stock_code]
+                    if not stock_row.empty:
+                        d20_disparity = float(stock_row.iloc[0].get('d20_dsrt', 100))
+                        if d20_disparity <= 90:  # 20일 이격도 90% 이하 (과매도)
+                            return f"과매도구간연장 (D20:{d20_disparity:.1f}%)"
+                
+            except Exception as e:
+                logger.debug(f"이격도 확인 오류: {e}")
+            
+            # 3. 거래량 증가 추세 (관심 증가)
+            try:
+                from core.kis_market_api import get_inquire_price
+                current_data = get_inquire_price("J", stock_code)
+                if current_data is not None and not current_data.empty:
+                    volume = int(current_data.iloc[0].get('acml_vol', 0))
+                    avg_volume = int(current_data.iloc[0].get('avrg_vol', 1))
+                    
+                    if volume > avg_volume * 1.5:  # 평균 거래량 1.5배 이상
+                        return f"거래량증가연장 (거래량:{volume/avg_volume:.1f}배)"
+                
+            except Exception as e:
+                logger.debug(f"거래량 확인 오류: {e}")
+            
+            # 4. 시장 전체 상황 (코스피 지수 확인)
+            try:
+                # 시장이 반등하고 있으면 개별주도 기다려볼 가치
+                if hasattr(self.data_collector, 'get_market_trend'):
+                    market_trend = self.data_collector.get_market_trend()
+                    if market_trend and market_trend.get('trend') == 'recovery':
+                        return f"시장반등연장 (시장상태:{market_trend.get('description', '')})"
+                
+            except Exception as e:
+                logger.debug(f"시장 상황 확인 오류: {e}")
+            
+            # 5. 기본 시간 연장 (손실이 크지 않은 경우)
+            if profit_rate >= -1.5 and holding_minutes < 90:  # -1.5% 이상 손실이고 90분 미만
+                return f"경미손실연장 (손실:{profit_rate:.1f}%)"
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"보유 연장 조건 체크 오류: {e}")
+            return None
 
     def execute_auto_sell(self, sell_signal: Dict) -> Optional[str]:
         """자동 매도 실행"""
@@ -757,6 +946,7 @@ class PositionManager:
                 investment_amount = position['buy_price'] * quantity
                 profit_loss = position_value - investment_amount
                 profit_rate = position.get('profit_rate', 0)
+                after_tax_profit_rate = position.get('after_tax_profit_rate', 0)  # 🎯 세후 수익률
 
                 total_value += position_value
                 total_profit_loss += profit_loss
@@ -769,8 +959,11 @@ class PositionManager:
                     'current_price': current_price,
                     'position_value': position_value,
                     'profit_loss': profit_loss,
-                    'profit_rate': profit_rate,
+                    'profit_rate': profit_rate,  # 세전 수익률
+                    'after_tax_profit_rate': after_tax_profit_rate,  # 🎯 세후 수익률 
                     'max_profit_rate': position.get('max_profit_rate', 0),
+                    'max_after_tax_profit_rate': position.get('max_after_tax_profit_rate', 0),  # 🎯 세후 최대 수익률
+                    'market_type': position.get('market_type', 'KOSPI'),  # 시장 구분
                     'strategy_type': position.get('strategy_type', 'manual')
                 })
 

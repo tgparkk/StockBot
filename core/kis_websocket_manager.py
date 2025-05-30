@@ -378,19 +378,220 @@ class KISWebSocketManager:
             return False
 
     async def disconnect(self):
-        """웹소켓 연결 해제"""
+        """안전한 웹소켓 연결 해제"""
+        logger.info("🔌 웹소켓 연결 해제 시작...")
+        
         try:
-            self.is_running = False
-
-            if self.websocket:
-                await self.websocket.close()
-                self.websocket = None
-
+            # 1️⃣ 상태 변경
             self.is_connected = False
-            logger.info("웹소켓 연결 해제 완료")
+            self.is_running = False
+            
+            # 2️⃣ 백그라운드 태스크 안전하게 종료
+            try:
+                if hasattr(self, '_listener_task') and self._listener_task and not self._listener_task.done():
+                    logger.debug("🔄 listener 태스크 종료 중...")
+                    self._listener_task.cancel()
+                    try:
+                        await asyncio.wait_for(self._listener_task, timeout=3.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        logger.debug("🔄 listener 태스크 종료 완료")
+                    except Exception as e:
+                        logger.warning(f"listener 태스크 종료 오류: {e}")
 
+                if hasattr(self, '_keepalive_task') and self._keepalive_task and not self._keepalive_task.done():
+                    logger.debug("🔄 keepalive 태스크 종료 중...")
+                    self._keepalive_task.cancel()
+                    try:
+                        await asyncio.wait_for(self._keepalive_task, timeout=3.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        logger.debug("🔄 keepalive 태스크 종료 완료")
+                    except Exception as e:
+                        logger.warning(f"keepalive 태스크 종료 오류: {e}")
+                        
+            except Exception as e:
+                logger.warning(f"백그라운드 태스크 정리 오류: {e}")
+            
+            # 3️⃣ 웹소켓 연결 해제
+            try:
+                if self._is_websocket_connected():
+                    logger.debug("🔌 웹소켓 연결 닫는 중...")
+                    await self.websocket.close()
+                    # 연결 완전 종료 대기
+                    try:
+                        await asyncio.wait_for(self.websocket.wait_closed(), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("웹소켓 종료 대기 시간 초과")
+            except Exception as e:
+                logger.warning(f"웹소켓 연결 해제 오류: {e}")
+            
+            # 4️⃣ 정리
+            self.websocket = None
+            
+            # 5️⃣ 구독 정보 정리
+            with self.subscription_lock:
+                self.subscribed_stocks.clear()
+                self.stock_callbacks.clear()
+            
+            logger.info("✅ 웹소켓 연결 해제 완료")
+            
         except Exception as e:
-            logger.error(f"웹소켓 연결 해제 오류: {e}")
+            logger.error(f"웹소켓 연결 해제 중 오류: {e}")
+
+    def safe_disconnect(self):
+        """동기식 안전한 웹소켓 해제 (메인 스레드 용)"""
+        try:
+            logger.info("🔌 동기식 웹소켓 연결 해제 시작...")
+            
+            # 1️⃣ 상태 변경
+            self.is_connected = False
+            self.is_running = False
+            
+            # 2️⃣ 이벤트 루프 체크 및 안전한 정리
+            if hasattr(self, '_event_loop') and self._event_loop:
+                try:
+                    if not self._event_loop.is_closed():
+                        # 새 스레드에서 비동기 정리 수행
+                        def cleanup_async():
+                            try:
+                                # 새 이벤트 루프에서 정리
+                                import asyncio
+                                cleanup_loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(cleanup_loop)
+                                try:
+                                    cleanup_loop.run_until_complete(self._async_cleanup())
+                                finally:
+                                    cleanup_loop.close()
+                            except Exception as e:
+                                logger.debug(f"비동기 정리 오류: {e}")
+                        
+                        import threading
+                        cleanup_thread = threading.Thread(target=cleanup_async, daemon=True)
+                        cleanup_thread.start()
+                        cleanup_thread.join(timeout=5)  # 최대 5초 대기
+                        
+                        # 기존 이벤트 루프 정리
+                        self._event_loop_closed = True
+                        
+                except Exception as e:
+                    logger.warning(f"이벤트 루프 정리 오류: {e}")
+            
+            # 3️⃣ 동기적 정리
+            try:
+                self.websocket = None
+                
+                with self.subscription_lock:
+                    self.subscribed_stocks.clear()
+                    self.stock_callbacks.clear()
+                    
+            except Exception as e:
+                logger.warning(f"동기적 정리 오류: {e}")
+            
+            logger.info("✅ 동기식 웹소켓 연결 해제 완료")
+            
+        except Exception as e:
+            logger.error(f"동기식 웹소켓 연결 해제 오류: {e}")
+
+    async def _async_cleanup(self):
+        """비동기 정리 작업"""
+        try:
+            # 백그라운드 태스크들 정리
+            tasks_to_cancel = []
+            
+            if hasattr(self, '_listener_task') and self._listener_task and not self._listener_task.done():
+                tasks_to_cancel.append(self._listener_task)
+                
+            if hasattr(self, '_keepalive_task') and self._keepalive_task and not self._keepalive_task.done():
+                tasks_to_cancel.append(self._keepalive_task)
+            
+            # 모든 태스크 취소
+            for task in tasks_to_cancel:
+                task.cancel()
+            
+            # 취소 완료 대기 (시간 제한)
+            if tasks_to_cancel:
+                await asyncio.wait(tasks_to_cancel, timeout=2.0, return_when=asyncio.ALL_COMPLETED)
+            
+            # 웹소켓 닫기
+            if self._is_websocket_connected():
+                await self.websocket.close()
+                await asyncio.wait_for(self.websocket.wait_closed(), timeout=2.0)
+                
+        except Exception as e:
+            logger.debug(f"비동기 정리 오류: {e}")
+
+    def cleanup(self):
+        """리소스 정리 (프로그램 종료 시)"""
+        logger.info("🧹 웹소켓 매니저 정리 중...")
+        
+        try:
+            # 1️⃣ 동기식 안전한 해제
+            self.safe_disconnect()
+            
+            # 2️⃣ 모든 pending task 강제 정리 (이벤트 루프 문제 방지)
+            try:
+                # asyncio 라이브러리 import 안전성 체크
+                import asyncio
+                
+                # 현재 실행 중인 모든 태스크 강제 종료
+                try:
+                    all_tasks = asyncio.all_tasks()
+                    pending_tasks = [task for task in all_tasks if not task.done()]
+                    
+                    if pending_tasks:
+                        logger.info(f"🧹 {len(pending_tasks)}개 pending 태스크 강제 정리 중...")
+                        for task in pending_tasks:
+                            try:
+                                if hasattr(task, 'get_name'):
+                                    task_name = task.get_name()
+                                    if 'keepalive' in task_name.lower() or 'connection' in task_name.lower():
+                                        task.cancel()
+                                        logger.debug(f"💥 태스크 강제 취소: {task_name}")
+                            except Exception as e:
+                                logger.debug(f"태스크 정리 오류: {e}")
+                                
+                except RuntimeError:
+                    # 이벤트 루프가 없는 경우
+                    logger.debug("실행 중인 이벤트 루프 없음 - pending 태스크 정리 생략")
+                    
+            except Exception as e:
+                logger.debug(f"pending 태스크 정리 오류: {e}")
+            
+            # 3️⃣ 추가 안전장치: 모든 상태 초기화
+            try:
+                self.is_connected = False
+                self.is_running = False
+                self._event_loop_closed = True
+                self.websocket = None
+                
+                # 구독 정보 정리
+                try:
+                    with self.subscription_lock:
+                        self.subscribed_stocks.clear()
+                        self.stock_callbacks.clear()
+                except:
+                    pass
+                    
+            except Exception as e:
+                logger.debug(f"상태 초기화 오류: {e}")
+            
+            logger.info("✅ 웹소켓 매니저 정리 완료")
+            
+        except Exception as e:
+            logger.error(f"웹소켓 매니저 정리 오류: {e}")
+
+    def __del__(self):
+        """소멸자에서 정리 작업"""
+        try:
+            # 동기적 정리만 수행 (소멸자에서는 비동기 작업 피함)
+            if hasattr(self, 'is_connected') and self.is_connected:
+                self.is_connected = False
+                self.is_running = False
+                
+            if hasattr(self, '_event_loop_closed'):
+                self._event_loop_closed = True
+                
+        except Exception:
+            pass  # 소멸자에서는 예외 발생 방지
 
     # ========== 콜백 시스템 ==========
 
@@ -514,15 +715,22 @@ class KISWebSocketManager:
 
         # 🔧 락 해제 후 웹소켓 통신 수행 (시간이 오래 걸리는 작업)
         try:
+            # 🔧 웹소켓 연결 재확인
+            if not self._is_websocket_connected():
+                logger.error(f"웹소켓 연결이 닫혀있음: {stock_code}")
+                with self.subscription_lock:
+                    self.subscribed_stocks.discard(stock_code)
+                return False
+
             # 실시간 체결 구독
             contract_msg = self._build_message(KIS_WSReq.CONTRACT.value, stock_code)
             await self.websocket.send(contract_msg)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)  # 🔧 간격 증가 (0.1초 → 0.2초)
 
             # 실시간 호가 구독
             bid_ask_msg = self._build_message(KIS_WSReq.BID_ASK.value, stock_code)
             await self.websocket.send(bid_ask_msg)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)  # 🔧 간격 증가
 
             # 🔧 구독 성공 후 콜백 추가 (락 외부에서)
             self.add_stock_callback(stock_code, callback)
@@ -543,6 +751,11 @@ class KISWebSocketManager:
         """종목 구독 (동기 방식) - 메인 스레드에서 안전하게 호출 가능"""
         try:
             logger.debug(f"🔄 동기 방식 종목 구독 시도: {stock_code}")
+            
+            # 🔧 웹소켓 연결 상태 엄격 체크
+            if not self.is_connected or not self.websocket:
+                logger.error(f"웹소켓 연결 상태 불량: connected={self.is_connected}, websocket={self.websocket is not None}")
+                return False
             
             # 🔧 락 경합 방지: 미리 빠른 체크
             with self.subscription_lock:
@@ -569,7 +782,7 @@ class KISWebSocketManager:
                     logger.error(f"동기 구독 내부 오류 ({stock_code}): {e}")
                     return False
             
-            # 🔧 타임아웃 단축: 별도 스레드에서 실행하여 메인 스레드 블록 방지
+            # 🔧 타임아웃 연장: 별도 스레드에서 실행하여 메인 스레드 블록 방지
             import threading
             result_container = [False]  # 결과를 담을 컨테이너
             
@@ -578,7 +791,7 @@ class KISWebSocketManager:
             
             subscribe_thread = threading.Thread(target=thread_target, daemon=True)
             subscribe_thread.start()
-            subscribe_thread.join(timeout=5)  # 🔧 타임아웃 단축 (10초 → 5초)
+            subscribe_thread.join(timeout=10)  # 🔧 타임아웃 10초로 연장
             
             if subscribe_thread.is_alive():
                 logger.warning(f"⚠️ 동기 구독 시간 초과: {stock_code}")
@@ -1228,7 +1441,7 @@ class KISWebSocketManager:
     def force_ready(self) -> bool:
         """🔧 웹소켓 강제 준비 (이벤트 루프 확실히 시작)"""
         try:
-            logger.info("�� 웹소켓 강제 준비 시작...")
+            logger.info("🔧 웹소켓 강제 준비 시작...")
             
             # 1️⃣ 현재 상태 확인
             logger.info(f"🔍 웹소켓 현재 상태: connected={self.is_connected}, running={self.is_running}")
@@ -1453,3 +1666,26 @@ class KISWebSocketManager:
             
         except Exception as e:
             logger.debug(f"구독 상태 정리 오류 ({stock_code}): {e}")
+
+    def _is_websocket_connected(self) -> bool:
+        """🔧 웹소켓 연결 상태를 안전하게 확인"""
+        try:
+            if not self.websocket:
+                return False
+            
+            # 🆕 websockets 라이브러리 버전 호환성 처리
+            if hasattr(self.websocket, 'closed'):
+                return not self.websocket.closed
+            elif hasattr(self.websocket, 'close_code'):
+                return self.websocket.close_code is None
+            elif hasattr(self.websocket, 'state'):
+                # websockets v12+ State enum 사용
+                from websockets.protocol import State
+                return self.websocket.state == State.OPEN
+            else:
+                # fallback: 기본 속성들로 추정
+                return hasattr(self.websocket, 'send') and callable(self.websocket.send)
+                
+        except Exception as e:
+            logger.debug(f"웹소켓 연결 상태 확인 오류: {e}")
+            return False
