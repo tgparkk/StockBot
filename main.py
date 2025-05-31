@@ -818,20 +818,11 @@ class StockBot:
             logger.error(f"❌ 웹소켓 상태 확인 실패: {e}")
             logger.warning("⚠️ 웹소켓은 필수 구성요소입니다 - 연결 문제를 확인하세요")
 
-
 def main():
     """메인 함수"""
     try:
-        print("DEBUG: main() 함수 시작")
-        logger.info("🚀 StockBot 시작...")
-
-        print("DEBUG: StockBot 인스턴스 생성 중...")
         bot = StockBot()
-        print("DEBUG: StockBot 인스턴스 생성 완료")
-
-        print("DEBUG: bot.start() 호출 중...")
         bot.start()
-        print("DEBUG: bot.start() 완료")
 
     except KeyboardInterrupt:
         print("DEBUG: KeyboardInterrupt 발생")
@@ -842,7 +833,6 @@ def main():
     finally:
         print("DEBUG: main() 함수 종료")
         logger.info("👋 StockBot 종료")
-
 
 if __name__ == "__main__":
     main()

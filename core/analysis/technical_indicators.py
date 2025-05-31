@@ -117,9 +117,9 @@ class TechnicalIndicators:
             df['bandwidth'] = (df['price'] - df['lower']) / (df['upper'] - df['lower']) * 100
 
             return {
-                'upper': df['upper'].fillna(method='bfill').tolist(),
-                'middle': df['middle'].fillna(method='bfill').tolist(),
-                'lower': df['lower'].fillna(method='bfill').tolist(),
+                'upper': df['upper'].bfill().tolist(),
+                'middle': df['middle'].bfill().tolist(),
+                'lower': df['lower'].bfill().tolist(),
                 'bandwidth': df['bandwidth'].fillna(50.0).tolist()
             }
 
@@ -184,7 +184,7 @@ class TechnicalIndicators:
             for period in periods:
                 if len(prices) >= period:
                     ma = df['price'].rolling(window=period).mean()
-                    result[f'ma_{period}'] = ma.fillna(method='bfill').tolist()
+                    result[f'ma_{period}'] = ma.bfill().tolist()
                 else:
                     result[f'ma_{period}'] = prices.copy()
 
