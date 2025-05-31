@@ -7,6 +7,8 @@ from utils.logger import setup_logger
 from ..api.rest_api_manager import KISRestAPIManager
 from ..data.kis_data_collector import KISDataCollector
 from ..websocket.kis_websocket_manager import KISWebSocketManager
+import pytz
+from datetime import datetime
 
 logger = setup_logger(__name__)
 
@@ -38,6 +40,15 @@ class TradingManager:
         self.stats['total_orders'] += 1
 
         try:
+            # 장시간 체크
+            market_status = self._check_market_status()
+            if not market_status.get('is_trading_time', False):
+                logger.warning(f"⚠️ 장외시간 주문 취소: {stock_code} {order_type} - "
+                             f"현재 상태: {market_status.get('status', '확인불가')} "
+                             f"({market_status.get('current_time', 'N/A')})")
+                self.stats['failed_orders'] += 1
+                return None
+
             # 1. 현재가 확인 (시장가 주문시)
             if price == 0:
                 price_data = self.data_collector.get_current_price(stock_code, use_cache=True)
@@ -262,6 +273,54 @@ class TradingManager:
             'pending_orders_count': len(self.pending_orders),
             'order_history_count': len(self.order_history)
         }
+
+    def _check_market_status(self) -> dict:
+        """시장 상태 확인"""
+        try:
+            # 한국 시간대 사용
+            kst = pytz.timezone('Asia/Seoul')
+            now = datetime.now(kst)
+
+            # 평일 체크 (월~금: 0~4)
+            is_weekday = now.weekday() < 5
+
+            # 시장 시간 체크 (9:00~15:30)
+            current_time = now.time()
+            market_open = datetime.strptime("09:00", "%H:%M").time()
+            market_close = datetime.strptime("15:30", "%H:%M").time()
+            is_market_hours = market_open <= current_time <= market_close
+
+            # 프리마켓 시간 체크 (8:30~9:00)
+            premarket_open = datetime.strptime("08:30", "%H:%M").time()
+            is_premarket = premarket_open <= current_time < market_open
+
+            # 전체 거래 가능 시간 (프리마켓 + 정규장)
+            is_trading_time = is_weekday and (is_premarket or is_market_hours)
+
+            status_text = "휴장"
+            if is_weekday:
+                if is_premarket:
+                    status_text = "프리마켓"
+                elif is_market_hours:
+                    status_text = "정규장"
+                else:
+                    status_text = "장외시간"
+            else:
+                status_text = "주말"
+
+            return {
+                'is_open': is_market_hours,
+                'is_trading_time': is_trading_time,
+                'is_premarket': is_premarket,
+                'is_weekday': is_weekday,
+                'current_time': now.strftime('%H:%M:%S'),
+                'current_date': now.strftime('%Y-%m-%d'),
+                'status': status_text,
+                'kst_time': now
+            }
+        except Exception as e:
+            logger.error(f"시장 상태 확인 오류: {e}")
+            return {'is_open': False, 'status': '확인불가', 'is_trading_time': False}
 
     def cleanup(self):
         """리소스 정리"""
