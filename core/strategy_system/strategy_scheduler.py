@@ -69,10 +69,10 @@ class StrategyScheduler:
         try:
             logger.info("🚀 전략 스케줄러 시작")
 
-            # 백그라운드 스크리닝 시작
-            self.stock_discovery.start_background_screening()
+            # 🆕 백그라운드 스크리닝 제거 - _main_scheduling_loop에서만 탐색
+            # self.stock_discovery.start_background_screening()  # 제거
 
-            # 메인 스케줄링 루프 시작
+            # 메인 스케줄링 루프 시작 (시간대별 중앙집중 탐색)
             self.scheduler_running = True
             await self._main_scheduling_loop()
 
@@ -91,6 +91,10 @@ class StrategyScheduler:
         if current_slot:
             logger.info(f"🚀 시작 시 활성 시간대 발견: {current_slot.name} - 즉시 전략 실행")
             await self._execute_time_slot_strategy()
+        else:
+            # 🆕 장외 시간이어도 첫 번째 시간대 전략 미리 실행
+            logger.info("🌙 현재 장외 시간 - 첫 번째 시간대 전략 미리 준비")
+            await self._execute_first_time_slot_strategy()
 
         while self.scheduler_running:
             try:
@@ -117,13 +121,52 @@ class StrategyScheduler:
                     if self.scheduler_running:
                         await self._execute_time_slot_strategy()
                 else:
-                    # 장외 시간 - 10분 대기 후 재확인
-                    logger.info("💤 장외 시간 - 10분 대기")
-                    await asyncio.sleep(600)
+                    # 장외 시간 - 6초 대기 후 재확인 (테스트용 단축)
+                    logger.info("💤 장외 시간 - 6초 대기")
+                    await asyncio.sleep(6)
 
             except Exception as e:
                 logger.error(f"스케줄링 루프 오류: {e}")
                 await asyncio.sleep(300)  # 5분 대기 후 재시도
+
+    async def _execute_first_time_slot_strategy(self):
+        """🌅 첫 번째 시간대 전략 미리 실행 (장외 시간용)"""
+        try:
+            from datetime import time
+            
+            # 첫 번째 시간대 설정 (장 시작 전)
+            first_slot = TimeSlotConfig(
+                name="pre_market_early",
+                description="장 시작 전 미리 준비 (장외 시간 실행)",
+                start_time=time(8, 30),
+                end_time=time(9, 0),
+                primary_strategies={
+                    "gap_trading": 1.0,         # 갭 트레이딩 우선
+                    "technical_screening": 0.8   # 기술적 지표 보조
+                },
+                secondary_strategies={
+                    "volume_breakout": 0.6,     # 거래량 돌파 보조
+                    "momentum": 0.4             # 모멘텀 최소
+                }
+            )
+            
+            logger.info(f"🌅 첫 번째 시간대 전략 미리 실행: {first_slot.name}")
+            logger.info(f"📋 주요 전략: {list(first_slot.primary_strategies.keys())}")
+            logger.info(f"📊 보조 전략: {list(first_slot.secondary_strategies.keys())}")
+            
+            # 현재 슬롯으로 설정
+            self.current_slot = first_slot
+
+            # 이전 전략 정리 (있다면)
+            await self._cleanup_previous_strategy()
+
+            # 첫 번째 시간대 전략 준비 및 활성화
+            await self._prepare_and_activate_strategy(first_slot)
+            
+            logger.info("✅ 첫 번째 시간대 전략 미리 실행 완료")
+
+        except Exception as e:
+            logger.error(f"❌ 첫 번째 시간대 전략 미리 실행 오류: {e}")
 
     async def _execute_time_slot_strategy(self):
         """시간대별 전략 실행"""
@@ -183,65 +226,350 @@ class StrategyScheduler:
             logger.error(f"전략 준비/활성화 오류: {e}")
 
     async def _discover_strategy_stocks(self, slot: TimeSlotConfig):
-        """전략별 종목 탐색"""
+        """🎯 시간대별 중앙집중 종목 탐색 - API 호출 최적화"""
         try:
-            logger.info(f"🔍 종목 탐색 시작: {slot.name}")
+            logger.info(f"🔍 [{slot.name}] 시간대별 중앙집중 종목 탐색 시작")
 
-            # 기본 전략들 탐색
+            # 🎯 1단계: 한 번의 API 호출로 모든 스크리닝 데이터 수집
+            logger.info(f"📊 [{slot.name}] 통합 시장 스크리닝 실행 중...")
+            all_screening_data = self.trading_api.get_market_screening_candidates("all")
+            
+            if not all_screening_data:
+                logger.warning(f"⚠️ [{slot.name}] 스크리닝 데이터 없음")
+                return
+
+            # 🎯 2단계: 시간대별 전략 우선순위 적용
+            time_based_strategy = self._get_time_based_strategy(slot)
+            logger.info(f"📋 [{slot.name}] 시간대 전략: {time_based_strategy['focus']} 중심")
+
+            # 🎯 3단계: 전략별 데이터 분배 및 필터링
+            strategy_results = {}
+            
+            # 기본 전략들에 대한 데이터 분배
             all_strategies = {**slot.primary_strategies, **slot.secondary_strategies}
-
-            discovery_tasks = []
+            
             for strategy_name, weight in all_strategies.items():
-                task = asyncio.create_task(
-                    self._discover_single_strategy(strategy_name, weight)
-                )
-                discovery_tasks.append(task)
+                try:
+                    # 시간대별 가중치 조정
+                    adjusted_weight = weight * time_based_strategy['multipliers'].get(strategy_name, 1.0)
+                    
+                    # 전략별 데이터 추출 및 필터링
+                    candidates = self._extract_strategy_candidates(
+                        strategy_name, 
+                        all_screening_data, 
+                        adjusted_weight,
+                        time_based_strategy
+                    )
+                    
+                    if candidates:
+                        strategy_results[strategy_name] = candidates
+                        stock_codes = [c.stock_code for c in candidates]
+                        self.active_stocks[strategy_name] = stock_codes
+                        
+                        logger.info(f"✅ [{slot.name}] {strategy_name}: {len(candidates)}개 후보 (가중치: {adjusted_weight:.2f})")
+                        
+                        # 상위 3개 후보 로그
+                        for i, candidate in enumerate(candidates[:3]):
+                            logger.info(f"   {i+1}. {candidate.stock_code} - {candidate.reason} (점수: {candidate.score:.1f})")
+                        
+                        # 🆕 데이터베이스에 종목 선정 기록
+                        await self._record_selected_stocks(strategy_name, candidates, adjusted_weight)
+                    else:
+                        logger.warning(f"⚠️ [{slot.name}] {strategy_name}: 후보 없음")
+                        
+                except Exception as e:
+                    logger.error(f"❌ [{slot.name}] {strategy_name} 전략 처리 오류: {e}")
+                    continue
 
-            # 모든 탐색 완료 대기 (최대 60초)
-            await asyncio.wait_for(
-                asyncio.gather(*discovery_tasks, return_exceptions=True),
-                timeout=60
-            )
+            # 🎯 4단계: 시간대별 특화 후보 추가 발굴
+            await self._discover_time_specific_opportunities(slot, all_screening_data, time_based_strategy)
 
-            logger.info("✅ 종목 탐색 완료")
+            total_stocks = sum(len(stocks) for stocks in self.active_stocks.values())
+            logger.info(f"✅ [{slot.name}] 중앙집중 탐색 완료: 총 {total_stocks}개 종목 선정")
 
-        except asyncio.TimeoutError:
-            logger.warning("⚠️ 종목 탐색 시간 초과 (60초)")
         except Exception as e:
-            logger.error(f"종목 탐색 오류: {e}")
+            logger.error(f"❌ [{slot.name}] 중앙집중 종목 탐색 오류: {e}")
 
-    async def _discover_single_strategy(self, strategy_name: str, weight: float):
-        """단일 전략 종목 탐색"""
+    def _get_time_based_strategy(self, slot: TimeSlotConfig) -> Dict:
+        """🕐 시간대별 전략 설정"""
+        from datetime import time
+        
+        # 시간대별 특화 전략 매핑
+        time_strategies = {
+            # 장 시작 전 (08:30-09:00): 갭 트레이딩 중심
+            "pre_market": {
+                "times": [(time(8, 30), time(9, 0))],
+                "focus": "갭 분석 + 기술적 지표",
+                "multipliers": {
+                    "gap_trading": 2.0,        # 갭 트레이딩 강화
+                    "technical_screening": 1.8, # 기술적 지표 중시
+                    "volume_breakout": 0.8,     # 거래량 완화
+                    "momentum": 0.6             # 모멘텀 완화
+                },
+                "filters": {
+                    "min_gap_rate": 1.0,       # 1% 이상 갭
+                    "min_technical_score": 70,  # 기술적 점수 70점 이상
+                    "max_candidates_per_strategy": 8
+                }
+            },
+            
+            # 🆕 장외 시간 미리 준비용 (첫 번째 시간대와 동일)
+            "pre_market_early": {
+                "times": [(time(0, 0), time(8, 30))],  # 장외 시간 전체
+                "focus": "갭 분석 + 기술적 지표 (미리 준비)",
+                "multipliers": {
+                    "gap_trading": 1.8,        # 갭 트레이딩 강화 (약간 완화)
+                    "technical_screening": 1.6, # 기술적 지표 중시
+                    "volume_breakout": 0.9,     # 거래량 약간 완화
+                    "momentum": 0.7             # 모멘텀 약간 완화
+                },
+                "filters": {
+                    "min_gap_rate": 0.8,       # 0.8% 이상 갭 (완화)
+                    "min_technical_score": 65,  # 기술적 점수 65점 이상 (완화)
+                    "max_candidates_per_strategy": 10  # 후보 수 확대
+                }
+            },
+            
+            # 장 초반 (09:00-10:30): 거래량 돌파 + 모멘텀
+            "early_market": {
+                "times": [(time(9, 0), time(10, 30))],
+                "focus": "거래량 돌파 + 초기 모멘텀",
+                "multipliers": {
+                    "volume_breakout": 2.0,     # 거래량 돌파 강화
+                    "momentum": 1.8,            # 모멘텀 중시
+                    "gap_trading": 1.2,         # 갭 트레이딩 유지
+                    "technical_screening": 1.0   # 기술적 지표 기본
+                },
+                "filters": {
+                    "min_volume_ratio": 1.5,    # 1.5배 이상 거래량
+                    "min_momentum_score": 60,   # 모멘텀 점수 60점 이상
+                    "max_candidates_per_strategy": 10
+                }
+            },
+            
+            # 장 중반 (10:30-14:00): 안정적 트렌드 추종
+            "mid_market": {
+                "times": [(time(10, 30), time(14, 0))],
+                "focus": "안정적 트렌드 + 기술적 분석",
+                "multipliers": {
+                    "technical_screening": 2.0,  # 기술적 분석 강화
+                    "momentum": 1.5,             # 지속적 모멘텀
+                    "volume_breakout": 1.2,      # 거래량 확인
+                    "gap_trading": 0.8           # 갭 완화
+                },
+                "filters": {
+                    "min_technical_score": 60,   # 기술적 점수 60점 이상
+                    "min_trend_strength": 0.7,   # 트렌드 강도 0.7 이상
+                    "max_candidates_per_strategy": 12
+                }
+            },
+            
+            # 장 마감 (14:00-15:30): 마감 효과 + 정리매매
+            "late_market": {
+                "times": [(time(14, 0), time(15, 30))],
+                "focus": "마감 효과 + 정리매매",
+                "multipliers": {
+                    "momentum": 1.8,             # 마감 모멘텀
+                    "volume_breakout": 1.5,      # 대량 거래
+                    "technical_screening": 1.2,  # 기술적 확인
+                    "gap_trading": 0.5           # 갭 최소화
+                },
+                "filters": {
+                    "min_volume_ratio": 2.0,     # 2배 이상 거래량
+                    "min_momentum_score": 50,    # 모멘텀 점수 50점 이상
+                    "max_candidates_per_strategy": 6
+                }
+            }
+        }
+        
+        # 🆕 슬롯 이름을 기준으로 전략 찾기 (시간보다 우선)
+        if slot.name in ["pre_market_early"]:
+            strategy_config = time_strategies["pre_market_early"]
+            logger.info(f"🕐 시간대 전략 선택: pre_market_early ({strategy_config['focus']})")
+            return strategy_config
+        
+        # 기존 시간 기반 매칭
+        current_time = slot.start_time
+        
+        for strategy_name, strategy_config in time_strategies.items():
+            if strategy_name == "pre_market_early":  # 이미 위에서 처리됨
+                continue
+                
+            for start_time, end_time in strategy_config["times"]:
+                if start_time <= current_time <= end_time:
+                    logger.info(f"🕐 시간대 전략 선택: {strategy_name} ({strategy_config['focus']})")
+                    return strategy_config
+        
+        # 기본 전략 (장외 시간) - 첫 번째 시간대와 유사하게
+        logger.info("🕐 기본 전략 적용 (장외 시간)")
+        return {
+            "focus": "기본 스크리닝 (갭 중심)",
+            "multipliers": {
+                "gap_trading": 1.5,         # 갭 우선
+                "technical_screening": 1.2,  # 기술적 지표
+                "volume_breakout": 1.0,      # 거래량 기본
+                "momentum": 0.8              # 모멘텀 완화
+            },
+            "filters": {
+                "min_gap_rate": 0.5,        # 매우 완화된 갭 기준
+                "min_technical_score": 50,   # 완화된 기술적 점수
+                "max_candidates_per_strategy": 12
+            }
+        }
+
+    def _extract_strategy_candidates(self, strategy_name: str, all_data: Dict, 
+                                   weight: float, time_strategy: Dict) -> List:
+        """전략별 후보 추출 및 필터링"""
         try:
-            logger.info(f"🔍 {strategy_name} 전략 후보 탐색 시작 (가중치: {weight})")
-
-            # 별도 스레드에서 탐색 실행
-            loop = asyncio.get_event_loop()
-            candidates = await loop.run_in_executor(
-                None,
-                self.stock_discovery.discover_strategy_stocks,
-                strategy_name, weight, True
-            )
-
-            if candidates:
-                stock_codes = [c.stock_code for c in candidates]
-                self.active_stocks[strategy_name] = stock_codes
-                logger.info(f"✅ {strategy_name} 전략: {len(stock_codes)}개 종목 발견")
-
-                # 후보 종목 상세 로그
-                for i, candidate in enumerate(candidates[:5]):  # 상위 5개만 로그
-                    logger.info(f"   {i+1}. {candidate.stock_code} - {candidate.reason} (점수: {candidate.score:.1f})")
-
-                if len(candidates) > 5:
-                    logger.info(f"   ... 외 {len(candidates)-5}개 종목")
-
-                # 🆕 데이터베이스에 종목 선정 기록 저장
-                await self._record_selected_stocks(strategy_name, candidates, weight)
+            # 스크리닝 데이터에서 해당 전략 데이터 추출
+            if strategy_name == "gap_trading":
+                raw_candidates = all_data.get('gap', [])
+            elif strategy_name == "volume_breakout":
+                raw_candidates = all_data.get('volume', [])
+            elif strategy_name == "momentum":
+                raw_candidates = all_data.get('momentum', [])
+            elif strategy_name == "technical_screening":
+                raw_candidates = all_data.get('technical', [])
             else:
-                logger.warning(f"⚠️ {strategy_name} 전략: 후보 없음")
-
+                logger.warning(f"알 수 없는 전략: {strategy_name}")
+                return []
+            
+            if not raw_candidates:
+                return []
+            
+            # StockCandidate 객체로 변환
+            candidates = []
+            max_candidates = time_strategy['filters'].get('max_candidates_per_strategy', 10)
+            
+            for i, candidate_data in enumerate(raw_candidates[:max_candidates]):
+                try:
+                    # 시간대별 필터 적용
+                    if not self._passes_time_based_filter(candidate_data, time_strategy, strategy_name):
+                        continue
+                    
+                    # StockCandidate 객체 생성
+                    from .stock_discovery import StockCandidate
+                    from datetime import datetime
+                    
+                    candidate = StockCandidate(
+                        stock_code=candidate_data.get('stock_code', ''),
+                        strategy_type=strategy_name,
+                        score=candidate_data.get('technical_score', candidate_data.get('score', 0)) * weight,
+                        reason=candidate_data.get('reason', f'{strategy_name} 후보'),
+                        discovered_at=datetime.now(),
+                        data=candidate_data
+                    )
+                    
+                    candidates.append(candidate)
+                    
+                except Exception as e:
+                    logger.debug(f"후보 변환 오류 ({strategy_name}): {e}")
+                    continue
+            
+            # 점수순 정렬
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            return candidates
+            
         except Exception as e:
-            logger.error(f"단일 전략 탐색 오류 ({strategy_name}): {e}")
+            logger.error(f"전략 후보 추출 오류 ({strategy_name}): {e}")
+            return []
+
+    def _passes_time_based_filter(self, candidate_data: Dict, time_strategy: Dict, strategy_name: str) -> bool:
+        """시간대별 필터 통과 여부 확인"""
+        try:
+            filters = time_strategy.get('filters', {})
+            
+            # 갭 트레이딩 필터
+            if strategy_name == "gap_trading":
+                min_gap_rate = filters.get('min_gap_rate', 0)
+                gap_rate = abs(candidate_data.get('gap_rate', 0))
+                if gap_rate < min_gap_rate:
+                    return False
+            
+            # 거래량 돌파 필터
+            elif strategy_name == "volume_breakout":
+                min_volume_ratio = filters.get('min_volume_ratio', 0)
+                volume_ratio = candidate_data.get('volume_ratio', 0)
+                if volume_ratio < min_volume_ratio:
+                    return False
+            
+            # 모멘텀 필터
+            elif strategy_name == "momentum":
+                min_momentum_score = filters.get('min_momentum_score', 0)
+                momentum_score = candidate_data.get('score', 0)
+                if momentum_score < min_momentum_score:
+                    return False
+            
+            # 기술적 지표 필터
+            elif strategy_name == "technical_screening":
+                min_technical_score = filters.get('min_technical_score', 0)
+                technical_score = candidate_data.get('technical_score', 0)
+                if technical_score < min_technical_score:
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.debug(f"시간대별 필터 오류: {e}")
+            return True  # 오류시 통과
+
+    async def _discover_time_specific_opportunities(self, slot: TimeSlotConfig, 
+                                                   all_data: Dict, time_strategy: Dict):
+        """🎯 시간대별 특화 기회 발굴"""
+        try:
+            focus = time_strategy.get('focus', '')
+            
+            # 장 시작 전: 해외 시장 갭 분석
+            if "갭 분석" in focus:
+                await self._analyze_overnight_gaps(all_data)
+            
+            # 장 초반: 신규 상한가 후보
+            elif "초기 모멘텀" in focus:
+                await self._find_early_momentum_stocks(all_data)
+            
+            # 장 중반: 트렌드 지속성 분석
+            elif "안정적 트렌드" in focus:
+                await self._analyze_trend_continuation(all_data)
+            
+            # 장 마감: 마감 급등 후보
+            elif "마감 효과" in focus:
+                await self._find_closing_opportunities(all_data)
+                
+        except Exception as e:
+            logger.error(f"시간대별 특화 기회 발굴 오류: {e}")
+
+    async def _analyze_overnight_gaps(self, all_data: Dict):
+        """해외 시장 갭 분석 (장 시작 전)"""
+        try:
+            # 해외 지수 확인 및 갭 예측 로직
+            logger.info("🌍 해외 시장 갭 분석 중...")
+            # 추후 구현: 나스닥, S&P 500 등 해외 지수 데이터 연동
+        except Exception as e:
+            logger.debug(f"해외 갭 분석 오류: {e}")
+
+    async def _find_early_momentum_stocks(self, all_data: Dict):
+        """신규 모멘텀 종목 발굴 (장 초반)"""
+        try:
+            logger.info("🚀 장 초반 모멘텀 종목 분석 중...")
+            # 거래량 급증 + 가격 상승 종목 추가 발굴
+        except Exception as e:
+            logger.debug(f"초기 모멘텀 분석 오류: {e}")
+
+    async def _analyze_trend_continuation(self, all_data: Dict):
+        """트렌드 지속성 분석 (장 중반)"""
+        try:
+            logger.info("📈 트렌드 지속성 분석 중...")
+            # 기술적 지표 기반 트렌드 강도 측정
+        except Exception as e:
+            logger.debug(f"트렌드 분석 오류: {e}")
+
+    async def _find_closing_opportunities(self, all_data: Dict):
+        """마감 시간 기회 발굴 (장 마감)"""
+        try:
+            logger.info("🏁 마감 시간 기회 분석 중...")
+            # 마감 5분전 급등 패턴 분석
+        except Exception as e:
+            logger.debug(f"마감 기회 분석 오류: {e}")
 
     async def _record_selected_stocks(self, strategy_name: str, candidates: List, weight: float = 1.0):
         """선정된 종목들을 데이터베이스에 기록"""
@@ -870,9 +1198,9 @@ class StrategyScheduler:
 
             self.scheduler_running = False
 
-            # 백그라운드 스크리닝 중지
-            if hasattr(self.stock_discovery, 'stop_background_screening'):
-                self.stock_discovery.stop_background_screening()
+            # 🆕 백그라운드 스크리닝 중지 제거 (더 이상 사용 안함)
+            # if hasattr(self.stock_discovery, 'stop_background_screening'):
+            #     self.stock_discovery.stop_background_screening()
 
             # 모든 구독 정리
             for strategy_name, stock_codes in self.active_stocks.items():
