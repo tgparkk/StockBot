@@ -905,7 +905,7 @@ def get_disparity_rank(fid_cond_mrkt_div_code: str = "J",
             output_data = res.getBody().output
             if output_data:
                 current_data = pd.DataFrame(output_data)
-                logger.info(f"이격도 순위 조회 성공: {len(current_data)}건")
+                #logger.info(f"이격도 순위 조회 성공: {len(current_data)}건")
                 return current_data
             else:
                 logger.warning("이격도 순위 조회: 데이터 없음")
@@ -1156,13 +1156,13 @@ def get_disparity_trading_signals() -> Optional[Dict]:
     """이격도 전체 시장 분석 및 트레이딩 신호"""
     try:
         logger.info("🎯 이격도 전체 시장 분석 시작")
-        
+
         signals = {
             'kospi': {},
             'kosdaq': {},
             'combined': {}
         }
-        
+
         # 코스피와 코스닥 이격도 분석
         for market, code in [('kospi', '0001'), ('kosdaq', '1001')]:
             try:
@@ -1172,29 +1172,29 @@ def get_disparity_trading_signals() -> Optional[Dict]:
                     fid_rank_sort_cls_code="0",  # 상위
                     fid_hour_cls_code="20"
                 )
-                
+
                 lower_data = get_disparity_rank(
                     fid_input_iscd=code,
                     fid_rank_sort_cls_code="1",  # 하위
                     fid_hour_cls_code="20"
                 )
-                
+
                 if upper_data is not None and not upper_data.empty and lower_data is not None and not lower_data.empty:
                     market_signals = _analyze_market_disparity(upper_data, lower_data, market)
                     signals[market] = market_signals
                 else:
                     logger.warning(f"{market} 이격도 데이터 없음")
                     signals[market] = {'status': 'no_data'}
-                    
+
             except Exception as e:
                 logger.error(f"{market} 이격도 분석 오류: {e}")
                 signals[market] = {'status': 'error', 'message': str(e)}
-        
+
         # 통합 시장 신호
         signals['combined'] = _combine_market_signals(signals['kospi'], signals['kosdaq'])
-        
+
         return signals
-        
+
     except Exception as e:
         logger.error(f"이격도 트레이딩 신호 분석 오류: {e}")
         return None
@@ -1203,13 +1203,13 @@ def get_disparity_trading_signals() -> Optional[Dict]:
 def get_technical_indicator_screening(market: str = "0000", min_score: int = 60) -> Optional[pd.DataFrame]:
     """🆕 기술적 지표 기반 종목 스크리닝 - RSI, MACD, 이동평균선 활용"""
     from ..analysis.technical_indicators import TechnicalIndicators
-    
+
     try:
         logger.info(f"📈 기술적 지표 스크리닝 시작: {market}, 최소점수 {min_score}")
-        
+
         # 🎯 1단계: 기본 후보군 수집 (다양한 방법 조합)
         candidate_sources = []
-        
+
         # 등락률 상위 (상승 추세)
         try:
             fluctuation_data = get_fluctuation_rank(
@@ -1221,7 +1221,7 @@ def get_technical_indicator_screening(market: str = "0000", min_score: int = 60)
                 candidate_sources.append(('fluctuation_up', fluctuation_data.head(30)))
         except Exception as e:
             logger.debug(f"등락률 상위 조회 오류: {e}")
-        
+
         # 등락률 하위 (반등 기대)
         try:
             fluctuation_down_data = get_fluctuation_rank(
@@ -1233,7 +1233,7 @@ def get_technical_indicator_screening(market: str = "0000", min_score: int = 60)
                 candidate_sources.append(('fluctuation_down', fluctuation_down_data.head(20)))
         except Exception as e:
             logger.debug(f"등락률 하위 조회 오류: {e}")
-        
+
         # 거래량 급증
         try:
             volume_data = get_volume_rank(
@@ -1245,7 +1245,7 @@ def get_technical_indicator_screening(market: str = "0000", min_score: int = 60)
                 candidate_sources.append(('volume', volume_data.head(25)))
         except Exception as e:
             logger.debug(f"거래량 급증 조회 오류: {e}")
-        
+
         # 체결강도 상위
         try:
             power_data = get_volume_power_rank(
@@ -1256,7 +1256,7 @@ def get_technical_indicator_screening(market: str = "0000", min_score: int = 60)
                 candidate_sources.append(('power', power_data.head(25)))
         except Exception as e:
             logger.debug(f"체결강도 조회 오류: {e}")
-        
+
         # 이격도 기반 (과매도/과매수)
         try:
             disparity_data = get_disparity_rank(
@@ -1268,7 +1268,7 @@ def get_technical_indicator_screening(market: str = "0000", min_score: int = 60)
                 candidate_sources.append(('disparity', disparity_data.head(20)))
         except Exception as e:
             logger.debug(f"이격도 조회 오류: {e}")
-        
+
         # 🎯 2단계: 종목 코드 수집 및 중복 제거
         collected_stocks = set()
         for source_name, data in candidate_sources:
@@ -1276,83 +1276,83 @@ def get_technical_indicator_screening(market: str = "0000", min_score: int = 60)
                 stock_code = row.get('stck_shrn_iscd') or row.get('mksc_shrn_iscd', '')
                 if stock_code and len(stock_code) == 6:  # 유효한 종목코드
                     collected_stocks.add(stock_code)
-        
+
         logger.info(f"📊 수집된 후보 종목: {len(collected_stocks)}개")
-        
+
         if not collected_stocks:
             logger.warning("📊 기술적 분석할 후보 종목 없음")
             return pd.DataFrame()
-        
+
         # 🎯 3단계: 기술적 지표 분석
         technical_results = []
         processed_count = 0
-        
+
         for stock_code in list(collected_stocks)[:150]:  # 최대 150개 분석
             try:
                 processed_count += 1
                 if processed_count % 20 == 0:
                     logger.info(f"📈 기술적 분석 진행: {processed_count}/{min(150, len(collected_stocks))}")
-                
+
                 # 기본 정보 조회
                 current_data = get_inquire_price("J", stock_code)
                 if not current_data or current_data.empty:
                     continue
-                
+
                 current_info = current_data.iloc[0]
                 current_price = int(current_info.get('stck_prpr', 0))
                 stock_name = current_info.get('prdy_vrss_sign', '')  # 종목명 (임시)
-                
+
                 if current_price <= 0:
                     continue
-                
+
                 # 가격 데이터 조회 (최근 60일)
                 price_data = get_inquire_daily_price("J", stock_code)
                 if not price_data or len(price_data) < 20:
                     continue
-                
+
                 # 가격 데이터 준비
                 closes = []
                 highs = []
                 lows = []
                 volumes = []
-                
+
                 for _, row in price_data.head(60).iterrows():
                     close = int(row.get('stck_clpr', 0))
                     high = int(row.get('stck_hgpr', 0))
                     low = int(row.get('stck_lwpr', 0))
                     volume = int(row.get('acml_vol', 0))
-                    
+
                     if close > 0:
                         closes.append(close)
                         highs.append(high if high > 0 else close)
                         lows.append(low if low > 0 else close)
                         volumes.append(volume)
-                
+
                 # 현재가 추가
                 closes.append(current_price)
                 highs.append(current_price)
                 lows.append(current_price)
-                
+
                 if len(closes) < 15:  # 최소 데이터 요구
                     continue
-                
+
                 # 🎯 기술적 지표 계산
                 technical_analysis = _analyze_technical_indicators(
                     closes, highs, lows, volumes, stock_code, stock_name, current_price
                 )
-                
+
                 if technical_analysis and technical_analysis['total_score'] >= min_score:
                     technical_results.append(technical_analysis)
-                
+
                 # API 제한 방지
                 time.sleep(0.03)
-                
+
             except Exception as e:
                 logger.debug(f"종목 {stock_code} 기술적 분석 오류: {e}")
                 continue
-        
+
         logger.info(f"📈 기술적 지표 분석 완료: {len(technical_results)}개 종목 선별 ({min_score}점 이상)")
-        
+
         # 결과를 DataFrame으로 변환
         if technical_results:
             df = pd.DataFrame(technical_results)
@@ -1361,19 +1361,19 @@ def get_technical_indicator_screening(market: str = "0000", min_score: int = 60)
             return df
         else:
             return pd.DataFrame()
-        
+
     except Exception as e:
         logger.error(f"기술적 지표 스크리닝 오류: {e}")
         return None
 
 
-def _analyze_technical_indicators(closes: List[int], highs: List[int], lows: List[int], 
-                                volumes: List[int], stock_code: str, stock_name: str, 
+def _analyze_technical_indicators(closes: List[int], highs: List[int], lows: List[int],
+                                volumes: List[int], stock_code: str, stock_name: str,
                                 current_price: int) -> Optional[Dict]:
     """기술적 지표 종합 분석"""
     try:
         from ..analysis.technical_indicators import TechnicalIndicators
-        
+
         # 기본 정보
         result = {
             'stock_code': stock_code,
@@ -1383,16 +1383,16 @@ def _analyze_technical_indicators(closes: List[int], highs: List[int], lows: Lis
             'signals': [],
             'indicators': {}
         }
-        
+
         score = 0
         signals = []
-        
+
         # 📊 1. RSI 분석
         try:
             rsi_values = TechnicalIndicators.calculate_rsi(closes, period=14)
             current_rsi = rsi_values[-1] if rsi_values else 50.0
             result['indicators']['rsi'] = current_rsi
-            
+
             if current_rsi < 30:  # 과매도 → 반등 기대
                 score += 25
                 signals.append(f"RSI과매도({current_rsi:.1f})")
@@ -1405,55 +1405,55 @@ def _analyze_technical_indicators(closes: List[int], highs: List[int], lows: Lis
             elif current_rsi > 70:  # 과매수 → 주의
                 score -= 10
                 signals.append(f"RSI과매수({current_rsi:.1f})")
-            
+
         except Exception as e:
             logger.debug(f"RSI 계산 오류 ({stock_code}): {e}")
             result['indicators']['rsi'] = 50.0
-        
+
         # 📊 2. MACD 분석
         try:
             macd_data = TechnicalIndicators.calculate_macd(closes, fast=12, slow=26, signal=9)
             current_macd = macd_data['macd'][-1] if macd_data['macd'] else 0.0
             current_signal = macd_data['signal'][-1] if macd_data['signal'] else 0.0
             current_histogram = macd_data['histogram'][-1] if macd_data['histogram'] else 0.0
-            
+
             result['indicators']['macd'] = current_macd
             result['indicators']['macd_signal'] = current_signal
             result['indicators']['macd_histogram'] = current_histogram
-            
+
             # MACD Line > Signal Line (상승 신호)
             if current_macd > current_signal:
                 score += 25
                 signals.append("MACD상승신호")
-                
+
                 # 추가로 히스토그램이 양수면 더 강한 신호
                 if current_histogram > 0:
                     score += 10
                     signals.append("MACD강세확인")
-            
+
             # 히스토그램 음수→양수 전환 (매우 강한 신호)
-            if (len(macd_data['histogram']) > 1 and 
+            if (len(macd_data['histogram']) > 1 and
                 macd_data['histogram'][-2] <= 0 < current_histogram):
                 score += 35
                 signals.append("MACD전환신호")
-            
+
         except Exception as e:
             logger.debug(f"MACD 계산 오류 ({stock_code}): {e}")
             result['indicators']['macd'] = 0.0
             result['indicators']['macd_signal'] = 0.0
             result['indicators']['macd_histogram'] = 0.0
-        
+
         # 📊 3. 이동평균선 분석
         try:
             ma_data = TechnicalIndicators.calculate_moving_averages(closes, [5, 20, 60])
             ma_5 = ma_data.get('ma_5', [current_price])[-1]
             ma_20 = ma_data.get('ma_20', [current_price])[-1]
             ma_60 = ma_data.get('ma_60', [current_price])[-1]
-            
+
             result['indicators']['ma_5'] = ma_5
             result['indicators']['ma_20'] = ma_20
             result['indicators']['ma_60'] = ma_60
-            
+
             # 완벽한 상승배열: 현재가 > 5일선 > 20일선 > 60일선
             if current_price > ma_5 > ma_20 > ma_60:
                 score += 40
@@ -1470,49 +1470,49 @@ def _analyze_technical_indicators(closes: List[int], highs: List[int], lows: Lis
             elif current_price > ma_5:
                 score += 10
                 signals.append("5일선돌파")
-            
+
             # 5일선이 20일선을 상향돌파하는 신호 (최근 데이터로 확인)
             if len(ma_data.get('ma_5', [])) > 5 and len(ma_data.get('ma_20', [])) > 5:
                 prev_ma5 = ma_data['ma_5'][-2] if len(ma_data['ma_5']) > 1 else ma_5
                 prev_ma20 = ma_data['ma_20'][-2] if len(ma_data['ma_20']) > 1 else ma_20
-                
+
                 if prev_ma5 <= prev_ma20 < ma_5:  # 골든크로스 확인
                     score += 30
                     signals.append("골든크로스발생")
-            
+
         except Exception as e:
             logger.debug(f"이동평균 계산 오류 ({stock_code}): {e}")
             result['indicators']['ma_5'] = current_price
             result['indicators']['ma_20'] = current_price
             result['indicators']['ma_60'] = current_price
-        
+
         # 📊 4. 거래량 분석 (보조 지표)
         try:
             if volumes and len(volumes) >= 5:
                 recent_volume = volumes[-1] if volumes else 0
                 avg_volume = sum(volumes[-5:]) / min(5, len(volumes))
-                
+
                 if recent_volume > avg_volume * 1.5:  # 거래량 1.5배 이상
                     score += 15
                     signals.append(f"거래량급증({recent_volume/avg_volume:.1f}배)")
                 elif recent_volume > avg_volume * 1.2:  # 거래량 1.2배 이상
                     score += 10
                     signals.append(f"거래량증가({recent_volume/avg_volume:.1f}배)")
-                
+
                 result['indicators']['volume_ratio'] = recent_volume / avg_volume if avg_volume > 0 else 1.0
             else:
                 result['indicators']['volume_ratio'] = 1.0
-                
+
         except Exception as e:
             logger.debug(f"거래량 분석 오류 ({stock_code}): {e}")
             result['indicators']['volume_ratio'] = 1.0
-        
+
         # 📊 5. 가격 모멘텀 (단기 추세)
         try:
             if len(closes) >= 5:
                 price_5d_ago = closes[-5]
                 momentum_5d = (current_price - price_5d_ago) / price_5d_ago * 100
-                
+
                 if 0 < momentum_5d <= 15:  # 적정 상승 (과열 방지)
                     score += 20
                     signals.append(f"5일상승({momentum_5d:.1f}%)")
@@ -1522,22 +1522,22 @@ def _analyze_technical_indicators(closes: List[int], highs: List[int], lows: Lis
                 elif -5 <= momentum_5d < 0:  # 소폭 조정 (매수 기회)
                     score += 15
                     signals.append(f"소폭조정({momentum_5d:.1f}%)")
-                
+
                 result['indicators']['momentum_5d'] = momentum_5d
             else:
                 result['indicators']['momentum_5d'] = 0.0
-                
+
         except Exception as e:
             logger.debug(f"모멘텀 계산 오류 ({stock_code}): {e}")
             result['indicators']['momentum_5d'] = 0.0
-        
+
         # 최종 결과
         result['total_score'] = score
         result['signals'] = signals
         result['analysis_summary'] = f"{len(signals)}개 신호 (총 {score}점)"
-        
+
         return result
-        
+
     except Exception as e:
         logger.error(f"기술적 지표 분석 오류 ({stock_code}): {e}")
         return None
@@ -1547,7 +1547,7 @@ def get_comprehensive_market_screening(markets: List[str] = ["0001", "1001"]) ->
     """🎯 종합 시장 스크리닝 - 기술적 지표 + 전통적 스크리닝 결합"""
     try:
         logger.info("🎯 종합 시장 스크리닝 시작")
-        
+
         all_results = {
             'technical_screening': {},
             'traditional_screening': {},
@@ -1555,11 +1555,11 @@ def get_comprehensive_market_screening(markets: List[str] = ["0001", "1001"]) ->
             'market_summary': {},
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
-        
+
         for market in markets:
             market_name = "코스피" if market == "0001" else "코스닥" if market == "1001" else f"시장{market}"
             logger.info(f"📊 {market_name} 분석 시작")
-            
+
             # 기술적 지표 스크리닝
             try:
                 technical_results = get_technical_indicator_screening(market, min_score=50)
@@ -1584,7 +1584,7 @@ def get_comprehensive_market_screening(markets: List[str] = ["0001", "1001"]) ->
                     'status': 'error',
                     'error': str(e)
                 }
-            
+
             # 전통적 스크리닝 (갭, 거래량, 모멘텀)
             try:
                 traditional_candidates = {
@@ -1592,41 +1592,41 @@ def get_comprehensive_market_screening(markets: List[str] = ["0001", "1001"]) ->
                     'volume': [],
                     'momentum': []
                 }
-                
+
                 # 갭 트레이딩
                 gap_data = get_gap_trading_candidates(market)
                 if gap_data is not None and not gap_data.empty:
                     traditional_candidates['gap'] = gap_data.head(10).to_dict('records')
-                
+
                 # 거래량 돌파
                 volume_data = get_volume_breakout_candidates(market)
                 if volume_data is not None and not volume_data.empty:
                     traditional_candidates['volume'] = volume_data.head(10).to_dict('records')
-                
+
                 # 모멘텀
                 momentum_data = get_momentum_candidates(market)
                 if momentum_data is not None and not momentum_data.empty:
                     traditional_candidates['momentum'] = momentum_data.head(10).to_dict('records')
-                
+
                 all_results['traditional_screening'][market] = traditional_candidates
                 traditional_count = sum(len(v) for v in traditional_candidates.values())
                 logger.info(f"📊 {market_name} 전통적 후보: {traditional_count}개")
-                
+
             except Exception as e:
                 logger.error(f"{market_name} 전통적 스크리닝 오류: {e}")
                 all_results['traditional_screening'][market] = {
                     'gap': [], 'volume': [], 'momentum': []
                 }
-            
+
             time.sleep(0.5)  # 시장간 대기
-        
+
         # 종합 추천 생성
         all_results['combined_recommendations'] = _generate_combined_recommendations(all_results)
         all_results['market_summary'] = _generate_market_summary(all_results)
-        
+
         logger.info("🎯 종합 시장 스크리닝 완료")
         return all_results
-        
+
     except Exception as e:
         logger.error(f"종합 시장 스크리닝 오류: {e}")
         return None
@@ -1636,7 +1636,7 @@ def _generate_combined_recommendations(results: Dict) -> List[Dict]:
     """종합 추천 생성"""
     try:
         recommendations = []
-        
+
         # 기술적 지표 기반 추천 (우선순위 높음)
         for market, data in results.get('technical_screening', {}).items():
             if data.get('status') == 'success' and data.get('data'):
@@ -1651,7 +1651,7 @@ def _generate_combined_recommendations(results: Dict) -> List[Dict]:
                         'market': "코스피" if market == "0001" else "코스닥",
                         'priority': 'high'
                     })
-        
+
         # 전통적 스크리닝 추가 (보조)
         for market, categories in results.get('traditional_screening', {}).items():
             for category, items in categories.items():
@@ -1668,22 +1668,22 @@ def _generate_combined_recommendations(results: Dict) -> List[Dict]:
                             'market': "코스피" if market == "0001" else "코스닥",
                             'priority': 'medium'
                         })
-        
+
         # 중복 제거 및 점수순 정렬
         unique_recommendations = {}
         for rec in recommendations:
             stock_code = rec['stock_code']
             if stock_code not in unique_recommendations or rec['score'] > unique_recommendations[stock_code]['score']:
                 unique_recommendations[stock_code] = rec
-        
+
         final_recommendations = sorted(
             unique_recommendations.values(),
             key=lambda x: (x['priority'] == 'high', x['score']),
             reverse=True
         )
-        
+
         return final_recommendations[:20]  # 상위 20개
-        
+
     except Exception as e:
         logger.error(f"종합 추천 생성 오류: {e}")
         return []
@@ -1698,17 +1698,17 @@ def _generate_market_summary(results: Dict) -> Dict:
             'market_analysis': {},
             'best_opportunities': []
         }
-        
+
         # 기술적 지표 후보 집계
         for market, data in results.get('technical_screening', {}).items():
             if data.get('status') == 'success':
                 summary['total_technical_candidates'] += data.get('count', 0)
-        
+
         # 전통적 후보 집계
         for market, categories in results.get('traditional_screening', {}).items():
             market_count = sum(len(items) for items in categories.values())
             summary['total_traditional_candidates'] += market_count
-            
+
             market_name = "코스피" if market == "0001" else "코스닥"
             summary['market_analysis'][market_name] = {
                 'gap_count': len(categories.get('gap', [])),
@@ -1716,7 +1716,7 @@ def _generate_market_summary(results: Dict) -> Dict:
                 'momentum_count': len(categories.get('momentum', [])),
                 'total_count': market_count
             }
-        
+
         # 최고 기회 종목 (기술적 점수 80점 이상)
         for market, data in results.get('technical_screening', {}).items():
             if data.get('status') == 'success' and data.get('data'):
@@ -1728,9 +1728,9 @@ def _generate_market_summary(results: Dict) -> Dict:
                             'signals': len(item.get('signals', [])),
                             'market': "코스피" if market == "0001" else "코스닥"
                         })
-        
+
         return summary
-        
+
     except Exception as e:
         logger.error(f"시장 요약 생성 오류: {e}")
         return {}
@@ -1745,15 +1745,15 @@ def _analyze_market_disparity(upper_data: pd.DataFrame, lower_data: pd.DataFrame
             'oversold_stocks': len(lower_data),
             'sentiment': 'neutral'
         }
-        
+
         # 시장 심리 판단
         if analysis['oversold_stocks'] > analysis['overbought_stocks'] * 2:
             analysis['sentiment'] = 'oversold_dominant'
         elif analysis['overbought_stocks'] > analysis['oversold_stocks'] * 2:
             analysis['sentiment'] = 'overbought_dominant'
-        
+
         return analysis
-        
+
     except Exception as e:
         logger.error(f"시장 이격도 분석 오류: {e}")
         return {'market': market, 'sentiment': 'error'}
@@ -1767,11 +1767,11 @@ def _combine_market_signals(kospi_signals: Dict, kosdaq_signals: Dict) -> Dict:
             'recommendation': 'hold',
             'confidence': 'medium'
         }
-        
+
         # 간단한 통합 로직
         kospi_sentiment = kospi_signals.get('sentiment', 'neutral')
         kosdaq_sentiment = kosdaq_signals.get('sentiment', 'neutral')
-        
+
         if kospi_sentiment == 'oversold_dominant' and kosdaq_sentiment == 'oversold_dominant':
             combined['overall_sentiment'] = 'market_oversold'
             combined['recommendation'] = 'buy_opportunity'
@@ -1780,9 +1780,9 @@ def _combine_market_signals(kospi_signals: Dict, kosdaq_signals: Dict) -> Dict:
             combined['overall_sentiment'] = 'market_overbought'
             combined['recommendation'] = 'sell_signal'
             combined['confidence'] = 'high'
-        
+
         return combined
-        
+
     except Exception as e:
         logger.error(f"시장 신호 통합 오류: {e}")
         return {'overall_sentiment': 'error', 'recommendation': 'hold', 'confidence': 'low'}

@@ -169,15 +169,15 @@ class KISWebSocketMessageHandler:
             self.stats['last_message_time'] = datetime.now()
 
             # 디버그: 수신된 메시지 로그
-            logger.info(f"📨 웹소켓 메시지 수신 (길이: {len(message)}, 첫 문자: '{message[0] if message else 'None'}')")
+            #logger.info(f"📨 웹소켓 메시지 수신 (길이: {len(message)}, 첫 문자: '{message[0] if message else 'None'}')")
 
             if message[0] in ('0', '1'):
                 # 실시간 데이터
-                logger.info(f"🔔 실시간 데이터로 분류하여 처리")
+                #logger.info(f"🔔 실시간 데이터로 분류하여 처리")
                 await self.handle_realtime_data(message)
             else:
                 # 시스템 메시지
-                logger.info(f"🔧 시스템 메시지로 분류하여 처리")
+                #logger.info(f"🔧 시스템 메시지로 분류하여 처리")
                 result = await self.handle_system_message(message)
                 return result  # PINGPONG 등 특별한 처리가 필요한 경우 반환
 
