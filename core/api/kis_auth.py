@@ -33,7 +33,7 @@ class KISEnv(NamedTuple):
 # 전역 변수
 _TRENV: Optional[KISEnv] = None
 _last_auth_time = datetime.now()
-_autoReAuth = False
+_autoReAuth = True
 _DEBUG = False
 _isPaper = False
 
@@ -197,7 +197,9 @@ def auth(svr: str = 'prod', product: str = '01') -> bool:
 def reAuth(svr: str = 'prod', product: str = '01') -> None:
     """토큰 재발급"""
     n2 = datetime.now()
-    if (n2 - _last_auth_time).seconds >= 86400:  # 24시간
+    # 23시간 후에 미리 재발급 (24시간 = 86400초, 23시간 = 82800초)
+    if (n2 - _last_auth_time).total_seconds() >= 82800:
+        logger.info("🔄 토큰 자동 재발급 시작 (23시간 경과)")
         auth(svr, product)
 
 

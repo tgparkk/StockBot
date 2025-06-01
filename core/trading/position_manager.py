@@ -849,10 +849,15 @@ class PositionManager:
                 current_data = get_inquire_price("J", stock_code)
                 if current_data is not None and not current_data.empty:
                     volume = int(current_data.iloc[0].get('acml_vol', 0))
-                    avg_volume = int(current_data.iloc[0].get('avrg_vol', 1))
+                    avg_volume = int(current_data.iloc[0].get('avrg_vol', 0))
 
-                    if volume > avg_volume * 1.5:  # 평균 거래량 1.5배 이상
-                        return f"거래량증가연장 (거래량:{volume/avg_volume:.1f}배)"
+                    # 🔧 안전한 거래량 비율 계산
+                    if avg_volume > 10000:  # 평균 거래량이 10,000주 이상일 때만 계산
+                        volume_ratio = volume / avg_volume
+                        if volume_ratio > 1.5:  # 평균 거래량 1.5배 이상
+                            return f"거래량증가연장 (거래량:{volume_ratio:.1f}배, 현재:{volume:,}주)"
+                        elif volume > 500000:  # 평균 거래량 데이터가 없어도 절대 거래량이 50만주 이상이면
+                            return f"거래량급증연장 (거래량:{volume:,}주)"
 
             except Exception as e:
                 logger.debug(f"거래량 확인 오류: {e}")
@@ -1058,7 +1063,7 @@ class PositionManager:
                             'suggested_price': int(current_price * 0.992)  # 0.8% 할인 매도
                         }
 
-                # 2. 🎯 과매수 구간: 수익 조건부 매도
+                # 2. 🆕 과매수 구간: 수익 조건부 매도
                 elif d5_val >= 115 and d20_val >= 110:
                     if profit_rate >= 1.5:  # 1.5% 이상 수익시 매도
                         return {
