@@ -236,14 +236,14 @@ class KISRestAPIManager:
 
     # === 시장 스크리닝 관련 ===
     def get_market_screening_candidates(self, market_type: str = "all") -> Dict:
-        """🎯 수익성 중심 시장 스크리닝 - 기술적 지표 통합 강화"""
-        logger.info(f"시장 스크리닝 시작: {market_type}")
+        """🎯 최적화된 시장 스크리닝 - 중복 제거 버전"""
+        logger.info(f"📊 최적화된 시장 스크리닝 시작: {market_type}")
         
         candidates = {
             'gap': [],
             'volume': [],
             'momentum': [],
-            'technical': []  # 🆕 기술적 지표 기반 후보
+            'technical': []
         }
         
         markets = ["0000", "0001", "1001"] if market_type == "all" else [market_type]
@@ -254,530 +254,319 @@ class KISRestAPIManager:
         is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
         is_early_market = current_time.hour < 11
         
+        # 🆕 중복 방지를 위한 종목 캐시
+        analyzed_stocks = {}  # {stock_code: {price_data, current_data, technical_analysis}}
+        collected_stocks = set()  # 수집된 모든 종목 코드
+        
         for market in markets:
             try:
-                # === 🆕 기술적 지표 우선 스크리닝 ===
-                try:
-                    technical_candidates = self._get_technical_indicator_candidates(market, is_pre_market)
-                    if technical_candidates:
-                        candidates['technical'].extend(technical_candidates)
-                        logger.info(f"📈 기술적 지표 후보: {len(technical_candidates)}개 ({market})")
-                except Exception as e:
-                    logger.error(f"기술적 지표 후보 조회 오류 ({market}): {e}")
-
-                # === 갭 트레이딩 후보 (기술적 지표 필터링 적용) ===
-                try:
-                    gap_candidates = market_api.get_gap_trading_candidates(market)
-                    if gap_candidates is not None and not gap_candidates.empty:
-                        # 🆕 기술적 지표로 필터링
-                        filtered_gap_data = self._process_gap_candidates_with_technical_filter(gap_candidates)
-                        candidates['gap'].extend(filtered_gap_data)
-                        logger.info(f"📊 갭 후보 (기술적필터링): {len(filtered_gap_data)}개 ({market})")
-                    else:
-                        logger.warning(f"⚠️ 갭 후보 없음 - 백업 전략 시도 ({market})")
-                        backup_gap_candidates = self._get_backup_gap_candidates(market, is_pre_market)
-                        if backup_gap_candidates:
-                            candidates['gap'].extend(backup_gap_candidates)
-                            logger.info(f"🔄 갭 백업 후보: {len(backup_gap_candidates)}개 ({market})")
-                        
-                except Exception as e:
-                    logger.error(f"갭 후보 조회 오류 ({market}): {e}")
-
-                # === 거래량 돌파 후보 (기술적 지표 필터링 적용) ===
-                try:
-                    volume_candidates = market_api.get_volume_breakout_candidates(market)
-                    if volume_candidates is not None and not volume_candidates.empty:
-                        # 🆕 기술적 지표로 필터링
-                        filtered_volume_data = self._process_volume_candidates_with_technical_filter(volume_candidates)
-                        candidates['volume'].extend(filtered_volume_data)
-                        logger.info(f"📊 거래량 후보 (기술적필터링): {len(filtered_volume_data)}개 ({market})")
-                    else:
-                        logger.warning(f"⚠️ 거래량 후보 없음 - 백업 전략 시도 ({market})")
-                        backup_volume_candidates = self._get_backup_volume_candidates(market, is_pre_market)
-                        if backup_volume_candidates:
-                            candidates['volume'].extend(backup_volume_candidates)
-                            logger.info(f"🔄 거래량 백업 후보: {len(backup_volume_candidates)}개 ({market})")
-                        
-                except Exception as e:
-                    logger.error(f"거래량 후보 조회 오류 ({market}): {e}")
-
-                # === 모멘텀 후보 (기술적 지표 필터링 적용) ===
-                try:
-                    momentum_candidates = market_api.get_momentum_candidates(market)
-                    if momentum_candidates is not None and not momentum_candidates.empty:
-                        # 🆕 기술적 지표로 필터링
-                        filtered_momentum_data = self._process_momentum_candidates_with_technical_filter(momentum_candidates)
-                        candidates['momentum'].extend(filtered_momentum_data)
-                        logger.info(f"📊 모멘텀 후보 (기술적필터링): {len(filtered_momentum_data)}개 ({market})")
-                    else:
-                        logger.warning(f"⚠️ 모멘텀 후보 없음 - 백업 전략 시도 ({market})")
-                        backup_momentum_candidates = self._get_backup_momentum_candidates(market, is_pre_market)
-                        if backup_momentum_candidates:
-                            candidates['momentum'].extend(backup_momentum_candidates)
-                            logger.info(f"🔄 모멘텀 백업 후보: {len(backup_momentum_candidates)}개 ({market})")
-                        
-                except Exception as e:
-                    logger.error(f"모멘텀 후보 조회 오류 ({market}): {e}")
-
-                # 🆕 API 제한 극복을 위한 추가 스크리닝
-                try:
-                    additional_candidates = self._get_extended_screening_candidates(market, is_pre_market)
-                    if additional_candidates:
-                        # 중복 제거하여 각 카테고리에 분산 추가
-                        for category, items in additional_candidates.items():
-                            if category in candidates:
-                                candidates[category].extend(items)
-                        logger.info(f"🔍 확장 스크리닝 완료: {sum(len(v) for v in additional_candidates.values())}개 추가 ({market})")
-                except Exception as e:
-                    logger.error(f"확장 스크리닝 오류 ({market}): {e}")
-
-                # 짧은 대기 (API 호출 간격)
+                logger.info(f"🔍 [{market}] 시장 분석 시작...")
+                
+                # === 1단계: 모든 소스에서 종목 수집 (중복 제거) ===
+                market_stocks = self._collect_all_market_stocks(market, is_pre_market)
+                collected_stocks.update(market_stocks)
+                logger.info(f"📊 [{market}] 종목 수집 완료: {len(market_stocks)}개")
+                
+                # === 2단계: 수집된 종목들에 대해 일괄 분석 (한 번만) ===
+                batch_analysis = self._batch_analyze_stocks(list(market_stocks)[:100], analyzed_stocks)
+                logger.info(f"📈 [{market}] 일괄 분석 완료: {len(batch_analysis)}개")
+                
+                # === 3단계: 분석 결과를 전략별로 분류 ===
+                market_candidates = self._classify_candidates_by_strategy(batch_analysis, market)
+                
+                # 결과 합산
+                for category, items in market_candidates.items():
+                    candidates[category].extend(items)
+                
+                logger.info(f"✅ [{market}] 완료 - 갭:{len(market_candidates['gap'])} 거래량:{len(market_candidates['volume'])} 모멘텀:{len(market_candidates['momentum'])} 기술:{len(market_candidates['technical'])}")
+                
+                # API 제한 방지
                 time.sleep(0.2)
-
+                
             except Exception as e:
-                logger.error(f"시장 {market} 스크리닝 오류: {e}")
-
-        # 🆕 결과 종합 및 우선순위 정렬
-        total_candidates = sum(len(v) for v in candidates.values())
-        logger.info(f"🎯 시장 스크리닝 완료: 총 {total_candidates}개 후보 발견")
-        logger.info(f"📊 카테고리별: 기술적{len(candidates['technical'])} 갭{len(candidates['gap'])} 거래량{len(candidates['volume'])} 모멘텀{len(candidates['momentum'])}")
+                logger.error(f"❌ 시장 {market} 스크리닝 오류: {e}")
+                continue
         
-        # 우선순위 정렬 (기술적 지표 점수 기준)
-        self._sort_candidates_by_technical_score(candidates)
+        # === 최종 정리 및 정렬 ===
+        total_candidates = sum(len(v) for v in candidates.values())
+        logger.info(f"🎯 최적화된 스크리닝 완료: 총 {total_candidates}개 후보")
+        logger.info(f"📊 분석된 종목: {len(analyzed_stocks)}개 (중복 제거)")
+        
+        # 카테고리별 상위 후보로 제한
+        for category in candidates:
+            if candidates[category]:
+                candidates[category].sort(key=lambda x: x.get('technical_score', 0), reverse=True)
+                candidates[category] = candidates[category][:30]  # 상위 30개로 제한
         
         return candidates
 
-    def _get_technical_indicator_candidates(self, market: str, is_pre_market: bool) -> List[Dict]:
-        """🆕 기술적 지표 기반 우선 스크리닝"""
+    def _collect_all_market_stocks(self, market: str, is_pre_market: bool) -> set:
+        """🆕 모든 소스에서 종목 수집 (중복 제거)"""
+        collected_stocks = set()
+        
         try:
-            from ..analysis.technical_indicators import TechnicalIndicators
-            
-            candidates = []
-            
-            # 🎯 1단계: 다양한 API로 폭넓은 종목 수집
+            # 기본 스크리닝 방법들
             screening_methods = [
-                # 이격도 기반 (RSI 과매도 유사)
-                lambda: market_api.get_disparity_rank(fid_input_iscd=market, fid_rank_sort_cls_code="1", fid_hour_cls_code="20"),
-                # 거래량 급증 (모멘텀)
-                lambda: market_api.get_volume_rank(fid_input_iscd=market, fid_blng_cls_code="1"),
-                # 등락률 상위 (추세)
+                # 갭 관련
+                lambda: market_api.get_gap_trading_candidates(market),
                 lambda: market_api.get_fluctuation_rank(fid_input_iscd=market, fid_rank_sort_cls_code="0"),
-                # 체결강도 상위 (매수 우위)
-                lambda: market_api.get_volume_power_rank(fid_input_iscd=market)
+                lambda: market_api.get_fluctuation_rank(fid_input_iscd=market, fid_rank_sort_cls_code="1"),
+                
+                # 거래량 관련
+                lambda: market_api.get_volume_breakout_candidates(market),
+                lambda: market_api.get_volume_rank(fid_input_iscd=market, fid_blng_cls_code="1"),
+                lambda: market_api.get_bulk_trans_num_rank(fid_input_iscd=market),
+                
+                # 모멘텀 관련
+                lambda: market_api.get_momentum_candidates(market),
+                lambda: market_api.get_volume_power_rank(fid_input_iscd=market),
+                
+                # 기술적 지표 관련
+                lambda: market_api.get_disparity_rank(fid_input_iscd=market, fid_rank_sort_cls_code="1", fid_hour_cls_code="20"),
+                lambda: market_api.get_quote_balance_rank(fid_input_iscd=market)
             ]
-            
-            collected_stocks = set()
             
             for method in screening_methods:
                 try:
                     data = method()
                     if data is not None and not data.empty:
-                        for _, row in data.head(30).iterrows():  # 각 방법에서 30개씩
+                        for _, row in data.head(20).iterrows():  # 각 방법에서 20개씩
                             stock_code = row.get('stck_shrn_iscd', '')
-                            if stock_code and stock_code not in collected_stocks:
+                            if stock_code and len(stock_code) == 6:  # 유효한 종목코드
                                 collected_stocks.add(stock_code)
                 except Exception as e:
-                    logger.debug(f"스크리닝 방법 오류: {e}")
+                    logger.debug(f"종목 수집 방법 오류: {e}")
                     continue
-                    
-                time.sleep(0.1)  # API 제한 방지
+                
+                time.sleep(0.05)  # API 제한 방지
             
-            logger.info(f"📊 1단계 수집완료: {len(collected_stocks)}개 종목")
+            logger.info(f"📊 [{market}] 종목 수집 완료: {len(collected_stocks)}개 (중복 제거됨)")
+            return collected_stocks
             
-            # 🎯 2단계: 기술적 지표 분석 및 필터링
-            for stock_code in list(collected_stocks)[:100]:  # 최대 100개까지 분석
+        except Exception as e:
+            logger.error(f"종목 수집 오류 ({market}): {e}")
+            return set()
+
+    def _batch_analyze_stocks(self, stock_codes: List[str], cache: Dict) -> Dict:
+        """🆕 종목 일괄 분석 (캐시 활용으로 중복 방지)"""
+        try:
+            from ..analysis.technical_indicators import TechnicalIndicators
+            
+            batch_results = {}
+            
+            for stock_code in stock_codes:
                 try:
-                    # 가격 데이터 조회 (DataFrame 반환)
-                    price_data = market_api.get_inquire_daily_price("J", stock_code)
-                    if price_data is None or price_data.empty or len(price_data) < 20:
+                    # 캐시 확인
+                    if stock_code in cache:
+                        batch_results[stock_code] = cache[stock_code]
                         continue
                     
-                    # 현재가 정보
+                    # 🎯 한 번에 모든 데이터 수집
+                    price_data = market_api.get_inquire_daily_price("J", stock_code)
                     current_data = market_api.get_inquire_price("J", stock_code)
-                    if current_data is None or current_data.empty:
+                    
+                    if (price_data is None or price_data.empty or 
+                        current_data is None or current_data.empty):
                         continue
                     
                     current_info = current_data.iloc[0]
                     current_price = int(current_info.get('stck_prpr', 0))
+                    change_rate = float(current_info.get('prdy_ctrt', 0))
+                    volume = int(current_info.get('acml_vol', 0))
                     
-                    # DataFrame에서 종가 컬럼 추출 (올바른 컬럼명 사용)
+                    # 종가 데이터 추출 (한 번만)
                     if 'stck_clpr' in price_data.columns:
                         closes = price_data['stck_clpr'].astype(int).tolist()
                     elif 'close' in price_data.columns:
                         closes = price_data['close'].astype(int).tolist()
                     else:
-                        # 컬럼명을 찾지 못한 경우 스킵
-                        logger.debug(f"종목 {stock_code}: 종가 컬럼을 찾을 수 없음. 컬럼: {price_data.columns.tolist()}")
                         continue
                     
-                    if not closes or len(closes) < 20 or current_price <= 0:
+                    if len(closes) < 10 or current_price <= 0:
                         continue
                     
-                    # RSI 계산
-                    rsi = TechnicalIndicators.calculate_rsi(closes)[-1]
+                    # 🎯 모든 기술적 지표를 한 번에 계산
+                    technical_analysis = self._comprehensive_technical_analysis(closes, current_price)
                     
-                    # MACD 계산
-                    macd_data = TechnicalIndicators.calculate_macd(closes)
-                    macd_line = macd_data['macd'][-1]
-                    macd_signal = macd_data['signal'][-1]
-                    macd_histogram = macd_data['histogram'][-1]
+                    # 결과 캐시 저장
+                    analysis_result = {
+                        'stock_code': stock_code,
+                        'current_price': current_price,
+                        'change_rate': change_rate,
+                        'volume': volume,
+                        'technical_analysis': technical_analysis,
+                        'price_data': price_data.to_dict('records')[:5],  # 최근 5일만 저장
+                        'current_data': current_info.to_dict()
+                    }
                     
-                    # 이동평균 계산
-                    ma_data = TechnicalIndicators.calculate_moving_averages(closes, [5, 20, 60])
-                    ma_5 = ma_data['ma_5'][-1]
-                    ma_20 = ma_data['ma_20'][-1]
-                    ma_60 = ma_data['ma_60'][-1]
+                    cache[stock_code] = analysis_result
+                    batch_results[stock_code] = analysis_result
                     
-                    # 🎯 기술적 신호 분석
-                    technical_score = 0
-                    signals = []
-                    
-                    # RSI 신호
-                    if 30 <= rsi <= 50:  # 과매도에서 회복
-                        technical_score += 25
-                        signals.append(f"RSI회복({rsi:.1f})")
-                    elif rsi < 30:  # 과매도 (반등 기대)
-                        technical_score += 20
-                        signals.append(f"RSI과매도({rsi:.1f})")
-                    elif rsi > 70:  # 과매수 (주의)
-                        technical_score -= 10
-                        signals.append(f"RSI과매수({rsi:.1f})")
-                    
-                    # MACD 신호
-                    if macd_line > macd_signal and macd_histogram > 0:  # 상승 신호
-                        technical_score += 25
-                        signals.append("MACD상승")
-                    elif macd_histogram > 0 and len(macd_data['histogram']) > 1:
-                        if macd_data['histogram'][-2] <= 0:  # 음수→양수 전환
-                            technical_score += 30
-                            signals.append("MACD전환")
-                    
-                    # 이동평균 정배열
-                    if current_price > ma_5 > ma_20 > ma_60:  # 완벽한 상승배열
-                        technical_score += 35
-                        signals.append("완벽상승배열")
-                    elif current_price > ma_5 > ma_20:  # 단기 상승배열
-                        technical_score += 20
-                        signals.append("단기상승배열")
-                    elif ma_5 > ma_20:  # 골든크로스
-                        technical_score += 15
-                        signals.append("골든크로스")
-                    
-                    # 🎯 종합 평가 (50점 이상만 선별)
-                    if technical_score >= 50:  # 기준점 낮춤 (더 많은 후보)
-                        candidates.append({
-                            'stock_code': stock_code,
-                            'current_price': current_price,
-                            'rsi': rsi,
-                            'macd_line': macd_line,
-                            'macd_signal': macd_signal,
-                            'ma_5': ma_5,
-                            'ma_20': ma_20,
-                            'ma_60': ma_60,
-                            'technical_score': technical_score,
-                            'signals': signals,
-                            'reason': f"기술적점수{technical_score}점",
-                            'strategy': 'technical_priority'
-                        })
-                
                 except Exception as e:
-                    logger.debug(f"종목 {stock_code} 기술적 분석 오류: {e}")
+                    logger.debug(f"종목 {stock_code} 분석 오류: {e}")
                     continue
                 
                 # API 제한 방지
-                time.sleep(0.05)
+                time.sleep(0.03)
             
-            # 점수 순으로 정렬
-            candidates.sort(key=lambda x: x['technical_score'], reverse=True)
-            
-            logger.info(f"📈 기술적 지표 후보 선별완료: {len(candidates)}개 (50점 이상)")
-            return candidates[:50]  # 상위 50개만 반환
+            logger.info(f"📈 일괄 분석 완료: {len(batch_results)}개 성공")
+            return batch_results
             
         except Exception as e:
-            logger.error(f"기술적 지표 스크리닝 오류: {e}")
-            return []
+            logger.error(f"일괄 분석 오류: {e}")
+            return {}
 
-    def _process_gap_candidates_with_technical_filter(self, gap_candidates: pd.DataFrame) -> List[Dict]:
-        """🆕 갭 후보에 기술적 지표 필터링 적용"""
+    def _comprehensive_technical_analysis(self, closes: List[int], current_price: int) -> Dict:
+        """🆕 포괄적 기술적 분석 (한 번에 모든 지표 계산)"""
         try:
             from ..analysis.technical_indicators import TechnicalIndicators
             
-            filtered_candidates = []
+            # 🎯 모든 기술적 지표를 한 번에 계산
+            rsi = TechnicalIndicators.calculate_rsi(closes)[-1]
+            macd_data = TechnicalIndicators.calculate_macd(closes)
+            ma_data = TechnicalIndicators.calculate_moving_averages(closes, [5, 20, 60])
             
-            for _, row in gap_candidates.head(20).iterrows():
-                try:
-                    stock_code = row.get('stck_shrn_iscd', '')
-                    if not stock_code:
-                        continue
-                    
-                    # 기본 갭 정보
-                    gap_info = self._calculate_gap_info(row)
-                    if not gap_info:
-                        continue
-                    
-                    # 📈 기술적 지표 검증
-                    technical_check = self._quick_technical_check(stock_code)
-                    if not technical_check:
-                        continue
-                    
-                    # 기술적 지표가 양호한 경우만 포함
-                    if technical_check['score'] >= 30:  # 낮은 기준 (더 많은 후보)
-                        candidate = {
-                            **gap_info,
-                            'technical_score': technical_check['score'],
-                            'technical_signals': technical_check['signals'],
-                            'strategy': 'gap_with_technical'
-                        }
-                        filtered_candidates.append(candidate)
-                
-                except Exception as e:
-                    logger.debug(f"갭 후보 기술적 필터링 오류: {e}")
-                    continue
-                
-                time.sleep(0.05)
-            
-            return filtered_candidates
-            
-        except Exception as e:
-            logger.error(f"갭 후보 기술적 필터링 오류: {e}")
-            return []
-
-    def _process_volume_candidates_with_technical_filter(self, volume_candidates: pd.DataFrame) -> List[Dict]:
-        """🆕 거래량 후보에 기술적 지표 필터링 적용"""
-        try:
-            filtered_candidates = []
-            
-            for _, row in volume_candidates.head(20).iterrows():
-                try:
-                    stock_code = row.get('stck_shrn_iscd', '')
-                    if not stock_code:
-                        continue
-                    
-                    # 기본 거래량 정보
-                    volume_info = self._calculate_volume_info(row)
-                    if not volume_info:
-                        continue
-                    
-                    # 📈 기술적 지표 검증
-                    technical_check = self._quick_technical_check(stock_code)
-                    if not technical_check:
-                        continue
-                    
-                    # 기술적 지표가 양호한 경우만 포함
-                    if technical_check['score'] >= 30:
-                        candidate = {
-                            **volume_info,
-                            'technical_score': technical_check['score'],
-                            'technical_signals': technical_check['signals'],
-                            'strategy': 'volume_with_technical'
-                        }
-                        filtered_candidates.append(candidate)
-                
-                except Exception as e:
-                    logger.debug(f"거래량 후보 기술적 필터링 오류: {e}")
-                    continue
-                
-                time.sleep(0.05)
-            
-            return filtered_candidates
-            
-        except Exception as e:
-            logger.error(f"거래량 후보 기술적 필터링 오류: {e}")
-            return []
-
-    def _process_momentum_candidates_with_technical_filter(self, momentum_candidates: pd.DataFrame) -> List[Dict]:
-        """🆕 모멘텀 후보에 기술적 지표 필터링 적용"""
-        try:
-            filtered_candidates = []
-            
-            for _, row in momentum_candidates.head(20).iterrows():
-                try:
-                    stock_code = row.get('stck_shrn_iscd', '')
-                    if not stock_code:
-                        continue
-                    
-                    # 기본 모멘텀 정보
-                    momentum_info = self._calculate_momentum_info(row)
-                    if not momentum_info:
-                        continue
-                    
-                    # 📈 기술적 지표 검증
-                    technical_check = self._quick_technical_check(stock_code)
-                    if not technical_check:
-                        continue
-                    
-                    # 기술적 지표가 양호한 경우만 포함
-                    if technical_check['score'] >= 30:
-                        candidate = {
-                            **momentum_info,
-                            'technical_score': technical_check['score'],
-                            'technical_signals': technical_check['signals'],
-                            'strategy': 'momentum_with_technical'
-                        }
-                        filtered_candidates.append(candidate)
-                
-                except Exception as e:
-                    logger.debug(f"모멘텀 후보 기술적 필터링 오류: {e}")
-                    continue
-                
-                time.sleep(0.05)
-            
-            return filtered_candidates
-            
-        except Exception as e:
-            logger.error(f"모멘텀 후보 기술적 필터링 오류: {e}")
-            return []
-
-    def _quick_technical_check(self, stock_code: str) -> Dict:
-        """🆕 빠른 기술적 지표 검증"""
-        try:
-            from ..analysis.technical_indicators import TechnicalIndicators
-            
-            # 최근 20일 데이터만 조회 (빠른 분석)
-            price_data = market_api.get_inquire_daily_price("J", stock_code)
-            if price_data is None or price_data.empty or len(price_data) < 10:
-                return None
-            
-            # 현재가 정보
-            current_data = market_api.get_inquire_price("J", stock_code)
-            if current_data is None or current_data.empty:
-                return None
-            
-            current_info = current_data.iloc[0]
-            current_price = int(current_info.get('stck_prpr', 0))
-            
-            # DataFrame에서 종가 컬럼 추출 (20일 제한)
-            price_data_limited = price_data.head(20)
-            if 'stck_clpr' in price_data_limited.columns:
-                closes = price_data_limited['stck_clpr'].astype(int).tolist()
-            elif 'close' in price_data_limited.columns:
-                closes = price_data_limited['close'].astype(int).tolist()
-            else:
-                # 컬럼명을 찾지 못한 경우 None 반환
-                logger.debug(f"빠른 체크 {stock_code}: 종가 컬럼을 찾을 수 없음")
-                return None
-            
-            # 현재가 추가
-            closes.append(current_price)
-            
-            if not closes or current_price <= 0:
-                return None
-            
-            # 빠른 기술적 지표 계산
-            score = 0
+            # 기술적 점수 계산
+            technical_score = 0
             signals = []
             
-            # RSI (10일 단축 버전)
-            rsi = TechnicalIndicators.calculate_rsi(closes, period=min(10, len(closes)))[-1]
-            if 30 <= rsi <= 65:  # 매수 적정 구간
-                score += 20
-                signals.append(f"RSI양호({rsi:.0f})")
+            # RSI 분석
+            if 20 <= rsi <= 50:
+                technical_score += 25
+                signals.append(f"RSI적정({rsi:.1f})")
             elif rsi < 30:
-                score += 15
-                signals.append(f"RSI과매도({rsi:.0f})")
+                technical_score += 20
+                signals.append(f"RSI과매도({rsi:.1f})")
+            elif rsi > 70:
+                technical_score -= 10
+                signals.append(f"RSI과매수({rsi:.1f})")
             
-            # 간단한 이동평균 체크
-            if len(closes) >= 5:
-                ma_5 = sum(closes[-5:]) / 5
-                if current_price > ma_5:
-                    score += 15
-                    signals.append("5일선상향")
+            # MACD 분석
+            macd_line = macd_data['macd'][-1]
+            macd_signal = macd_data['signal'][-1]
+            macd_histogram = macd_data['histogram'][-1]
             
-            # 단기 모멘텀 체크
-            if len(closes) >= 3:
-                recent_change = (closes[-1] - closes[-3]) / closes[-3] * 100
-                if 0 < recent_change < 10:  # 적정 상승
-                    score += 15
-                    signals.append(f"단기상승({recent_change:.1f}%)")
+            if macd_line > macd_signal and macd_histogram > 0:
+                technical_score += 25
+                signals.append("MACD상승")
+            elif macd_histogram > 0 and len(macd_data['histogram']) > 1:
+                if macd_data['histogram'][-2] <= 0:
+                    technical_score += 30
+                    signals.append("MACD전환")
+            
+            # 이동평균 분석
+            ma_5 = ma_data['ma_5'][-1] if ma_data['ma_5'] else current_price
+            ma_20 = ma_data['ma_20'][-1] if ma_data['ma_20'] else current_price
+            ma_60 = ma_data['ma_60'][-1] if ma_data['ma_60'] else current_price
+            
+            if current_price > ma_5 > ma_20 > ma_60:
+                technical_score += 35
+                signals.append("완벽상승배열")
+            elif current_price > ma_5 > ma_20:
+                technical_score += 20
+                signals.append("단기상승배열")
+            elif ma_5 > ma_20:
+                technical_score += 15
+                signals.append("골든크로스")
             
             return {
-                'score': score,
-                'signals': signals,
-                'rsi': rsi
+                'rsi': rsi,
+                'macd_line': macd_line,
+                'macd_signal': macd_signal,
+                'macd_histogram': macd_histogram,
+                'ma_5': ma_5,
+                'ma_20': ma_20,
+                'ma_60': ma_60,
+                'technical_score': technical_score,
+                'signals': signals
             }
             
         except Exception as e:
-            logger.debug(f"빠른 기술적 체크 오류 ({stock_code}): {e}")
-            return None
+            logger.error(f"포괄적 기술적 분석 오류: {e}")
+            return {
+                'technical_score': 0,
+                'signals': []
+            }
 
-    def _get_extended_screening_candidates(self, market: str, is_pre_market: bool) -> Dict:
-        """🆕 API 제한 극복을 위한 확장 스크리닝"""
+    def _classify_candidates_by_strategy(self, batch_analysis: Dict, market: str) -> Dict:
+        """🆕 분석 결과를 전략별로 분류"""
         try:
-            extended_candidates = {
+            classified = {
                 'gap': [],
                 'volume': [],
-                'momentum': []
+                'momentum': [],
+                'technical': []
             }
             
-            # 🎯 다양한 접근법으로 더 많은 종목 발굴
-            screening_approaches = [
-                # 하락률 순위에서 반등 후보 찾기
-                ('gap', lambda: market_api.get_fluctuation_rank(fid_input_iscd=market, fid_rank_sort_cls_code="1")),
-                # 대량 체결 건수 상위
-                ('volume', lambda: market_api.get_bulk_trans_num_rank(fid_input_iscd=market)),
-                # 호가잔량 불균형
-                ('momentum', lambda: market_api.get_quote_balance_rank(fid_input_iscd=market)),
-            ]
-            
-            for category, method in screening_approaches:
+            for stock_code, analysis in batch_analysis.items():
                 try:
-                    data = method()
-                    if data is not None and not data.empty:
-                        # 상위 15개씩 추가 분석
-                        for _, row in data.head(15).iterrows():
-                            try:
-                                stock_code = row.get('stck_shrn_iscd', '')
-                                if not stock_code:
-                                    continue
-                                
-                                # 기술적 지표 빠른 검증
-                                technical_check = self._quick_technical_check(stock_code)
-                                if technical_check and technical_check['score'] >= 25:
-                                    candidate = {
-                                        'stock_code': stock_code,
-                                        'technical_score': technical_check['score'],
-                                        'signals': technical_check['signals'],
-                                        'strategy': f'extended_{category}',
-                                        'reason': f"확장스크리닝({technical_check['score']}점)"
-                                    }
-                                    extended_candidates[category].append(candidate)
-                            
-                            except Exception as e:
-                                logger.debug(f"확장 스크리닝 개별 종목 오류: {e}")
-                                continue
-                        
-                        time.sleep(0.1)
+                    change_rate = analysis['change_rate']
+                    volume = analysis['volume']
+                    technical_score = analysis['technical_analysis']['technical_score']
                     
+                    # 기본 종목 정보
+                    base_info = {
+                        'stock_code': stock_code,
+                        'current_price': analysis['current_price'],
+                        'change_rate': change_rate,
+                        'volume': volume,
+                        'technical_score': technical_score,
+                        'signals': analysis['technical_analysis']['signals']
+                    }
+                    
+                    # 🎯 전략별 분류 (중복 허용 - 하나의 종목이 여러 전략에 포함될 수 있음)
+                    
+                    # 갭 트레이딩 (3% 이상 갭 + 기술적 점수 30점 이상)
+                    if abs(change_rate) >= 3.0 and technical_score >= 30:
+                        gap_candidate = {
+                            **base_info,
+                            'gap_rate': change_rate,
+                            'strategy': 'gap_trading',
+                            'reason': f"갭{change_rate:.1f}% + 기술적{technical_score}점"
+                        }
+                        classified['gap'].append(gap_candidate)
+                    
+                    # 거래량 돌파 (2배 이상 거래량 추정 + 기술적 점수 25점 이상)
+                    avg_volume = volume // 2  # 간단한 추정
+                    if volume > avg_volume * 1.5 and technical_score >= 25:
+                        volume_candidate = {
+                            **base_info,
+                            'volume_ratio': volume / max(avg_volume, 1),
+                            'strategy': 'volume_breakout',
+                            'reason': f"거래량{volume:,} + 기술적{technical_score}점"
+                        }
+                        classified['volume'].append(volume_candidate)
+                    
+                    # 모멘텀 (1% 이상 상승 + RSI 적정 + 기술적 점수 20점 이상)
+                    rsi = analysis['technical_analysis'].get('rsi', 50)
+                    if change_rate >= 1.0 and 30 <= rsi <= 70 and technical_score >= 20:
+                        momentum_candidate = {
+                            **base_info,
+                            'momentum_score': technical_score + (change_rate * 5),
+                            'rsi': rsi,
+                            'strategy': 'momentum',
+                            'reason': f"모멘텀{change_rate:.1f}% + RSI{rsi:.0f} + 기술적{technical_score}점"
+                        }
+                        classified['momentum'].append(momentum_candidate)
+                    
+                    # 순수 기술적 (기술적 점수 50점 이상)
+                    if technical_score >= 50:
+                        technical_candidate = {
+                            **base_info,
+                            'strategy': 'technical_priority',
+                            'reason': f"기술적우선{technical_score}점"
+                        }
+                        classified['technical'].append(technical_candidate)
+                
                 except Exception as e:
-                    logger.debug(f"확장 스크리닝 방법 오류: {e}")
+                    logger.debug(f"종목 {stock_code} 분류 오류: {e}")
                     continue
             
-            total_extended = sum(len(v) for v in extended_candidates.values())
-            logger.info(f"🔍 확장 스크리닝 완료: {total_extended}개 추가 후보")
-            
-            return extended_candidates
+            return classified
             
         except Exception as e:
-            logger.error(f"확장 스크리닝 오류: {e}")
-            return {'gap': [], 'volume': [], 'momentum': []}
-
-    def _sort_candidates_by_technical_score(self, candidates: Dict) -> None:
-        """🆕 기술적 지표 점수 기준으로 후보 정렬"""
-        try:
-            for category in candidates:
-                if candidates[category]:
-                    candidates[category].sort(
-                        key=lambda x: x.get('technical_score', 0), 
-                        reverse=True
-                    )
-                    
-                    # 상위 30개로 제한 (너무 많으면 분석 시간 증가)
-                    candidates[category] = candidates[category][:30]
-            
-            logger.info("🎯 후보 정렬 완료: 기술적 점수 기준")
-            
-        except Exception as e:
-            logger.error(f"후보 정렬 오류: {e}")
+            logger.error(f"전략 분류 오류: {e}")
+            return {'gap': [], 'volume': [], 'momentum': [], 'technical': []}
 
     def get_screening_summary(self) -> Dict:
         """스크리닝 요약 정보"""
