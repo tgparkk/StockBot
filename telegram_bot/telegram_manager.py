@@ -797,22 +797,32 @@ class TelegramBot:
             logger.error(f"텔레그램 봇 중지 오류: {e}")
 
     def send_notification_sync(self, message: str):
-        """동기 방식 알림 전송"""
+        """동기 방식 알림 전송 - 스레드 안전"""
         try:
             if not self.application or not self.running:
                 logger.debug("텔레그램 봇이 실행되지 않아 알림을 전송할 수 없습니다")
                 return
 
-            def send_async():
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(self.send_message(message))
-                except Exception as e:
-                    logger.error(f"텔레그램 알림 전송 오류: {e}")
+            # 텔레그램 봇의 이벤트 루프가 실행 중인지 확인
+            if not self.loop or self.loop.is_closed():
+                logger.debug("텔레그램 봇 이벤트 루프가 없어 알림을 전송할 수 없습니다")
+                return
 
-            # 별도 스레드에서 전송 (non-blocking)
-            threading.Thread(target=send_async, daemon=True).start()
+            try:
+                # 스레드 안전한 방식으로 코루틴 실행
+                future = asyncio.run_coroutine_threadsafe(
+                    self.send_message(message),
+                    self.loop
+                )
+
+                # 타임아웃 설정 (3초)
+                future.result(timeout=3.0)
+                logger.debug("텔레그램 알림 전송 성공")
+
+            except asyncio.TimeoutError:
+                logger.warning("텔레그램 알림 전송 타임아웃 (3초)")
+            except Exception as e:
+                logger.error(f"텔레그램 알림 전송 오류: {e}")
 
         except Exception as e:
             logger.error(f"텔레그램 동기 알림 전송 실패: {e}")
@@ -820,6 +830,10 @@ class TelegramBot:
     def send_startup_notification(self):
         """시작 알림 전송"""
         try:
+            # 텔레그램 봇이 완전히 시작될 때까지 대기
+            import time
+            time.sleep(3)  # 3초 대기
+
             startup_msg = (
                 "🚀 StockBot이 시작되었습니다!\n\n"
                 f"시작 시간: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}\n"

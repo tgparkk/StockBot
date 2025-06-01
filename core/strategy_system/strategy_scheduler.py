@@ -55,7 +55,7 @@ class StrategyScheduler:
         # 신호 제한 및 히스토리
         self.last_signals = {}  # 중복 신호 방지용
         self.signal_history = {}  # 신호 히스토리 추적
-        self.signal_cooldown = 300  # 5분 쿨다운 기본값
+        self.signal_cooldown = 120  # 2분 쿨다운 기본값
 
         # 📊 신호 통계
         self.signal_stats = {
@@ -152,7 +152,7 @@ class StrategyScheduler:
         """🌅 첫 번째 시간대 전략 미리 실행 (장외 시간용)"""
         try:
             from datetime import time
-            
+
             # 첫 번째 시간대 설정 (장 시작 전)
             first_slot = TimeSlotConfig(
                 name="pre_market_early",
@@ -168,11 +168,11 @@ class StrategyScheduler:
                     "momentum": 0.4             # 모멘텀 최소
                 }
             )
-            
+
             logger.info(f"🌅 첫 번째 시간대 전략 미리 실행: {first_slot.name}")
             logger.info(f"📋 주요 전략: {list(first_slot.primary_strategies.keys())}")
             logger.info(f"📊 보조 전략: {list(first_slot.secondary_strategies.keys())}")
-            
+
             # 현재 슬롯으로 설정
             self.current_slot = first_slot
 
@@ -181,7 +181,7 @@ class StrategyScheduler:
 
             # 첫 번째 시간대 전략 준비 및 활성화
             await self._prepare_and_activate_strategy(first_slot)
-            
+
             logger.info("✅ 첫 번째 시간대 전략 미리 실행 완료")
 
         except Exception as e:
@@ -252,7 +252,7 @@ class StrategyScheduler:
             # 🎯 1단계: 한 번의 API 호출로 모든 스크리닝 데이터 수집
             logger.info(f"📊 [{slot.name}] 통합 시장 스크리닝 실행 중...")
             all_screening_data = self.trading_api.get_market_screening_candidates("all")
-            
+
             if not all_screening_data:
                 logger.warning(f"⚠️ [{slot.name}] 스크리닝 데이터 없음")
                 return
@@ -263,39 +263,39 @@ class StrategyScheduler:
 
             # 🎯 3단계: 전략별 데이터 분배 및 필터링
             strategy_results = {}
-            
+
             # 기본 전략들에 대한 데이터 분배
             all_strategies = {**slot.primary_strategies, **slot.secondary_strategies}
-            
+
             for strategy_name, weight in all_strategies.items():
                 try:
                     # 시간대별 가중치 조정
                     adjusted_weight = weight * time_based_strategy['multipliers'].get(strategy_name, 1.0)
-                    
+
                     # 전략별 데이터 추출 및 필터링
                     candidates = self._extract_strategy_candidates(
-                        strategy_name, 
-                        all_screening_data, 
+                        strategy_name,
+                        all_screening_data,
                         adjusted_weight,
                         time_based_strategy
                     )
-                    
+
                     if candidates:
                         strategy_results[strategy_name] = candidates
                         stock_codes = [c.stock_code for c in candidates]
                         self.active_stocks[strategy_name] = stock_codes
-                        
+
                         logger.info(f"✅ [{slot.name}] {strategy_name}: {len(candidates)}개 후보 (가중치: {adjusted_weight:.2f})")
-                        
+
                         # 상위 3개 후보 로그
                         for i, candidate in enumerate(candidates[:3]):
                             logger.info(f"   {i+1}. {candidate.stock_code} - {candidate.reason} (점수: {candidate.score:.1f})")
-                        
+
                         # 🆕 데이터베이스에 종목 선정 기록
                         await self._record_selected_stocks(strategy_name, candidates, adjusted_weight)
                     else:
                         logger.warning(f"⚠️ [{slot.name}] {strategy_name}: 후보 없음")
-                        
+
                 except Exception as e:
                     logger.error(f"❌ [{slot.name}] {strategy_name} 전략 처리 오류: {e}")
                     continue
@@ -312,7 +312,7 @@ class StrategyScheduler:
     def _get_time_based_strategy(self, slot: TimeSlotConfig) -> Dict:
         """🕐 시간대별 전략 설정"""
         from datetime import time
-        
+
         # 시간대별 특화 전략 매핑
         time_strategies = {
             # 장 시작 전 (08:30-09:00): 갭 트레이딩 중심
@@ -331,7 +331,7 @@ class StrategyScheduler:
                     "max_candidates_per_strategy": 8
                 }
             },
-            
+
             # 🆕 장외 시간 미리 준비용 (첫 번째 시간대와 동일)
             "pre_market_early": {
                 "times": [(time(0, 0), time(8, 30))],  # 장외 시간 전체
@@ -348,7 +348,7 @@ class StrategyScheduler:
                     "max_candidates_per_strategy": 10  # 후보 수 확대
                 }
             },
-            
+
             # 장 초반 (09:00-10:30): 거래량 돌파 + 모멘텀
             "early_market": {
                 "times": [(time(9, 0), time(10, 30))],
@@ -365,7 +365,7 @@ class StrategyScheduler:
                     "max_candidates_per_strategy": 10
                 }
             },
-            
+
             # 장 중반 (10:30-14:00): 안정적 트렌드 추종
             "mid_market": {
                 "times": [(time(10, 30), time(14, 0))],
@@ -382,7 +382,7 @@ class StrategyScheduler:
                     "max_candidates_per_strategy": 12
                 }
             },
-            
+
             # 장 마감 (14:00-15:30): 마감 효과 + 정리매매
             "late_market": {
                 "times": [(time(14, 0), time(15, 30))],
@@ -400,25 +400,25 @@ class StrategyScheduler:
                 }
             }
         }
-        
+
         # 🆕 슬롯 이름을 기준으로 전략 찾기 (시간보다 우선)
         if slot.name in ["pre_market_early"]:
             strategy_config = time_strategies["pre_market_early"]
             logger.info(f"🕐 시간대 전략 선택: pre_market_early ({strategy_config['focus']})")
             return strategy_config
-        
+
         # 기존 시간 기반 매칭
         current_time = slot.start_time
-        
+
         for strategy_name, strategy_config in time_strategies.items():
             if strategy_name == "pre_market_early":  # 이미 위에서 처리됨
                 continue
-                
+
             for start_time, end_time in strategy_config["times"]:
                 if start_time <= current_time <= end_time:
                     logger.info(f"🕐 시간대 전략 선택: {strategy_name} ({strategy_config['focus']})")
                     return strategy_config
-        
+
         # 기본 전략 (장외 시간) - 첫 번째 시간대와 유사하게
         logger.info("🕐 기본 전략 적용 (장외 시간)")
         return {
@@ -436,7 +436,7 @@ class StrategyScheduler:
             }
         }
 
-    def _extract_strategy_candidates(self, strategy_name: str, all_data: Dict, 
+    def _extract_strategy_candidates(self, strategy_name: str, all_data: Dict,
                                    weight: float, time_strategy: Dict) -> List:
         """전략별 후보 추출 및 필터링"""
         try:
@@ -452,24 +452,24 @@ class StrategyScheduler:
             else:
                 logger.warning(f"알 수 없는 전략: {strategy_name}")
                 return []
-            
+
             if not raw_candidates:
                 return []
-            
+
             # StockCandidate 객체로 변환
             candidates = []
             max_candidates = time_strategy['filters'].get('max_candidates_per_strategy', 10)
-            
+
             for i, candidate_data in enumerate(raw_candidates[:max_candidates]):
                 try:
                     # 시간대별 필터 적용
                     if not self._passes_time_based_filter(candidate_data, time_strategy, strategy_name):
                         continue
-                    
+
                     # StockCandidate 객체 생성
                     from .stock_discovery import StockCandidate
                     from datetime import datetime
-                    
+
                     candidate = StockCandidate(
                         stock_code=candidate_data.get('stock_code', ''),
                         strategy_type=strategy_name,
@@ -478,17 +478,17 @@ class StrategyScheduler:
                         discovered_at=datetime.now(),
                         data=candidate_data
                     )
-                    
+
                     candidates.append(candidate)
-                    
+
                 except Exception as e:
                     logger.debug(f"후보 변환 오류 ({strategy_name}): {e}")
                     continue
-            
+
             # 점수순 정렬
             candidates.sort(key=lambda x: x.score, reverse=True)
             return candidates
-            
+
         except Exception as e:
             logger.error(f"전략 후보 추출 오류 ({strategy_name}): {e}")
             return []
@@ -497,63 +497,63 @@ class StrategyScheduler:
         """시간대별 필터 통과 여부 확인"""
         try:
             filters = time_strategy.get('filters', {})
-            
+
             # 갭 트레이딩 필터
             if strategy_name == "gap_trading":
                 min_gap_rate = filters.get('min_gap_rate', 0)
                 gap_rate = abs(candidate_data.get('gap_rate', 0))
                 if gap_rate < min_gap_rate:
                     return False
-            
+
             # 거래량 돌파 필터
             elif strategy_name == "volume_breakout":
                 min_volume_ratio = filters.get('min_volume_ratio', 0)
                 volume_ratio = candidate_data.get('volume_ratio', 0)
                 if volume_ratio < min_volume_ratio:
                     return False
-            
+
             # 모멘텀 필터
             elif strategy_name == "momentum":
                 min_momentum_score = filters.get('min_momentum_score', 0)
                 momentum_score = candidate_data.get('score', 0)
                 if momentum_score < min_momentum_score:
                     return False
-            
+
             # 기술적 지표 필터
             elif strategy_name == "technical_screening":
                 min_technical_score = filters.get('min_technical_score', 0)
                 technical_score = candidate_data.get('technical_score', 0)
                 if technical_score < min_technical_score:
                     return False
-            
+
             return True
-            
+
         except Exception as e:
             logger.debug(f"시간대별 필터 오류: {e}")
             return True  # 오류시 통과
 
-    async def _discover_time_specific_opportunities(self, slot: TimeSlotConfig, 
+    async def _discover_time_specific_opportunities(self, slot: TimeSlotConfig,
                                                    all_data: Dict, time_strategy: Dict):
         """🎯 시간대별 특화 기회 발굴"""
         try:
             focus = time_strategy.get('focus', '')
-            
+
             # 장 시작 전: 해외 시장 갭 분석
             if "갭 분석" in focus:
                 await self._analyze_overnight_gaps(all_data)
-            
+
             # 장 초반: 신규 상한가 후보
             elif "초기 모멘텀" in focus:
                 await self._find_early_momentum_stocks(all_data)
-            
+
             # 장 중반: 트렌드 지속성 분석
             elif "안정적 트렌드" in focus:
                 await self._analyze_trend_continuation(all_data)
-            
+
             # 장 마감: 마감 급등 후보
             elif "마감 효과" in focus:
                 await self._find_closing_opportunities(all_data)
-                
+
         except Exception as e:
             logger.error(f"시간대별 특화 기회 발굴 오류: {e}")
 
@@ -828,7 +828,7 @@ class StrategyScheduler:
 
                 # 🆕 신호 생성 모드에 따른 처리
                 signal = None
-                
+
                 # advanced 모드만 사용 (가장 포괄적이고 완성도 높음)
                 signal = self._generate_advanced_signal(strategy_name, stock_code, data)
 
@@ -838,10 +838,10 @@ class StrategyScheduler:
                     logger.info(f"   📊 신뢰도: {signal.confidence:.2f}, 강도: {signal.strength:.2f}")
                     logger.info(f"   💰 목표가: {signal.target_price:,}원, 손절가: {signal.stop_loss:,}원")
                     logger.info(f"   📈 리스크수익비: {signal.risk_reward:.1f}:1, 포지션: {signal.position_size:.1%}")
-                    
+
                     if signal.warnings:
                         logger.warning(f"   ⚠️ 주의사항: {', '.join(signal.warnings)}")
-                    
+
                     # 고도화된 신호를 기존 형식으로 변환
                     converted_signal = {
                         'stock_code': signal.stock_code,
@@ -952,8 +952,8 @@ class StrategyScheduler:
                     # 🆕 2. 같은 전략 신호 중복 체크 (30초)
                     last_signal_time = history.get('last_signal_time', 0)
                     last_strategy = history.get('strategy', '')
-                    
-                    if (strategy_name == last_strategy and 
+
+                    if (strategy_name == last_strategy and
                         current_time - last_signal_time < 30):
                         elapsed = int(current_time - last_signal_time)
                         logger.debug(f"🔄 {stock_code} 같은전략({strategy_name}) 30초 제한 (경과: {elapsed}초)")
@@ -967,7 +967,7 @@ class StrategyScheduler:
 
                     # 🆕 4. 같은 신호 타입 중복 체크 (60초)
                     last_signal_type = history.get('last_signal_type', '')
-                    if (last_signal_type == 'BUY' and 
+                    if (last_signal_type == 'BUY' and
                         current_time - last_signal_time < 60):
                         elapsed = int(current_time - last_signal_time)
                         logger.debug(f"📈 {stock_code} 매수신호 60초 제한 (경과: {elapsed}초)")
@@ -1082,8 +1082,8 @@ class StrategyScheduler:
                     # 🆕 2. 같은 전략 신호 중복 체크 (30초)
                     last_signal_time = history.get('last_signal_time', 0)
                     last_strategy = history.get('strategy', '')
-                    
-                    if (strategy_name == last_strategy and 
+
+                    if (strategy_name == last_strategy and
                         current_time - last_signal_time < 30):
                         elapsed = int(current_time - last_signal_time)
                         logger.debug(f"🔄 {stock_code} 같은전략({strategy_name}) 30초 제한 (경과: {elapsed}초)")
@@ -1097,7 +1097,7 @@ class StrategyScheduler:
 
                     # 🆕 4. 같은 신호 타입 중복 체크 (60초)
                     last_signal_type = history.get('last_signal_type', '')
-                    if (last_signal_type == 'BUY' and 
+                    if (last_signal_type == 'BUY' and
                         current_time - last_signal_time < 60):
                         elapsed = int(current_time - last_signal_time)
                         logger.debug(f"📈 {stock_code} 매수신호 60초 제한 (경과: {elapsed}초)")
@@ -1198,11 +1198,11 @@ class StrategyScheduler:
         try:
             # 고도화된 신호 생성기 사용
             logger.debug(f"🔬 고도화 신호 분석 시작: {stock_code} ({strategy_name})")
-            
+
             advanced_signal = self.advanced_signal_generator.generate_advanced_signal(
                 strategy_name, stock_code, data
             )
-            
+
             if advanced_signal:
                 logger.info(f"✅ 고도화 신호 생성 성공: {stock_code}")
                 logger.info(f"   📈 RSI: {advanced_signal.technical_analysis.rsi:.1f} ({advanced_signal.technical_analysis.rsi_signal})")
@@ -1210,12 +1210,12 @@ class StrategyScheduler:
                 logger.info(f"   📉 이평선: {advanced_signal.technical_analysis.ma_signal}")
                 logger.info(f"   📦 거래량: {advanced_signal.volume_profile.volume_ratio:.1f}x ({advanced_signal.volume_profile.volume_trend})")
                 logger.info(f"   🎯 포지션사이즈: {advanced_signal.position_size:.1%}")
-                
+
                 return advanced_signal
             else:
                 logger.debug(f"❌ 고도화 신호 조건 미달: {stock_code}")
                 return None
-                
+
         except Exception as e:
             logger.error(f"고도화 신호 생성 오류 ({stock_code}): {e}")
             return None
@@ -1229,18 +1229,18 @@ class StrategyScheduler:
                 'signal_history_count': len(self.signal_history),
                 'strategies': {}
             }
-            
+
             # 전략별 통계
             for strategy_name, stock_codes in self.active_stocks.items():
-                strategy_signals = sum(1 for hist in self.signal_history.values() 
+                strategy_signals = sum(1 for hist in self.signal_history.values()
                                      if hist.get('strategy') == strategy_name)
                 stats['strategies'][strategy_name] = {
                     'active_stocks': len(stock_codes),
                     'signals_generated': strategy_signals
                 }
-            
+
             return stats
-            
+
         except Exception as e:
             logger.error(f"신호 통계 조회 오류: {e}")
             return {'error': str(e)}
@@ -1251,7 +1251,7 @@ class StrategyScheduler:
         try:
             stock_codes = self.active_stocks.get(strategy_name, [])
             prices = {}
-            
+
             for stock_code in stock_codes:
                 try:
                     # data_manager에서 최신 데이터 조회
@@ -1265,14 +1265,14 @@ class StrategyScheduler:
                         }
                 except Exception as e:
                     logger.error(f"가격 조회 오류 ({stock_code}): {e}")
-                    
+
             return {
                 'strategy': strategy_name,
                 'stock_count': len(stock_codes),
                 'prices': prices,
                 'last_updated': time_module.time()
             }
-            
+
         except Exception as e:
             logger.error(f"전략별 가격 조회 오류: {e}")
             return {}
@@ -1286,17 +1286,17 @@ class StrategyScheduler:
                 'data_manager_status': self.data_manager.get_status() if self.data_manager else {},
                 'last_updated': time_module.time()
             }
-            
+
             for strategy_name in self.active_stocks.keys():
                 strategy_data = self.get_current_prices_for_strategy(strategy_name)
                 summary['strategies'][strategy_name] = {
                     'stock_count': strategy_data.get('stock_count', 0),
-                    'updated_stocks': len([p for p in strategy_data.get('prices', {}).values() 
+                    'updated_stocks': len([p for p in strategy_data.get('prices', {}).values()
                                          if p.get('current_price', 0) > 0])
                 }
-            
+
             return summary
-            
+
         except Exception as e:
             logger.error(f"실시간 데이터 요약 오류: {e}")
             return {'error': str(e)}
