@@ -144,8 +144,10 @@ class StockBot:
             return None
 
         try:
-            telegram_bot = TelegramBotClass(stock_bot_instance=self)  # 🆕 명시적 파라미터 전달
-            telegram_bot.set_main_bot_reference(self)
+            # 올바른 매개변수로 텔레그램 봇 초기화
+            telegram_bot = TelegramBotClass(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+            # StockBot 인스턴스 설정
+            telegram_bot.set_stock_bot(self)
             logger.info("✅ 텔레그램 봇 초기화 완료")
             return telegram_bot
         except Exception as e:
@@ -734,6 +736,41 @@ class StockBot:
         except Exception as e:
             logger.error(f"시스템 상태 조회 오류: {e}")
             return {'error': str(e)}
+
+    def get_status(self) -> dict:
+        """텔레그램 봇용 상태 조회 (별칭)"""
+        try:
+            system_status = self.get_system_status()
+
+            # 스케줄러 상태 추가
+            scheduler_status = {}
+            if hasattr(self.strategy_scheduler, 'get_status'):
+                scheduler_status = self.strategy_scheduler.get_status()
+
+            return {
+                'bot_running': self.is_running,
+                'websocket_connected': system_status.get('websocket_connected', False),
+                'api_connected': True,  # REST API는 항상 사용 가능하다고 가정
+                'data_collector_running': True,
+                'scheduler': scheduler_status,
+                'uptime': system_status.get('uptime', 0),
+                'stats': system_status.get('stats', {}),
+                'positions_count': system_status.get('positions', 0)
+            }
+        except Exception as e:
+            logger.error(f"상태 조회 오류: {e}")
+            return {
+                'bot_running': self.is_running,
+                'websocket_connected': False,
+                'api_connected': False,
+                'data_collector_running': False,
+                'error': str(e)
+            }
+
+    def shutdown(self):
+        """시스템 종료 (텔레그램 봇용)"""
+        logger.info("🛑 텔레그램 봇에서 종료 요청")
+        self.stop()
 
     def _start_telegram_bot(self):
         """텔레그램 봇 시작"""
