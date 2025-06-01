@@ -17,10 +17,10 @@ class TradeConfig:
     """💰 거래 설정 - 여기서 매수 금액을 조정하세요!"""
 
     # 🎯 기본 매수 금액 설정 (가장 중요!)
-    base_position_ratio: float = 0.1          # 기본 10%: 계좌 잔고의 10%씩 매수
+    base_position_ratio: float = 0.2          # 기본 20%: 계좌 잔고의 20%씩 매수
     max_position_ratio: float = 0.50          # 최대 50%: 계좌 잔고의 50%를 넘지 않음
     max_investment_amount: int = 2000000      # 최대 200만원: 절대 한도액 (수정 가능)
-    min_investment_amount: int = 300000       # 최소 20만원: 최소 투자금액 (수정 가능)
+    min_investment_amount: int = 300000       # 최소 30만원: 최소 투자금액 (수정 가능)
 
     # 💡 예시: 계좌에 1000만원이 있다면
     # - 기본 매수: 60만원 (6%)
