@@ -40,6 +40,9 @@ class KISWebSocketMessageHandler:
                  subscription_manager: "KISWebSocketSubscriptionManager"):
         self.data_parser = data_parser
         self.subscription_manager = subscription_manager
+        
+        # 🆕 체결통보 직접 처리를 위한 OrderExecutionManager
+        self.execution_manager = None
 
         # 통계
         self.stats = {
@@ -50,8 +53,13 @@ class KISWebSocketMessageHandler:
             'errors': 0
         }
 
+    def set_execution_manager(self, execution_manager):
+        """🎯 OrderExecutionManager 설정"""
+        self.execution_manager = execution_manager
+        logger.info("✅ OrderExecutionManager 설정 완료 - 직접 체결통보 처리 가능")
+
     async def handle_realtime_data(self, data: str):
-        """실시간 데이터 처리"""
+        """실시간 데이터 처리 - 🎯 KIS 공식 문서 기준 개선"""
         try:
             # 🔧 디버그: 실시간 데이터 수신 확인
             logger.info(f"🔔 실시간 데이터 수신: {data[:100]}...")  # 첫 100자만 로그
@@ -61,40 +69,85 @@ class KISWebSocketMessageHandler:
                 logger.debug(f"⚠️ 데이터 파트 수 부족: {len(parts)}")
                 return
 
+            # 🎯 KIS 공식 구조: 암호화유무|TR_ID|데이터건수|응답데이터
+            encryption_flag = parts[0]  # 0: 암호화없음, 1: 암호화됨
             tr_id = parts[1]
+            data_count = parts[2] if len(parts) > 2 else "001"  # 데이터 건수
             raw_data = parts[3]
 
-            logger.info(f"📋 TR_ID: {tr_id}, 데이터 길이: {len(raw_data)}")
+            logger.info(f"📋 TR_ID: {tr_id}, 암호화: {encryption_flag}, 데이터건수: {data_count}, 길이: {len(raw_data)}")
 
             if tr_id == KIS_WSReq.CONTRACT.value:
                 # 실시간 체결
-                logger.info(f"📈 실시간 체결 데이터 처리: {tr_id}")
-                parsed_data = self.data_parser.parse_contract_data(raw_data)
+                logger.info(f"📈 실시간 체결 데이터 처리: {tr_id} ({data_count}건)")
+                
+                # 🔍 암호화 여부 확인
+                is_encrypted = encryption_flag == '1'
+                
+                if is_encrypted:
+                    # 암호화된 경우 복호화 필요
+                    decrypted_data = self.data_parser.decrypt_notice_data(raw_data)
+                    if decrypted_data:
+                        parsed_data = self.data_parser.parse_contract_data(decrypted_data)
+                        logger.debug(f"🔓 체결 데이터 복호화 성공: {len(decrypted_data)}자")
+                    else:
+                        logger.warning("❌ 체결 데이터 복호화 실패")
+                        parsed_data = None
+                else:
+                    # 암호화되지 않은 경우 직접 파싱
+                    parsed_data = self.data_parser.parse_contract_data(raw_data)
+                
                 if parsed_data:
                     stock_code = parsed_data['stock_code']
-                    logger.info(f"✅ 체결 데이터 파싱 성공: {stock_code}")
+                    total_records = parsed_data.get('total_data_count', 1)
+                    logger.info(f"✅ 체결 데이터 파싱 성공: {stock_code} "
+                               f"(암호화: {'예' if is_encrypted else '아니오'}, "
+                               f"처리건수: {total_records}건)")
                     await self._execute_callbacks(DataType.STOCK_PRICE.value, parsed_data)
                 else:
                     logger.warning("❌ 체결 데이터 파싱 실패")
 
             elif tr_id == KIS_WSReq.BID_ASK.value:
                 # 실시간 호가
-                logger.info(f"📊 실시간 호가 데이터 처리: {tr_id}")
-                parsed_data = self.data_parser.parse_bid_ask_data(raw_data)
+                logger.info(f"📊 실시간 호가 데이터 처리: {tr_id} ({data_count}건)")
+                
+                # 🔍 암호화 여부 확인
+                is_encrypted = encryption_flag == '1'
+                
+                if is_encrypted:
+                    # 암호화된 경우 복호화 필요
+                    decrypted_data = self.data_parser.decrypt_notice_data(raw_data)
+                    if decrypted_data:
+                        parsed_data = self.data_parser.parse_bid_ask_data(decrypted_data)
+                        logger.debug(f"🔓 호가 데이터 복호화 성공: {len(decrypted_data)}자")
+                    else:
+                        logger.warning("❌ 호가 데이터 복호화 실패")
+                        parsed_data = None
+                else:
+                    # 암호화되지 않은 경우 직접 파싱
+                    parsed_data = self.data_parser.parse_bid_ask_data(raw_data)
+                
                 if parsed_data:
                     stock_code = parsed_data['stock_code']
-                    logger.info(f"✅ 호가 데이터 파싱 성공: {stock_code}")
+                    logger.info(f"✅ 호가 데이터 파싱 성공: {stock_code} "
+                               f"(암호화: {'예' if is_encrypted else '아니오'})")
                     await self._execute_callbacks(DataType.STOCK_ORDERBOOK.value, parsed_data)
                 else:
                     logger.warning("❌ 호가 데이터 파싱 실패")
 
             elif tr_id in [KIS_WSReq.NOTICE.value, KIS_WSReq.NOTICE_DEMO.value]:
                 # 체결통보 (실전투자는 NOTICE만 사용)
-                logger.info(f"📢 체결통보 처리: {tr_id}")
+                logger.info(f"📢 체결통보 처리: {tr_id} ({data_count}건)")
                 if tr_id == KIS_WSReq.NOTICE.value:
+                    # 🔍 체결통보는 항상 암호화됨
                     decrypted_data = self.data_parser.decrypt_notice_data(raw_data)
                     if decrypted_data:
-                        logger.info(f"체결통보 수신: {decrypted_data}")
+                        logger.info(f"✅ 체결통보 수신: {decrypted_data[:100]}...")
+                        
+                        # 🆕 직접 OrderExecutionManager 호출
+                        await self._handle_execution_notice_direct(decrypted_data)
+                        
+                        # 기존 콜백 시스템도 유지 (다른 용도)
                         await self._execute_callbacks(DataType.STOCK_EXECUTION.value,
                                                     {'data': decrypted_data, 'timestamp': datetime.now()})
                     else:
@@ -125,12 +178,12 @@ class KISWebSocketMessageHandler:
             tr_id = json_data.get('header', {}).get('tr_id', '')
 
             if tr_id == "PINGPONG":
-                # 🆕 공식 샘플에 맞춘 PING/PONG 응답 처리
-                logger.debug(f"### RECV [PINGPONG] [{data}]")
+                # 🎯 KIS PINGPONG 처리 (JSON 메시지)
+                logger.debug(f"### RECV [PINGPONG] [{data[:100]}...]")
                 self.stats['ping_pong_count'] = self.stats.get('ping_pong_count', 0) + 1
                 self.stats['last_ping_pong_time'] = datetime.now()
 
-                # 🆕 PONG 응답은 connection에서 직접 처리하도록 반환 (pong 메서드 사용)
+                # 🎯 동일한 PINGPONG 메시지를 그대로 반환 (KIS 방식)
                 return 'PINGPONG', data
             else:
                 body = json_data.get('body', {})
@@ -186,16 +239,16 @@ class KISWebSocketMessageHandler:
             self.stats['errors'] += 1
 
     async def _execute_callbacks(self, data_type: str, data: Dict):
-        """콜백 함수들 실행"""
+        """콜백 함수들 실행 - 🆕 data_type 정보 전달"""
         try:
             # 글로벌 콜백 실행
             global_callbacks = self.subscription_manager.get_global_callbacks(data_type)
             for callback in global_callbacks:
                 try:
                     if asyncio.iscoroutinefunction(callback):
-                        await callback(data)
+                        await callback(data_type, data)  # 🆕 data_type 추가
                     else:
-                        callback(data)
+                        callback(data_type, data)  # 🆕 data_type 추가
                 except Exception as e:
                     logger.error(f"글로벌 콜백 실행 오류 ({data_type}): {e}")
 
@@ -206,9 +259,9 @@ class KISWebSocketMessageHandler:
                 for callback in stock_callbacks:
                     try:
                         if asyncio.iscoroutinefunction(callback):
-                            await callback(stock_code, data)
+                            await callback(data_type, stock_code, data)  # 🆕 data_type 추가
                         else:
-                            callback(stock_code, data)
+                            callback(data_type, stock_code, data)  # 🆕 data_type 추가
                     except Exception as e:
                         logger.error(f"종목별 콜백 실행 오류 ({stock_code}): {e}")
 
@@ -218,3 +271,40 @@ class KISWebSocketMessageHandler:
     def get_stats(self) -> Dict:
         """메시지 처리 통계 반환"""
         return self.stats.copy()
+
+    async def _handle_execution_notice_direct(self, decrypted_data: str):
+        """🎯 체결통보 직접 처리 - OrderExecutionManager 연동"""
+        try:
+            # 🔍 OrderExecutionManager 찾기
+            execution_manager = self._find_execution_manager()
+            if not execution_manager:
+                logger.warning("⚠️ OrderExecutionManager를 찾을 수 없음 - 체결통보 처리 불가")
+                return
+            
+            # 🎯 체결통보 데이터 구조 생성
+            notice_data = {
+                'data': decrypted_data,  # KIS에서 복호화된 '^' 구분 데이터
+                'timestamp': datetime.now(),
+                'source': 'kis_websocket_direct'
+            }
+            
+            # 🚀 OrderExecutionManager로 직접 전달
+            logger.info(f"🎯 체결통보 직접 처리: {decrypted_data[:100]}...")
+            await execution_manager.handle_execution_notice(notice_data)
+            
+        except Exception as e:
+            logger.error(f"❌ 체결통보 직접 처리 오류: {e}")
+    
+    def _find_execution_manager(self):
+        """OrderExecutionManager 인스턴스 찾기"""
+        try:
+            # 🎯 직접 설정된 execution_manager 사용
+            if self.execution_manager and hasattr(self.execution_manager, 'handle_execution_notice'):
+                return self.execution_manager
+            
+            logger.debug("💡 OrderExecutionManager가 설정되지 않음 - 콜백 시스템 사용")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ OrderExecutionManager 검색 오류: {e}")
+            return None

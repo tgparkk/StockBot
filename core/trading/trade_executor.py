@@ -7,7 +7,10 @@ import threading
 from typing import Dict, List, Optional, Any
 from utils.logger import setup_logger
 from ..api.kis_market_api import get_disparity_rank, get_multi_period_disparity
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+from .async_data_logger import get_async_logger, log_signal_failed, log_buy_failed, log_buy_success
+from .order_execution_manager import OrderExecutionManager
 
 logger = setup_logger(__name__)
 
@@ -77,6 +80,7 @@ class TradeResult:
     total_amount: int
     order_no: str = ""
     error_message: str = ""
+    is_pending: bool = False  # 🆕 웹소켓 NOTICE 대기 중인지 여부
 
     @property
     def is_buy(self) -> bool:
@@ -101,74 +105,176 @@ class TradeExecutor:
         # 중복 주문 방지
         self.pending_orders = set()
 
-        logger.info("✅ TradeExecutor 초기화 완료")
+        # 🆕 비동기 데이터 로거 초기화
+        self.async_logger = get_async_logger()
+        
+        # 🆕 웹소켓 NOTICE 기반 주문 실행 관리자
+        self.execution_manager = OrderExecutionManager(
+            position_manager=position_manager,
+            trade_db=trade_db,
+            async_logger=self.async_logger
+        )
+        
+        # 웹소켓 NOTICE 콜백 등록
+        self._register_websocket_callbacks()
+        
+        # 중복 신호 방지
+        self.last_signals = {}
+        self.signal_cooldown = 300  # 5분
+        
+        logger.info("✅ TradeExecutor 초기화 완료 (실전투자 체결통보 연동)")
+
+    def _register_websocket_callbacks(self):
+        """🔔 WebSocketMessageHandler에 OrderExecutionManager 직접 설정"""
+        try:
+            # 데이터 매니저의 웹소켓 매니저 확인
+            if (hasattr(self.data_manager, 'websocket_manager') and 
+                self.data_manager.websocket_manager):
+                
+                websocket_manager = self.data_manager.websocket_manager
+                
+                # 🎯 WebSocketMessageHandler에 OrderExecutionManager 직접 설정
+                if hasattr(websocket_manager, 'message_handler'):
+                    message_handler = websocket_manager.message_handler
+                    if hasattr(message_handler, 'set_execution_manager'):
+                        message_handler.set_execution_manager(self.execution_manager)
+                        logger.info("✅ WebSocketMessageHandler에 OrderExecutionManager 설정 완료")
+                        logger.info("📡 체결통보는 WebSocketMessageHandler에서 직접 처리됨")
+                        return
+                    else:
+                        logger.warning("⚠️ WebSocketMessageHandler에 set_execution_manager 메서드 없음")
+                else:
+                    logger.warning("⚠️ WebSocketManager에 message_handler 속성 없음")
+                
+                # 🔄 기존 콜백 시스템 사용 (fallback)
+                logger.info("💡 기존 콜백 시스템을 fallback으로 사용")
+                
+                # 🎯 체결통보 처리 함수
+                async def handle_execution_notice(data_type: str, data: Dict):
+                    """체결통보 데이터 처리 - 🆕 data_type 포함 글로벌 콜백 시그니처"""
+                    try:
+                        # 🔍 체결통보 데이터만 처리
+                        if data_type != 'STOCK_EXECUTION':
+                            logger.debug(f"🔄 체결통보가 아닌 데이터 무시: {data_type}")
+                            return
+                        
+                        logger.info(f"🔔 체결통보 수신 (fallback): data_type={data_type}")
+                        
+                        # OrderExecutionManager로 전달
+                        await self.execution_manager.handle_execution_notice(data)
+                        
+                    except Exception as e:
+                        logger.error(f"❌ 체결통보 처리 오류: {e}")
+                
+                # 기존 콜백 시스템에 등록
+                if hasattr(websocket_manager, 'add_global_callback'):
+                    websocket_manager.add_global_callback('STOCK_EXECUTION', handle_execution_notice)
+                    logger.info("✅ 체결통보 콜백 등록 완료 (fallback)")
+                else:
+                    logger.warning("⚠️ 웹소켓 매니저에 add_global_callback 메서드 없음")
+                
+            else:
+                logger.warning("⚠️ 웹소켓 매니저가 없어 체결통보 처리 설정 실패")
+                logger.info("💡 힌트: DataManager에 KisWebSocketManager 인스턴스가 필요합니다")
+                
+        except Exception as e:
+            logger.error(f"❌ 웹소켓 콜백 등록 오류: {e}")
 
     def execute_buy_signal(self, signal: Dict) -> TradeResult:
-        """매수 신호 실행"""
+        """매수 신호 실행 - 🆕 웹소켓 NOTICE 기반으로 개선"""
+        stock_code = signal.get('stock_code', '')
+        strategy = signal.get('strategy', 'unknown')
+        signal_strength = signal.get('strength', 0.0)
+        
+        # 🆕 매수 시도 시작 로깅
+        attempt_start_time = time.time()
+        validation_details = {}
+        
         try:
-            stock_code = signal['stock_code']
-            strategy = signal['strategy']
-            strength = signal.get('strength', 0.5)
+            logger.info(f"📈 매수 신호 처리 시작: {stock_code} (전략: {strategy}, 강도: {signal_strength:.2f})")
 
-            logger.info(f"🛒 매수 신호 처리 시작: {stock_code} (전략: {strategy}, 강도: {strength:.2f})")
-
-            # 1. 기본 검증
+            # 1. 기본 신호 검증
             validation_result = self._validate_buy_signal_enhanced(signal, stock_code)
+            validation_details['enhanced_validation'] = validation_result
+            
             if not validation_result:
-                error_msg = f"매수 신호 검증 실패: {stock_code}"
-                logger.warning(f"❌ {error_msg}")
+                reason = "강화된 매수 검증 실패"
+                # 🆕 매수 실패 로깅
+                log_buy_failed(
+                    stock_code=stock_code,
+                    reason=reason,
+                    signal_data=signal,
+                    validation_details=validation_details
+                )
                 return TradeResult(
                     success=False,
                     stock_code=stock_code,
                     order_type='BUY',
                     quantity=0,
-                    price=0,
+                    price=signal.get('price', 0),
                     total_amount=0,
-                    error_message=error_msg
+                    error_message=reason
                 )
 
-            # 2. 현재가 조회
-            current_price = self._get_current_price(stock_code)
+            # 2. 잔고 확인
+            balance = self.trading_manager.get_balance()
+            available_cash = balance.get('available_cash', 0)
+            validation_details['available_cash'] = available_cash
+            
+            if available_cash < self.config.min_investment_amount:
+                reason = f"잔고 부족: {available_cash:,}원 < {self.config.min_investment_amount:,}원"
+                # 🆕 매수 실패 로깅
+                log_buy_failed(
+                    stock_code=stock_code,
+                    reason=reason,
+                    signal_data=signal,
+                    validation_details=validation_details
+                )
+                return TradeResult(
+                    success=False,
+                    stock_code=stock_code,
+                    order_type='BUY',
+                    quantity=0,
+                    price=signal.get('price', 0),
+                    total_amount=0,
+                    error_message=reason
+                )
+
+            # 3. 매수 가격 및 수량 계산
+            current_price = signal.get('price', 0)
             if current_price <= 0:
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='BUY',
-                    quantity=0,
-                    price=0,
-                    total_amount=0,
-                    error_message=f"현재가 조회 실패: {current_price}"
-                )
+                reason = "유효하지 않은 가격"
+                log_buy_failed(stock_code, reason, signal, validation_details)
+                return TradeResult(False, stock_code, 'BUY', 0, 0, 0, reason)
 
-            # 3. 매수가 계산
-            buy_price = self._calculate_buy_price(current_price, strategy)
-
-            # 4. 매수 수량 계산
-            available_cash = self._get_available_cash()
+            # 호가 단위로 조정된 매수 가격
+            buy_price = self._adjust_to_tick_size(current_price)
+            validation_details['buy_price'] = buy_price
+            
+            # 매수 수량 계산
             quantity = self._calculate_buy_quantity(
-                current_price=current_price,
-                buy_price=buy_price,
-                available_cash=available_cash,
-                strategy=strategy,
-                strength=strength
+                current_price, buy_price, available_cash, strategy, signal_strength
             )
-
+            validation_details['calculated_quantity'] = quantity
+            
             if quantity <= 0:
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='BUY',
-                    quantity=0,
-                    price=buy_price,
-                    total_amount=0,
-                    error_message=f"매수 수량 부족: 현재가={current_price:,}원, 매수가={buy_price:,}원, 예산={available_cash:,}원"
-                )
+                reason = "매수 수량 부족"
+                log_buy_failed(stock_code, reason, signal, validation_details)
+                return TradeResult(False, stock_code, 'BUY', 0, buy_price, 0, reason)
+
+            total_amount = quantity * buy_price
+            validation_details['total_amount'] = total_amount
+
+            # 4. 최종 잔고 재확인
+            if total_amount > available_cash:
+                reason = f"총 매수금액 초과: {total_amount:,}원 > {available_cash:,}원"
+                log_buy_failed(stock_code, reason, signal, validation_details)
+                return TradeResult(False, stock_code, 'BUY', quantity, buy_price, total_amount, reason)
 
             # 5. 실제 매수 주문 실행
-            total_amount = quantity * buy_price
-            logger.info(f"🛒 매수 주문 실행: {stock_code} {quantity:,}주 @ {buy_price:,}원 (전략: {strategy})")
-
-            order_result = self.trading_manager.execute_order(
+            logger.info(f"💰 매수 주문 실행: {stock_code} {quantity:,}주 @{buy_price:,}원 (총 {total_amount:,}원)")
+            
+            buy_result = self.trading_manager.execute_order(
                 stock_code=stock_code,
                 order_type="BUY",
                 quantity=quantity,
@@ -176,59 +282,111 @@ class TradeExecutor:
                 strategy_type=strategy
             )
 
-            logger.debug(f"💰 매수 주문 결과: {order_result} (타입: {type(order_result)})")
-
-            if order_result:  # 주문번호가 반환되면 성공
-                # 6. 거래 기록 저장
-                order_result_dict = {'order_no': order_result, 'status': 'success'}
-                self._record_buy_trade(stock_code, quantity, buy_price, strategy, signal, order_result_dict)
-
-                # 7. 포지션 추가
-                self.position_manager.add_position(
-                    stock_code=stock_code,
-                    quantity=quantity,
-                    buy_price=buy_price,
-                    strategy_type=strategy
-                )
-
-                logger.info(f"✅ 매수 주문 완료: {stock_code} {quantity:,}주 @ {buy_price:,}원 (총 {total_amount:,}원)")
-
-                return TradeResult(
-                    success=True,
-                    stock_code=stock_code,
-                    order_type='BUY',
-                    quantity=quantity,
-                    price=buy_price,
-                    total_amount=total_amount,
-                    order_no=order_result
-                )
+            if buy_result and buy_result.get('success', False):
+                order_id = buy_result.get('order_id', '')
+                
+                # 🆕 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 주문 등록
+                if order_id:
+                    success = self.execution_manager.add_pending_order(
+                        order_id=order_id,
+                        stock_code=stock_code,
+                        order_type='BUY',
+                        quantity=quantity,
+                        price=buy_price,
+                        strategy_type=strategy
+                    )
+                    
+                    if success:
+                        logger.info(f"✅ 매수 주문 전송 성공 - 웹소켓 NOTICE 대기 중: {stock_code} (주문ID: {order_id})")
+                        return TradeResult(
+                            success=True,
+                            stock_code=stock_code,
+                            order_type='BUY',
+                            quantity=quantity,
+                            price=buy_price,
+                            total_amount=total_amount,
+                            order_no=order_id,
+                            is_pending=True  # 🆕 웹소켓 NOTICE 대기 중
+                        )
+                    else:
+                        reason = "주문 대기 등록 실패"
+                        log_buy_failed(stock_code, reason, signal, validation_details)
+                        return TradeResult(False, stock_code, 'BUY', quantity, buy_price, total_amount, reason)
+                else:
+                    # 🚨 주문ID가 없는 경우도 체결통보를 기다려야 함
+                    logger.warning(f"⚠️ 주문ID 없음 - 체결통보 기반 처리 불가: {stock_code}")
+                    
+                    # 🆕 임시 주문ID 생성하여 대기 목록에 추가
+                    temp_order_id = f"TEMP_{stock_code}_{int(time.time())}"
+                    
+                    success = self.execution_manager.add_pending_order(
+                        order_id=temp_order_id,
+                        stock_code=stock_code,
+                        order_type='BUY',
+                        quantity=quantity,
+                        price=buy_price,
+                        strategy_type=strategy
+                    )
+                    
+                    if success:
+                        logger.info(f"⏳ 임시 주문ID로 체결통보 대기: {stock_code} (임시ID: {temp_order_id})")
+                        return TradeResult(
+                            success=True,
+                            stock_code=stock_code,
+                            order_type='BUY',
+                            quantity=quantity,
+                            price=buy_price,
+                            total_amount=total_amount,
+                            order_no=temp_order_id,
+                            is_pending=True  # 체결통보 대기 중
+                        )
+                    else:
+                        # 대기 등록 실패시에만 기존 방식 사용 (최후 수단)
+                        logger.error(f"❌ 임시 주문ID 등록 실패 - 기존방식 적용: {stock_code}")
+                        
+                        # 기존 방식: 즉시 포지션에 추가 (비추천, 최후 수단)
+                        self.position_manager.add_position(
+                            stock_code=stock_code,
+                            quantity=quantity,
+                            buy_price=buy_price,
+                            strategy_type=strategy
+                        )
+                        
+                        # 기존 방식: 즉시 성공 로깅 (비추천, 최후 수단)
+                        log_buy_success(
+                            stock_code=stock_code,
+                            buy_price=buy_price,
+                            quantity=quantity,
+                            strategy=strategy,
+                            signal_data=signal
+                        )
+                        
+                        logger.warning(f"⚠️ 비추천 방식으로 매수 처리됨: {stock_code} {quantity:,}주 @{buy_price:,}원")
+                        return TradeResult(
+                            success=True,
+                            stock_code=stock_code,
+                            order_type='BUY',
+                            quantity=quantity,
+                            price=buy_price,
+                            total_amount=total_amount,
+                            order_no=buy_result.get('order_id', temp_order_id)
+                        )
             else:
-                error_msg = f"매수 주문 실패: 주문 처리 실패"
-                logger.error(f"❌ {error_msg}")
-
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='BUY',
-                    quantity=quantity,
-                    price=buy_price,
-                    total_amount=total_amount,
-                    error_message=error_msg
-                )
+                reason = f"매수 주문 실패: {buy_result.get('error_message', '알 수 없는 오류') if buy_result else '주문 결과 없음'}"
+                log_buy_failed(stock_code, reason, signal, validation_details)
+                return TradeResult(False, stock_code, 'BUY', quantity, buy_price, total_amount, reason)
 
         except Exception as e:
-            error_msg = f"매수 신호 실행 오류: {e}"
-            logger.error(error_msg)
-
-            return TradeResult(
-                success=False,
-                stock_code=signal.get('stock_code', 'UNKNOWN'),
-                order_type='BUY',
-                quantity=0,
-                price=0,
-                total_amount=0,
-                error_message=error_msg
+            reason = f"매수 신호 처리 오류: {e}"
+            logger.error(reason)
+            # 🆕 예외 상황 로깅
+            log_buy_failed(
+                stock_code=stock_code,
+                reason=reason,
+                signal_data=signal,
+                validation_details=validation_details
             )
+            return TradeResult(False, stock_code, 'BUY', 0, 0, 0, reason)
 
     def execute_sell_signal(self, signal: Dict) -> TradeResult:
         """매도 신호 실행"""
@@ -306,37 +464,93 @@ class TradeExecutor:
             )
 
             if sell_result:  # 주문번호가 반환되면 성공
-                # 6. 거래 기록 저장
-                sell_result_dict = {'order_no': sell_result, 'status': 'success'}
-                self._record_sell_trade(stock_code, verified_quantity, sell_price, position, signal, sell_result_dict)
-
-                # 7. 포지션에서 제거
-                self.position_manager.remove_position(stock_code, verified_quantity, sell_price)
-
-                logger.info(f"✅ 매도 주문 완료: {stock_code} {verified_quantity:,}주 @ {sell_price:,}원 (총 {total_amount:,}원)")
-
-                return TradeResult(
-                    success=True,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=verified_quantity,
-                    price=sell_price,
-                    total_amount=total_amount,
-                    order_no=sell_result
-                )
-            else:
-                error_msg = f"매도 주문 실패: 주문 처리 실패"
-                logger.error(f"❌ {error_msg}")
-
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=verified_quantity,
-                    price=sell_price,
-                    total_amount=total_amount,
-                    error_message=error_msg
-                )
+                # 🆕 체결통보 기반 매도 처리
+                order_id = sell_result if isinstance(sell_result, str) else str(sell_result)
+                
+                if order_id:
+                    # 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 주문 등록
+                    success = self.execution_manager.add_pending_order(
+                        order_id=order_id,
+                        stock_code=stock_code,
+                        order_type='SELL',
+                        quantity=verified_quantity,
+                        price=sell_price,
+                        strategy_type=strategy
+                    )
+                    
+                    if success:
+                        # 📝 거래 기록은 저장하되 포지션 제거는 체결통보 후
+                        sell_result_dict = {'order_no': order_id, 'status': 'pending'}
+                        self._record_sell_trade(stock_code, verified_quantity, sell_price, position, signal, sell_result_dict)
+                        
+                        logger.info(f"📤 매도 주문 전송 성공 - 체결통보 대기 중: {stock_code} {verified_quantity:,}주 @{sell_price:,}원")
+                        
+                        return TradeResult(
+                            success=True,
+                            stock_code=stock_code,
+                            order_type='SELL',
+                            quantity=verified_quantity,
+                            price=sell_price,
+                            total_amount=total_amount,
+                            order_no=order_id,
+                            is_pending=True  # 체결통보 대기 중
+                        )
+                    else:
+                        # 대기 등록 실패시 기존 방식 (최후 수단)
+                        logger.warning(f"⚠️ 매도 주문 대기 등록 실패 - 기존방식 적용: {stock_code}")
+                        
+                        # 기존 방식: 즉시 처리
+                        sell_result_dict = {'order_no': order_id, 'status': 'success'}
+                        self._record_sell_trade(stock_code, verified_quantity, sell_price, position, signal, sell_result_dict)
+                        
+                        # 포지션에서 제거 (비추천, 최후 수단)
+                        self.position_manager.remove_position(stock_code, verified_quantity, sell_price)
+                        
+                        logger.warning(f"⚠️ 비추천 방식으로 매도 처리됨: {stock_code} {verified_quantity:,}주 @{sell_price:,}원")
+                        
+                        return TradeResult(
+                            success=True,
+                            stock_code=stock_code,
+                            order_type='SELL',
+                            quantity=verified_quantity,
+                            price=sell_price,
+                            total_amount=total_amount,
+                            order_no=order_id
+                        )
+                else:
+                    # 주문ID가 없는 경우 임시ID 생성
+                    temp_order_id = f"TEMP_SELL_{stock_code}_{int(time.time())}"
+                    
+                    success = self.execution_manager.add_pending_order(
+                        order_id=temp_order_id,
+                        stock_code=stock_code,
+                        order_type='SELL',
+                        quantity=verified_quantity,
+                        price=sell_price,
+                        strategy_type=strategy
+                    )
+                    
+                    if success:
+                        # 거래 기록 저장
+                        sell_result_dict = {'order_no': temp_order_id, 'status': 'pending'}
+                        self._record_sell_trade(stock_code, verified_quantity, sell_price, position, signal, sell_result_dict)
+                        
+                        logger.info(f"⏳ 임시ID로 매도 체결통보 대기: {stock_code} (임시ID: {temp_order_id})")
+                        
+                        return TradeResult(
+                            success=True,
+                            stock_code=stock_code,
+                            order_type='SELL',
+                            quantity=verified_quantity,
+                            price=sell_price,
+                            total_amount=total_amount,
+                            order_no=temp_order_id,
+                            is_pending=True
+                        )
+                    else:
+                        error_msg = f"매도 주문 대기 등록 실패: {stock_code}"
+                        logger.error(f"❌ {error_msg}")
+                        return TradeResult(False, stock_code, 'SELL', verified_quantity, sell_price, total_amount, error_msg)
 
         except Exception as e:
             error_msg = f"매도 신호 실행 오류: {e}"
@@ -437,31 +651,145 @@ class TradeExecutor:
     # === 내부 헬퍼 메서드들 ===
 
     def _validate_buy_signal(self, signal: Dict, stock_code: str) -> bool:
-        """매수 신호 검증"""
-        if not stock_code:
-            logger.warning(f"🚫 매수 검증 실패: 종목 코드 누락")
+        """기본 매수 신호 검증"""
+        try:
+            # 1. 필수 필드 확인
+            required_fields = ['stock_code', 'strategy', 'strength', 'price']
+            for field in required_fields:
+                if field not in signal:
+                    reason = f"필수 필드 누락: {field}"
+                    # 🆕 필수 필드 누락 로깅
+                    log_signal_failed(
+                        stock_code=stock_code,
+                        strategy=signal.get('strategy', 'unknown'),
+                        signal_strength=signal.get('strength', 0.0),
+                        threshold=1.0,
+                        reason=reason,
+                        market_data=signal
+                    )
+                    logger.warning(f"❌ 매수 신호 검증 실패: {reason}")
+                    return False
+
+            # 2. 신호 강도 확인
+            strength = signal.get('strength', 0.0)
+            min_strength = 0.3  # 최소 신호 강도
+            if strength < min_strength:
+                reason = f"신호 강도 부족 ({strength:.2f} < {min_strength})"
+                # 🆕 신호 강도 부족 로깅
+                log_signal_failed(
+                    stock_code=stock_code,
+                    strategy=signal.get('strategy', 'unknown'),
+                    signal_strength=strength,
+                    threshold=min_strength,
+                    reason=reason,
+                    market_data=signal
+                )
+                logger.debug(f"🔽 신호 강도 부족: {stock_code} - {reason}")
+                return False
+
+            # 3. 쿨다운 확인 (같은 종목 중복 신호 방지)
+            current_time = time.time()
+            if stock_code in self.last_signals:
+                last_signal_time = self.last_signals[stock_code]
+                if current_time - last_signal_time < self.signal_cooldown:
+                    remaining_time = int(self.signal_cooldown - (current_time - last_signal_time))
+                    reason = f"신호 쿨다운 중 (남은 시간: {remaining_time}초)"
+                    # 🆕 쿨다운 로깅
+                    log_signal_failed(
+                        stock_code=stock_code,
+                        strategy=signal.get('strategy', 'unknown'),
+                        signal_strength=strength,
+                        threshold=self.signal_cooldown,
+                        reason=reason,
+                        market_data=signal
+                    )
+                    logger.debug(f"⏰ 신호 쿨다운: {stock_code} - {reason}")
+                    return False
+
+            # 4. 중복 포지션 확인
+            existing_positions = self.position_manager.get_positions('active')
+            if stock_code in existing_positions:
+                reason = "이미 보유 중인 종목"
+                # 🆕 중복 포지션 로깅
+                log_signal_failed(
+                    stock_code=stock_code,
+                    strategy=signal.get('strategy', 'unknown'),
+                    signal_strength=strength,
+                    threshold=1.0,
+                    reason=reason,
+                    market_data=signal
+                )
+                logger.debug(f"📊 중복 포지션: {stock_code} - {reason}")
+                return False
+
+            # 5. 진행중인 주문 확인
+            if stock_code in self.pending_orders:
+                reason = "처리 중인 주문 존재"
+                # 🆕 중복 주문 로깅
+                log_signal_failed(
+                    stock_code=stock_code,
+                    strategy=signal.get('strategy', 'unknown'),
+                    signal_strength=strength,
+                    threshold=1.0,
+                    reason=reason,
+                    market_data=signal
+                )
+                logger.debug(f"⚠️ 중복 주문: {stock_code} - {reason}")
+                return False
+
+            # 6. 가격 유효성 확인
+            price = signal.get('price', 0)
+            if price <= 0:
+                reason = f"유효하지 않은 가격: {price}"
+                # 🆕 가격 오류 로깅
+                log_signal_failed(
+                    stock_code=stock_code,
+                    strategy=signal.get('strategy', 'unknown'),
+                    signal_strength=strength,
+                    threshold=1.0,
+                    reason=reason,
+                    market_data=signal
+                )
+                logger.warning(f"💰 가격 오류: {stock_code} - {reason}")
+                return False
+
+            # 7. 거래 시간 확인 (선택사항)
+            # 현재는 시간 제한 없이 모든 시간에 거래 허용
+
+            # 모든 검증 통과
+            self.last_signals[stock_code] = current_time
+            logger.debug(f"✅ 기본 매수 신호 검증 통과: {stock_code}")
+            return True
+
+        except Exception as e:
+            reason = f"검증 과정 오류: {e}"
+            logger.error(f"❌ 매수 신호 검증 오류: {reason}")
+            # 🆕 검증 오류 로깅
+            log_signal_failed(
+                stock_code=stock_code,
+                strategy=signal.get('strategy', 'unknown'),
+                signal_strength=signal.get('strength', 0.0),
+                threshold=1.0,
+                reason=reason,
+                market_data=signal
+            )
             return False
-
-        # 포지션 중복 체크
-        existing_positions = self.position_manager.get_positions('active')
-        if stock_code in existing_positions:
-            logger.warning(f"🚫 매수 검증 실패: 이미 보유 중인 종목 ({stock_code})")
-            logger.info(f"📊 현재 보유 종목: {list(existing_positions.keys())}")
-            return False
-
-        # 중복 주문 체크는 handle_signal()에서 이미 처리하므로 제거
-        # if stock_code in self.pending_orders:
-        #     logger.warning(f"🚫 매수 검증 실패: 이미 처리 중인 주문 ({stock_code})")
-        #     return False
-
-        logger.debug(f"✅ 기본 매수 검증 통과: {stock_code}")
-        return True
 
     def _validate_buy_signal_enhanced(self, signal: Dict, stock_code: str) -> bool:
         """🆕 강화된 매수 신호 검증 (고도화된 다중 이격도 활용)"""
         try:
             # 기본 검증
-            if not self._validate_buy_signal(signal, stock_code):
+            basic_validation = self._validate_buy_signal(signal, stock_code)
+            if not basic_validation:
+                # 🆕 기본 검증 실패 로깅
+                log_signal_failed(
+                    stock_code=stock_code,
+                    strategy=signal.get('strategy', 'unknown'),
+                    signal_strength=signal.get('strength', 0.0),
+                    threshold=0.3,  # 기본 임계값
+                    reason="기본 검증 실패",
+                    market_data=signal
+                )
                 logger.warning(f"🚫 강화된 매수 검증 실패: 기본 검증 단계에서 실패 ({stock_code})")
                 return False
 
@@ -514,6 +842,15 @@ class TradeExecutor:
                                       f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f}")
                             return True
                         else:
+                            # 🆕 이격도 반등 전략 실패 로깅
+                            log_signal_failed(
+                                stock_code=stock_code,
+                                strategy=strategy,
+                                signal_strength=signal.get('strength', 0.0),
+                                threshold=90.0,  # D20 임계값
+                                reason=f"이격도반등 조건 미달 (D20:{d20_val:.1f} > 90, D60:{d60_val:.1f} > 95)",
+                                market_data={**signal, 'disparity_5d': d5_val, 'disparity_20d': d20_val, 'disparity_60d': d60_val}
+                            )
                             logger.warning(f"🎯 이격도반등 매수 거부: {stock_code} "
                                          f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매도 미달)")
                             return False
@@ -521,6 +858,15 @@ class TradeExecutor:
                     elif strategy in ['gap_trading', 'volume_breakout', 'momentum']:
                         # 기존 전략들: 과매수 구간 매수 금지
                         if d5_val >= 135 or d20_val >= 125:  # 단기/중기 과매수 (1단계 완화)
+                            # 🆕 과매수 구간 매수 거부 로깅
+                            log_signal_failed(
+                                stock_code=stock_code,
+                                strategy=strategy,
+                                signal_strength=signal.get('strength', 0.0),
+                                threshold=125.0,  # D20 임계값
+                                reason=f"과매수 구간 매수 금지 (D5:{d5_val:.1f} >= 135 또는 D20:{d20_val:.1f} >= 125)",
+                                market_data={**signal, 'disparity_5d': d5_val, 'disparity_20d': d20_val, 'disparity_60d': d60_val}
+                            )
                             logger.warning(f"🎯 {strategy} 매수 거부: {stock_code} "
                                          f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매수)")
                             return False
@@ -536,6 +882,15 @@ class TradeExecutor:
                     else:
                         # 기타 전략: 기본 검증
                         if d20_val >= 125:  # 과매수 매수 금지 (1단계 완화)
+                            # 🆕 기타 전략 과매수 거부 로깅
+                            log_signal_failed(
+                                stock_code=stock_code,
+                                strategy=strategy,
+                                signal_strength=signal.get('strength', 0.0),
+                                threshold=125.0,
+                                reason=f"기타전략 과매수 구간 (D20:{d20_val:.1f} >= 125)",
+                                market_data={**signal, 'disparity_20d': d20_val}
+                            )
                             logger.warning(f"🎯 기타전략 매수 거부: {stock_code} "
                                          f"D20:{d20_val:.1f} (과매수)")
                             return False
@@ -548,6 +903,15 @@ class TradeExecutor:
                         logger.info(f"🎯 20일 이격도 매수 허용: {stock_code} D20:{d20_val:.1f}% (과매도)")
                         return True
                     elif d20_val >= 125:  # 1단계 완화
+                        # 🆕 20일 이격도만으로 과매수 거부 로깅
+                        log_signal_failed(
+                            stock_code=stock_code,
+                            strategy=signal.get('strategy', 'unknown'),
+                            signal_strength=signal.get('strength', 0.0),
+                            threshold=125.0,
+                            reason=f"20일 이격도 과매수 (D20:{d20_val:.1f} >= 125)",
+                            market_data={**signal, 'disparity_20d': d20_val}
+                        )
                         logger.warning(f"🎯 20일 이격도 매수 거부: {stock_code} D20:{d20_val:.1f}% (과매수)")
                         return False
                     else:
@@ -986,3 +1350,29 @@ class TradeExecutor:
                 'message': error_msg,
                 'order_executed': False
             }
+
+    def get_execution_stats(self) -> Dict:
+        """🆕 주문 실행 통계"""
+        try:
+            execution_stats = self.execution_manager.get_stats()
+            pending_count = self.execution_manager.get_pending_orders_count()
+            
+            return {
+                'traditional_orders': self.stats if hasattr(self, 'stats') else {},
+                'websocket_executions': execution_stats,
+                'pending_orders_count': pending_count,
+                'total_success_rate': (
+                    execution_stats['orders_filled'] / 
+                    max(execution_stats['orders_sent'], 1)
+                ) if execution_stats['orders_sent'] > 0 else 0
+            }
+        except Exception as e:
+            logger.error(f"❌ 실행 통계 조회 오류: {e}")
+            return {}
+
+    def cleanup_expired_orders(self):
+        """🆕 만료된 주문 정리"""
+        try:
+            self.execution_manager.cleanup_expired_orders()
+        except Exception as e:
+            logger.error(f"❌ 만료 주문 정리 오류: {e}")
