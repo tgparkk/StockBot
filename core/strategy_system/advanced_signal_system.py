@@ -346,134 +346,6 @@ class AdvancedSignalGenerator:
                 relative_volume=1.0
             )
 
-    def _calculate_risk_management(self, stock_code: str, current_data: Dict,
-                                 tech_analysis: TechnicalAnalysis,
-                                 historical_data: pd.DataFrame, strategy_name: str) -> RiskManagement:
-        """리스크 관리 계산"""
-        try:
-            current_price = current_data.get('current_price', 0)
-
-            # 1. ATR 기반 손절가 계산
-            atr = self._calculate_atr(historical_data)
-            current_atr = atr.iloc[-1] if len(atr) > 0 else current_price * 0.02
-
-            # 2. 손절가 설정 (현재가보다 낮아야 함) - 🔧 수정된 로직
-            atr_stop = current_price - (current_atr * self.risk_config['stop_loss_multiplier'])
-
-            # 지지선 기반 손절가 (현재가보다 낮게 제한)
-            support_stop = min(tech_analysis.support_level * 0.98, current_price * 0.95)
-
-            # 볼린저 밴드 기반 손절가 (현재가보다 낮게 제한)
-            bb_stop = min(tech_analysis.bb_lower * 0.99, current_price * 0.97)
-
-            # 🔧 가장 높은 손절가 선택하되 현재가보다는 낮게 제한
-            stop_loss_price = min(
-                max(atr_stop, support_stop, bb_stop),
-                current_price * 0.98  # 최대 2% 손절
-            )
-
-            # 🔧 최소 손절 거리 보장 (0.5% 이상)
-            min_stop_distance = current_price * 0.005
-            if current_price - stop_loss_price < min_stop_distance:
-                stop_loss_price = current_price - min_stop_distance
-
-            stop_loss_pct = (current_price - stop_loss_price) / current_price
-
-            # 3. 🔧 목표가 설정 (현재가보다 반드시 높게, 2:1 비율 보장)
-            risk_amount = current_price - stop_loss_price  # 이제 항상 양수
-
-            # 🔧 최소 리스크-수익 비율 강화 (2.5:1로 상향)
-            min_risk_reward = max(self.risk_config['min_risk_reward'], 2.5)
-            base_target = current_price + (risk_amount * min_risk_reward)
-
-            # 🔧 전략별 목표가 조정
-            strategy_multipliers = {
-                'momentum': 3.0,      # 모멘텀: 더 높은 목표
-                'gap_trading': 2.5,   # 갭 거래: 중간 목표
-                'volume_breakout': 3.5, # 거래량 돌파: 가장 높은 목표
-                'default': 2.5        # 기본값
-            }
-
-            # 전략에 맞는 배수 적용
-            strategy_key = 'default'
-            for key in strategy_multipliers.keys():
-                if key in strategy_name.lower():  # 🔧 매개변수의 strategy_name 사용
-                    strategy_key = key
-                    break
-
-            strategy_multiplier = strategy_multipliers[strategy_key]
-            strategy_target = current_price + (risk_amount * strategy_multiplier)
-
-            # 더 높은 목표가 선택
-            calculated_target = max(base_target, strategy_target)
-
-            # 저항선 고려한 목표가 조정 (단, 너무 낮아지지 않도록)
-            if (tech_analysis.resistance_level > current_price and
-                calculated_target > tech_analysis.resistance_level):
-                # 저항선이 너무 낮으면 무시하고 계산된 목표가 사용
-                resistance_target = tech_analysis.resistance_level * 0.98
-                if resistance_target >= current_price * 1.02:  # 최소 2% 이상 목표가
-                    take_profit_price = resistance_target
-                else:
-                    take_profit_price = calculated_target  # 저항선 무시
-                    logger.debug(f"🎯 저항선이 너무 낮아 무시: 저항선={tech_analysis.resistance_level:,}, 계산목표가={calculated_target:,}")
-            else:
-                take_profit_price = calculated_target
-
-            # 🔧 최소 목표가 보장 강화 (현재가의 최소 2.5% 이상)
-            min_target_pct = 0.025  # 2.5%
-            min_target = current_price * (1 + min_target_pct)
-            take_profit_price = max(take_profit_price, min_target)
-
-            # 🔧 최대 목표가 제한 (현실적 범위 내)
-            max_target_pct = 0.15  # 15%
-            max_target = current_price * (1 + max_target_pct)
-            take_profit_price = min(take_profit_price, max_target)
-
-            take_profit_pct = (take_profit_price - current_price) / current_price
-
-            # 4. 포지션 사이징 계산
-            max_loss_per_trade = self.account_balance * self.risk_config['max_risk_per_trade']
-            loss_per_share = current_price - stop_loss_price
-
-            if loss_per_share > 0:
-                max_shares = int(max_loss_per_trade / loss_per_share)
-                position_value = max_shares * current_price
-                position_size = position_value / self.account_balance
-            else:
-                position_size = 0.01  # 최소 포지션
-
-            # 5. 🔧 리스크-수익 비율 계산 (항상 양수가 되도록)
-            profit_amount = take_profit_price - current_price
-            risk_reward_ratio = profit_amount / risk_amount if risk_amount > 0 else 2.0
-
-            # 🔧 계산 검증 및 로깅
-            logger.debug(f"💰 {stock_code} 가격계산: 현재={current_price:,}원, 목표={take_profit_price:,}원, 손절={stop_loss_price:,}원")
-            logger.debug(f"📊 리스크 분석: 손실={risk_amount:.0f}원, 이익={profit_amount:.0f}원, 비율={risk_reward_ratio:.1f}:1")
-
-            return RiskManagement(
-                stop_loss_price=stop_loss_price,
-                stop_loss_pct=stop_loss_pct,
-                take_profit_price=take_profit_price,
-                take_profit_pct=take_profit_pct,
-                position_size=min(position_size, 0.05),  # 최대 5% 포지션
-                risk_reward_ratio=risk_reward_ratio,
-                max_risk_per_trade=self.risk_config['max_risk_per_trade']
-            )
-
-        except Exception as e:
-            logger.error(f"리스크 관리 계산 오류: {e}")
-            current_price = current_data.get('current_price', 0)
-            return RiskManagement(
-                stop_loss_price=current_price * 0.95,
-                stop_loss_pct=0.05,
-                take_profit_price=current_price * 1.10,
-                take_profit_pct=0.10,
-                position_size=0.02,
-                risk_reward_ratio=2.0,
-                max_risk_per_trade=0.02
-            )
-
     def _calculate_signal_scores(self, tech_analysis: TechnicalAnalysis,
                                volume_profile: VolumeProfile,
                                strategy_name: str) -> Dict[str, float]:
@@ -539,6 +411,158 @@ class AdvancedSignalGenerator:
         scores['risk_score'] = max(0, min(1, risk_score))
 
         return scores
+
+    def _calculate_risk_management(self, stock_code: str, current_data: Dict,
+                                 tech_analysis: TechnicalAnalysis,
+                                 historical_data: pd.DataFrame, strategy_name: str) -> RiskManagement:
+        """리스크 관리 계산"""
+        try:
+            current_price = current_data.get('current_price', 0)
+
+            # 1. ATR 기반 손절가 계산
+            atr = self._calculate_atr(historical_data)
+            current_atr = atr.iloc[-1] if len(atr) > 0 else current_price * 0.02
+
+            # 2. 손절가 설정 (현재가보다 낮아야 함) - 🔧 수정된 로직
+            atr_stop = current_price - (current_atr * self.risk_config['stop_loss_multiplier'])
+
+            # 지지선 기반 손절가 (현재가보다 낮게 제한)
+            support_stop = min(tech_analysis.support_level * 0.98, current_price * 0.95)
+
+            # 볼린저 밴드 기반 손절가 (현재가보다 낮게 제한)
+            bb_stop = min(tech_analysis.bb_lower * 0.99, current_price * 0.97)
+
+            # 🔧 가장 높은 손절가 선택하되 현재가보다는 낮게 제한 (매일 복리용 - 빠른 손절)
+            stop_loss_price = min(
+                max(atr_stop, support_stop, bb_stop),
+                current_price * 0.985  # 최대 1.5% 손절 (매일 복리용)
+            )
+
+            # 🔧 최소 손절 거리 보장 (0.8% 이상 - 매일 복리용)
+            min_stop_distance = current_price * 0.008  # 0.8%
+            if current_price - stop_loss_price < min_stop_distance:
+                stop_loss_price = current_price - min_stop_distance
+
+            stop_loss_pct = (current_price - stop_loss_price) / current_price
+
+            # 3. 🔧 목표가 설정 (현재가보다 반드시 높게, 2:1 비율 보장)
+            risk_amount = current_price - stop_loss_price  # 이제 항상 양수
+
+            # 🔧 최소 리스크-수익 비율 강화 (2.5:1로 상향)
+            min_risk_reward = max(self.risk_config['min_risk_reward'], 2.5)
+            base_target = current_price + (risk_amount * min_risk_reward)
+
+            # 🔧 전략별 목표가 조정
+            strategy_multipliers = {
+                'momentum': 3.0,      # 모멘텀: 더 높은 목표
+                'gap_trading': 2.5,   # 갭 거래: 중간 목표
+                'volume_breakout': 3.5, # 거래량 돌파: 가장 높은 목표
+                'default': 2.5        # 기본값
+            }
+
+            # 전략에 맞는 배수 적용
+            strategy_key = 'default'
+            for key in strategy_multipliers.keys():
+                if key in strategy_name.lower():  # 🔧 매개변수의 strategy_name 사용
+                    strategy_key = key
+                    break
+
+            strategy_multiplier = strategy_multipliers[strategy_key]
+            strategy_target = current_price + (risk_amount * strategy_multiplier)
+
+            # 더 높은 목표가 선택
+            calculated_target = max(base_target, strategy_target)
+
+            # 저항선 고려한 목표가 조정 (단, 너무 낮아지지 않도록)
+            if (tech_analysis.resistance_level > current_price and
+                calculated_target > tech_analysis.resistance_level):
+                # 저항선이 너무 낮으면 무시하고 계산된 목표가 사용
+                resistance_target = tech_analysis.resistance_level * 0.98
+                if resistance_target >= current_price * 1.02:  # 최소 2% 이상 목표가
+                    take_profit_price = resistance_target
+                else:
+                    take_profit_price = calculated_target  # 저항선 무시
+                    logger.debug(f"🎯 저항선이 너무 낮아 무시: 저항선={tech_analysis.resistance_level:,}, 계산목표가={calculated_target:,}")
+            else:
+                take_profit_price = calculated_target
+
+            # 🔧 최소 목표가 보장 강화 (현재가의 최소 2.5% 이상)
+            min_target_pct = 0.025  # 2.5%
+            min_target = current_price * (1 + min_target_pct)
+            take_profit_price = max(take_profit_price, min_target)
+
+            # 🔧 최대 목표가 제한 (매일 복리 수익 전략 - 초보수적)
+            strategy_max_limits = {
+                'momentum': 0.04,        # 모멘텀: 4% (매일 복리용)
+                'gap_trading': 0.03,     # 갭 거래: 3% (매우 안전)
+                'volume_breakout': 0.05, # 거래량 돌파: 5% (적당)
+                'default': 0.025         # 기본값: 2.5% (매일 복리 최적)
+            }
+
+            # 전략에 맞는 최대 제한 선택
+            max_limit_key = 'default'
+            for key in strategy_max_limits.keys():
+                if key in strategy_name.lower():
+                    max_limit_key = key
+                    break
+
+            max_target_pct = strategy_max_limits[max_limit_key]
+            max_target = current_price * (1 + max_target_pct)
+            take_profit_price = min(take_profit_price, max_target)
+
+            # 🔧 매일 복리 수익 최적화 로깅
+            #daily_compound_info = f"💰 매일복리모드: {stock_code} 목표 {max_target_pct:.1%} (현재: {current_price:,}원 → 목표: {max_target:,}원)"
+            #logger.info(daily_compound_info)
+
+            # 📊 복리 수익 시뮬레이션 (참고용)
+            if max_target_pct > 0:
+                monthly_return = ((1 + max_target_pct) ** 20) - 1  # 월 20거래일 가정
+                yearly_return = ((1 + max_target_pct) ** 240) - 1  # 연 240거래일 가정
+                #logger.info(f"🚀 복리 예상: 월 {monthly_return:.1%}, 연 {yearly_return:.1%} (성공률 80% 가정)")
+
+            take_profit_pct = (take_profit_price - current_price) / current_price
+
+            # 4. 포지션 사이징 계산
+            max_loss_per_trade = self.account_balance * self.risk_config['max_risk_per_trade']
+            loss_per_share = current_price - stop_loss_price
+
+            if loss_per_share > 0:
+                max_shares = int(max_loss_per_trade / loss_per_share)
+                position_value = max_shares * current_price
+                position_size = position_value / self.account_balance
+            else:
+                position_size = 0.01  # 최소 포지션
+
+            # 5. 🔧 리스크-수익 비율 계산 (항상 양수가 되도록)
+            profit_amount = take_profit_price - current_price
+            risk_reward_ratio = profit_amount / risk_amount if risk_amount > 0 else 2.0
+
+            # 🔧 계산 검증 및 로깅
+            logger.debug(f"💰 {stock_code} 가격계산: 현재={current_price:,}원, 목표={take_profit_price:,}원, 손절={stop_loss_price:,}원")
+            logger.debug(f"📊 리스크 분석: 손실={risk_amount:.0f}원, 이익={profit_amount:.0f}원, 비율={risk_reward_ratio:.1f}:1")
+
+            return RiskManagement(
+                stop_loss_price=stop_loss_price,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_price=take_profit_price,
+                take_profit_pct=take_profit_pct,
+                position_size=min(position_size, 0.02),  # 최대 2% 포지션 (초보자용)
+                risk_reward_ratio=risk_reward_ratio,
+                max_risk_per_trade=self.risk_config['max_risk_per_trade']
+            )
+
+        except Exception as e:
+            logger.error(f"리스크 관리 계산 오류: {e}")
+            current_price = current_data.get('current_price', 0)
+            return RiskManagement(
+                stop_loss_price=current_price * 0.95,
+                stop_loss_pct=0.05,
+                take_profit_price=current_price * 1.10,
+                take_profit_pct=0.10,
+                position_size=0.02,
+                risk_reward_ratio=2.0,
+                max_risk_per_trade=0.02
+            )
 
     def _make_final_decision(self, strategy_name: str, stock_code: str, current_data: Dict,
                            tech_analysis: TechnicalAnalysis, volume_profile: VolumeProfile,

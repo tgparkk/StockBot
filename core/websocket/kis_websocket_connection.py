@@ -160,20 +160,22 @@ class KISWebSocketConnection:
             return False
 
     async def send_pong(self, ping_data: str) -> bool:
-        """PONG 응답 전송 (공식 샘플 방식)"""
+        """🎯 KIS PINGPONG 응답 전송 (JSON 기반)"""
         try:
             if not self.websocket:
                 logger.warning("웹소켓이 연결되지 않음")
                 return False
 
-            # 공식 샘플에 맞춘 pong() 메서드 사용
-            await self.websocket.pong(ping_data.encode('utf-8'))
+            # 🎯 KIS PINGPONG은 JSON 메시지이므로 JSON으로 응답
+            # ping_data: {"header":{"tr_id":"PINGPONG","datetime":"20250526073425"}}
+            # 동일한 메시지를 그대로 PONG으로 전송
+            await self.websocket.send(ping_data)
             self.stats['last_pong_time'] = time.time()
-            logger.debug(f"🏓 PONG 응답 전송: {ping_data[:50]}...")
+            logger.debug(f"🏓 PINGPONG 응답 전송: {ping_data[:80]}...")
             return True
 
         except Exception as e:
-            logger.error(f"❌ PONG 응답 전송 실패: {e}")
+            logger.error(f"❌ PINGPONG 응답 전송 실패: {e}")
             return False
 
     async def receive_message(self) -> Optional[str]:

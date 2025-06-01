@@ -24,7 +24,7 @@ class KISWebSocketManager:
     """
 
     def __init__(self):
-        """초기화"""
+        """초기화 - 🎯 안전성과 명확성 개선"""
         # 분리된 컴포넌트들 초기화
         self.connection = KISWebSocketConnection()
         self.data_parser = KISWebSocketDataParser()
@@ -34,21 +34,23 @@ class KISWebSocketManager:
             self.subscription_manager
         )
 
-        # 백그라운드 작업 관리
+        # 🎯 간소화된 백그라운드 작업 관리
         self._message_loop_task: Optional[asyncio.Task] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._websocket_thread: Optional[threading.Thread] = None
-        self._event_loop_closed = True
         self._shutdown_event = threading.Event()
 
         # 통계
         self.stats = {
             'start_time': time.time(),
             'total_messages': 0,
-            'connection_count': 0
+            'connection_count': 0,
+            'reconnect_count': 0,
+            'ping_pong_count': 0,
+            'last_error': None
         }
 
-        logger.info("KIS 웹소켓 매니저 초기화 완료 (리팩토링 버전)")
+        logger.info("✅ KIS 웹소켓 매니저 초기화 완료")
 
     # ==========================================
     # 기존 인터페이스 호환성 유지 (Property)
@@ -188,7 +190,6 @@ class KISWebSocketManager:
             # 🆕 완전히 새로운 이벤트 루프 생성
             self._event_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._event_loop)
-            self._event_loop_closed = False
 
             # 🆕 안전한 연결 및 메시지 루프 실행
             try:
@@ -222,8 +223,6 @@ class KISWebSocketManager:
                     # 루프 종료
                     if not self._event_loop.is_closed():
                         self._event_loop.close()
-                    self._event_loop_closed = True
-
             except Exception as e:
                 logger.error(f"이벤트 루프 정리 오류: {e}")
 
@@ -276,9 +275,10 @@ class KISWebSocketManager:
                             # 메시지 처리
                             result = await self.message_handler.process_message(message)
 
-                            # PINGPONG 응답 처리
+                            # 🎯 PINGPONG 응답 처리 (KIS 방식)
                             if result and result[0] == 'PINGPONG':
                                 await self.connection.send_pong(result[1])
+                                self.stats['ping_pong_count'] += 1
 
                     except asyncio.TimeoutError:
                         logger.debug("메시지 수신 타임아웃 (정상)")
@@ -335,28 +335,29 @@ class KISWebSocketManager:
             logger.info("🛑 웹소켓 메인 루프 종료")
 
     async def _safe_reconnect(self) -> bool:
-        """🆕 안전한 재연결 메서드"""
+        """🎯 간소화된 안전한 재연결"""
         try:
-            logger.info("🔄 안전한 웹소켓 재연결 시도...")
+            logger.info("🔄 웹소켓 재연결 시도...")
+            self.stats['reconnect_count'] += 1
 
-            # 기존 연결 정리
-            try:
-                await self.connection.disconnect()
-                await asyncio.sleep(1)  # 정리 대기
-            except Exception as e:
-                logger.debug(f"기존 연결 정리 중 오류: {e}")
+            # 🔧 기존 연결 정리
+            await self.connection.disconnect()
+            await asyncio.sleep(2)  # 안전한 대기
 
-            # 새로 연결
+            # 🔧 새로운 연결
             success = await self.connection.connect()
             if success:
                 logger.info("✅ 웹소켓 재연결 성공")
+                # 🎯 계좌 체결통보 재구독
+                await self._subscribe_account_notices()
                 return True
             else:
                 logger.error("❌ 웹소켓 재연결 실패")
                 return False
 
         except Exception as e:
-            logger.error(f"재연결 과정 중 오류: {e}")
+            logger.error(f"❌ 재연결 과정 오류: {e}")
+            self.stats['last_error'] = str(e)
             return False
 
     # ==========================================
