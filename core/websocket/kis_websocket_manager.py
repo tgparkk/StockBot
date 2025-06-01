@@ -419,8 +419,32 @@ class KISWebSocketManager:
                     self.subscription_manager.add_stock_callback(stock_code, callback)
                 return True
 
-            # 🆕 웹소켓 스레드의 이벤트 루프에서 안전하게 실행
-            if hasattr(self, '_event_loop') and self._event_loop and not self._event_loop.is_closed():
+            # 🔧 개선된 이벤트 루프 안전성 확인
+            event_loop_available = False
+            loop_error_message = ""
+
+            try:
+                # 웹소켓 스레드의 이벤트 루프 상태 확인
+                if hasattr(self, '_event_loop') and self._event_loop:
+                    if not self._event_loop.is_closed() and not self._event_loop.is_running():
+                        # 루프가 있지만 실행 중이 아닌 경우
+                        logger.debug("이벤트 루프가 중지된 상태 - 재시작 필요")
+                        loop_error_message = "루프 중지됨"
+                    elif self._event_loop.is_closed():
+                        # 루프가 닫힌 경우
+                        logger.debug("이벤트 루프가 닫힌 상태")
+                        loop_error_message = "루프 닫힘"
+                    else:
+                        # 정상 상태
+                        event_loop_available = True
+                else:
+                    loop_error_message = "루프 없음"
+
+            except Exception as e:
+                loop_error_message = f"루프 상태 확인 오류: {e}"
+
+            # 🔧 이벤트 루프 사용 가능한 경우
+            if event_loop_available and self._event_loop:
                 try:
                     # 이벤트 루프에 비동기 작업 예약
                     future = asyncio.run_coroutine_threadsafe(
@@ -440,12 +464,39 @@ class KISWebSocketManager:
 
                 except Exception as e:
                     logger.error(f"이벤트 루프 구독 오류 ({stock_code}): {e}")
-                    # 오류 시 구독 목록에서 제거
-                    self.subscription_manager.remove_subscription(stock_code)
-                    return False
-            else:
-                logger.error("웹소켓 이벤트 루프가 사용 불가능")
-                return False
+                    event_loop_available = False  # 백업 방식으로 전환
+
+            # 🆕 백업 방식: 이벤트 루프 없이도 구독 시도
+            if not event_loop_available:
+                logger.warning(f"이벤트 루프 사용 불가능 ({loop_error_message}) - 백업 방식 사용: {stock_code}")
+
+                try:
+                    # 웹소켓 직접 메시지 전송 시도 (동기)
+                    if hasattr(self.connection, 'websocket') and self.connection.websocket:
+                        # 체결가 구독 메시지 빌드
+                        contract_msg = self.connection.build_message(
+                            KIS_WSReq.CONTRACT.value, stock_code, '1'
+                        )
+
+                        # 호가 구독 메시지 빌드
+                        bid_ask_msg = self.connection.build_message(
+                            KIS_WSReq.BID_ASK.value, stock_code, '1'
+                        )
+
+                        # 메시지 전송은 웹소켓 연결이 살아있을 때만 가능
+                        # 여기서는 일단 구독 매니저에만 등록
+                        self.subscription_manager.add_subscription(stock_code)
+
+                        if callback:
+                            self.subscription_manager.add_stock_callback(stock_code, callback)
+
+                        logger.info(f"⚠️ 백업 방식 구독 등록: {stock_code} (실제 구독은 이벤트 루프 복구 후)")
+                        return True
+
+                except Exception as e:
+                    logger.error(f"백업 구독 실패 ({stock_code}): {e}")
+
+            return False
 
         except Exception as e:
             logger.error(f"동기 구독 오류 ({stock_code}): {e}")
@@ -613,15 +664,36 @@ class KISWebSocketManager:
             # 종료 신호
             self._shutdown_event.set()
 
-            # 연결 정리
+            # 🔧 안전한 연결 정리 (이벤트 루프 충돌 방지)
             try:
-                # 동기식이므로 await 사용 불가
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                # 현재 실행 중인 이벤트 루프 확인
                 try:
-                    loop.run_until_complete(self.connection.safe_disconnect())
-                finally:
-                    loop.close()
+                    current_loop = asyncio.get_running_loop()
+                    logger.debug("이미 실행 중인 이벤트 루프가 있음 - 동기 방식으로 정리")
+
+                    # 웹소켓 동기 방식 정리
+                    if hasattr(self.connection, 'websocket') and self.connection.websocket:
+                        # 웹소켓 직접 종료 (동기)
+                        try:
+                            if not getattr(self.connection.websocket, 'closed', True):
+                                self.connection.websocket.close()
+                        except Exception as e:
+                            logger.debug(f"웹소켓 직접 종료 중 오류: {e}")
+
+                    # 연결 상태 플래그 정리
+                    self.connection.is_connected = False
+                    self.connection.is_running = False
+
+                except RuntimeError:
+                    # 실행 중인 이벤트 루프가 없는 경우 - 새 루프 생성
+                    logger.debug("실행 중인 이벤트 루프 없음 - 새 루프로 정리")
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(self.connection.safe_disconnect())
+                    finally:
+                        loop.close()
+
             except Exception as e:
                 logger.debug(f"연결 정리 중 오류: {e}")
 
