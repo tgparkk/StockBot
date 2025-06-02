@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 StockBot 메인 실행 파일 (리팩토링 버전)
-StrategyScheduler를 이용한 시간대별 전략 시스템
+🕯️ CandleTradeManager를 이용한 캔들 패턴 기반 트레이딩 시스템
 """
 import sys
 import time
@@ -11,6 +11,8 @@ import threading
 from pathlib import Path
 from typing import Optional, Dict, TYPE_CHECKING
 import pytz
+import os
+from dotenv import load_dotenv
 
 # 프로젝트 루트 경로 설정
 project_root = Path(__file__).parent
@@ -21,7 +23,7 @@ from utils.logger import setup_logger
 
 # 핵심 모듈들
 from core import (
-    TradingManager, PositionManager, StrategyScheduler,
+    TradingManager, PositionManager,
     KISRestAPIManager, SimpleHybridDataManager, KISWebSocketManager,
     TradeDatabase, TradeConfig, TradeExecutor, WorkerManager, KISDataCollector
 )
@@ -50,6 +52,16 @@ except Exception as e:
     logger.warning(f"⚠️ 텔레그램 봇 설정 오류: {e}")
     logger.info("📱 텔레그램 알림 없이 계속 진행")
 
+# 프로젝트 루트 디렉토리 추가
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# 환경변수 로드
+load_dotenv()
+
+# 🆕 새로운 캔들 트레이딩 시스템
+from core.strategy.candle_trade_manager import CandleTradeManager
+from core.strategy.candle_stock_manager import CandleStockManager
+from core.strategy.candle_pattern_detector import CandlePatternDetector
 
 class StockBot:
     """간소화된 메인 StockBot 클래스 - 오케스트레이션 역할"""
@@ -61,8 +73,19 @@ class StockBot:
 
         logger.info("📈 StockBot 시작 중...")
 
-        # 1. REST API 관리자 (단일 인스턴스)
-        self.rest_api = KISRestAPIManager()
+        try:
+            # 1. REST API 관리자 (단일 인스턴스)
+            logger.info("🔑 KIS API 연결 중...")
+            self.rest_api = KISRestAPIManager()
+            logger.info("✅ KIS API 연결 성공")
+        except Exception as e:
+            logger.error(f"❌ KIS API 연결 실패: {e}")
+            logger.error("📋 해결 방법:")
+            logger.error("  1. .env 파일이 프로젝트 루트 디렉토리에 있는지 확인")
+            logger.error("  2. .env 파일에 실제 KIS API 키를 입력했는지 확인")
+            logger.error("  3. 네트워크 연결 상태 확인")
+            logger.error("🛑 StockBot을 중단합니다.")
+            raise SystemExit(1)
 
         # 2. 웹소켓 관리자 (단일 인스턴스)
         self.websocket_manager = KISWebSocketManager()
@@ -87,28 +110,25 @@ class StockBot:
             data_collector=self.data_collector
         )
 
-        # 6. 포지션 매니저
-        self.position_manager = PositionManager(self.trading_manager, self.data_collector)
-
-        # 7. 거래 데이터베이스
+        # 6. 거래 데이터베이스
         self.trade_db = TradeDatabase()
 
-        # 8. 거래 실행자 (핵심 비즈니스 로직 분리)
+        # 7. 거래 실행자 (핵심 비즈니스 로직 분리)
         trade_config = TradeConfig()  # 기본 설정 사용
         self.trade_executor = TradeExecutor(
             self.trading_manager,
-            self.position_manager,
             self.data_manager,
             self.trade_db,
             trade_config
         )
 
-        # 9. 전략 스케줄러 (핵심!)
-        self.strategy_scheduler = StrategyScheduler(self.rest_api, self.data_manager, self.trade_db)
-        self.strategy_scheduler.set_bot_instance(self)
-
-        # 🆕 StockDiscovery에 TradeExecutor 연결
-        self.strategy_scheduler.stock_discovery.set_trade_executor(self.trade_executor)
+        # 🆕 캔들 기반 트레이딩 매니저 (기존 전략 대체)
+        self.candle_trade_manager = CandleTradeManager(
+            kis_api_manager=self.rest_api,
+            data_manager=self.data_manager,
+            trade_executor=self.trade_executor,
+            websocket_manager=self.websocket_manager  # 🆕 웹소켓 매니저 전달
+        )
 
         # 10. 워커 매니저 (스레드 관리 전담)
         self.worker_manager = WorkerManager(self.shutdown_event)
@@ -156,261 +176,45 @@ class StockBot:
             return None
 
     def _setup_existing_positions_sync(self):
-        """보유 종목 자동 모니터링 설정 (동기 버전) - active_stocks 통합"""
+        """기존 보유 종목 설정 (캔들 시스템에 위임)"""
         try:
-            logger.info("📊 보유 종목 모니터링 설정 시작")
+            logger.info("📊 기존 보유 종목 설정 시작 - 캔들 시스템에 위임")
 
-            balance = self.trading_manager.get_balance()
-            holdings = balance.get('holdings', [])
-
-            if not holdings:
-                logger.info("보유 종목이 없습니다.")
-                return
-
-            logger.info(f"📈 보유 종목 {len(holdings)}개 발견 - 자동 모니터링 설정")
-
-            # 🆕 웹소켓 준비 상태 확인 및 대기 (웹소켓 매니저 메서드 사용)
-            if self.websocket_manager:
-                self.websocket_manager.ensure_ready_for_subscriptions()
-
-            # 🆕 기존 보유 종목을 strategy_scheduler에도 등록하기 위한 리스트
-            existing_stock_codes = []
-
-            for index, holding in enumerate(holdings):
-                stock_code = holding.get('pdno', '')
-                stock_name = holding.get('prdt_name', '')
-                quantity = int(holding.get('hldg_qty', 0))
-                current_price = int(holding.get('prpr', 0))
-                avg_price = int(float(holding.get('pchs_avg_pric', current_price)))
-
-                if stock_code and quantity > 0:
-                    # 간소화된 전략 타입 결정 로직
-                    strategy_type = "existing_holding"  # 기본값
-
-                    try:
-                        # DB에서 해당 종목의 미결제 포지션 확인
-                        open_positions = self.trade_db.get_open_positions()
-                        for pos in open_positions:
-                            if (pos['stock_code'] == stock_code and
-                                pos['buy_price'] == avg_price and
-                                pos['quantity'] == quantity):
-                                # 동일한 종목/가격/수량의 미결제 포지션 발견
-                                strategy_type = pos['strategy_type']
-                                logger.info(f"🔄 {stock_code} 기존 전략 발견: {strategy_type}")
-                                break
-                        else:
-                            # DB에 해당하는 미결제 포지션이 없음 -> 순수 기존 보유
-                            logger.info(f"📝 {stock_code} 새로운 기존 보유 종목")
-
-                            # 기존 보유 종목으로 DB에 기록
-                            trade_id = self.trade_db.record_existing_position_if_not_exists(
-                                stock_code=stock_code,
-                                stock_name=stock_name,
-                                quantity=quantity,
-                                avg_price=avg_price,
-                                current_price=current_price
-                            )
-
-                            if trade_id > 0:
-                                logger.info(f"💾 기존 보유 종목 DB 기록: {stock_code}({stock_name}) (ID: {trade_id})")
-
-                    except Exception as e:
-                        logger.debug(f"전략 타입 확인 실패 ({stock_code}): {e}")
-
-                    # 1️⃣ 포지션 매니저에 전략 타입과 함께 추가
-                    self.position_manager.add_position(
-                        stock_code=stock_code,
-                        quantity=quantity,
-                        buy_price=avg_price,
-                        strategy_type=strategy_type
-                    )
-
-                    # 2️⃣ 🆕 active_stocks 리스트에 추가
-                    existing_stock_codes.append(stock_code)
-
-                    # 3️⃣ 🆕 데이터 관리자에도 실시간 모니터링 등록 (재시도 로직 포함)
-                    try:
-                        from core import DataPriority
-
-                        # 🔧 웹소켓 구독 안정성 보장 (웹소켓 매니저 메서드 사용)
-                        subscription_success = self._safe_subscribe_stock(
-                            stock_code=stock_code,
-                            strategy_name="existing_holding",
-                            max_retries=3,
-                            retry_delay=0.5
-                        )
-
-                        if subscription_success:
-                            logger.info(f"📡 {stock_code} 실시간 모니터링 등록 성공")
-                        else:
-                            logger.warning(f"⚠️ {stock_code} 실시간 모니터링 등록 실패 - REST API 백업 사용")
-
-                    except Exception as e:
-                        logger.error(f"데이터 관리자 등록 오류 ({stock_code}): {e}")
-
-                    logger.info(f"✅ 보유종목 등록: {stock_code}({stock_name}) {quantity:,}주 @ {avg_price:,}원")
-
-                    # 🕐 종목 간 간격 (웹소켓 안정성)
-                    if index < len(holdings) - 1:  # 마지막이 아니면
-                        time.sleep(0.5)  # 🔧 간격 증가 (300ms → 500ms)
-
-            # 4️⃣ 🆕 strategy_scheduler의 active_stocks에 기존 보유 종목 추가
-            if existing_stock_codes:
-                if hasattr(self.strategy_scheduler, 'active_stocks'):
-                    self.strategy_scheduler.active_stocks['existing_holding'] = existing_stock_codes
-                    logger.info(f"📋 기존 보유 종목 {len(existing_stock_codes)}개를 active_stocks에 등록 완료")
-                else:
-                    logger.warning("⚠️ strategy_scheduler.active_stocks가 초기화되지 않음")
-
-            logger.info(f"📊 보유 종목 자동 모니터링 설정 완료: {len(existing_stock_codes)}개 (통합 관리)")
-
-        except Exception as e:
-            logger.error(f"보유 종목 모니터링 설정 오류: {e}")
-
-    def _safe_subscribe_stock(self, stock_code: str, strategy_name: str,
-                             max_retries: int = 3, retry_delay: float = 0.5) -> bool:
-        """🔧 안전한 종목 구독 (재시도 로직 포함)"""
-        try:
-            from core import DataPriority
-
-            for attempt in range(1, max_retries + 1):
+            # 🆕 캔들 트레이딩 매니저에 위임
+            if hasattr(self, 'candle_trade_manager'):
+                # 동기 방식으로 비동기 메서드 호출
                 try:
-                    logger.debug(f"📡 {stock_code} 구독 시도 {attempt}/{max_retries}")
-
-                    # 🆕 재시도 전에 기존 실패한 구독 상태 정리 (웹소켓 매니저 메서드 사용)
-                    if attempt > 1:
-                        if self.websocket_manager:
-                            self.websocket_manager.cleanup_failed_subscription(stock_code)
-                        time.sleep(0.3)  # 정리 후 잠시 대기
-
-                    # 구독 시도
-                    success = self.data_manager.add_stock_request(
-                        stock_code=stock_code,
-                        priority=DataPriority.HIGH,
-                        strategy_name=strategy_name,
-                        callback=self._create_existing_holding_callback(stock_code)
-                    )
-
-                    if success:
-                        # 구독 성공 확인 (짧은 대기 후)
-                        time.sleep(0.5)  # 더 충분한 대기 시간
-
-                        # 실제 구독 상태 확인
-                        if self._verify_subscription_success(stock_code):
-                            logger.debug(f"✅ {stock_code} 구독 성공 (시도 {attempt})")
-                            return True
-                        else:
-                            logger.debug(f"⚠️ {stock_code} 구독 응답 성공이지만 실제 미구독 (시도 {attempt})")
-                            # 🆕 실제 구독되지 않았으면 정리 (웹소켓 매니저 메서드 사용)
-                            if self.websocket_manager:
-                                self.websocket_manager.cleanup_failed_subscription(stock_code)
-                    else:
-                        logger.debug(f"❌ {stock_code} 구독 실패 (시도 {attempt})")
-                        # 🆕 구독 실패 시 정리 (웹소켓 매니저 메서드 사용)
-                        if self.websocket_manager:
-                            self.websocket_manager.cleanup_failed_subscription(stock_code)
-
-                    # 재시도 전 대기
-                    if attempt < max_retries:
-                        time.sleep(retry_delay)
-                        retry_delay *= 1.5  # 점진적 대기 시간 증가
-
-                except Exception as e:
-                    logger.debug(f"❌ {stock_code} 구독 시도 {attempt} 중 오류: {e}")
-                    # 🆕 오류 시에도 정리 (웹소켓 매니저 메서드 사용)
-                    if self.websocket_manager:
-                        self.websocket_manager.cleanup_failed_subscription(stock_code)
-                    if attempt < max_retries:
-                        time.sleep(retry_delay)
-
-            logger.warning(f"❌ {stock_code} 모든 구독 시도 실패 ({max_retries}회)")
-            # 🆕 최종 실패 시에도 정리 (웹소켓 매니저 메서드 사용)
-            if self.websocket_manager:
-                self.websocket_manager.cleanup_failed_subscription(stock_code)
-            return False
-
-        except Exception as e:
-            logger.error(f"안전한 구독 프로세스 오류 ({stock_code}): {e}")
-            if self.websocket_manager:
-                self.websocket_manager.cleanup_failed_subscription(stock_code)
-            return False
-
-    def _verify_subscription_success(self, stock_code: str) -> bool:
-        """🔍 구독 성공 여부 확인"""
-        try:
-            if not self.data_manager:
-                return False
-
-            # 데이터 매니저의 구독 상태 확인
-            status = self.data_manager.get_status()
-            websocket_details = status.get('websocket_details', {})
-            subscribed_stocks = websocket_details.get('subscribed_stocks', [])
-
-            return stock_code in subscribed_stocks
-
-        except Exception as e:
-            logger.debug(f"구독 상태 확인 오류 ({stock_code}): {e}")
-            return False
-
-    def _create_existing_holding_callback(self, stock_code: str):
-        """🆕 기존 보유 종목용 콜백 함수 생성"""
-        def existing_holding_callback(data_type: str, stock_code: str, data: Dict, source: str = 'websocket') -> None:
-            """기존 보유 종목 데이터 콜백 - 🆕 data_type 파라미터 추가"""
-            try:
-                # 🆕 데이터 타입 검증 (체결가 데이터만 처리)
-                if data_type not in ['stock_price', 'stock_execution']:
-                    return
-
-                # 기본 데이터 검증
-                if not data or data.get('status') != 'success':
-                    return
-
-                current_price = data.get('current_price', 0)
-                if current_price <= 0:
-                    return
-
-                # 포지션 매니저의 현재가 업데이트
-                if hasattr(self, 'position_manager'):
-                    self.position_manager._update_position_price(stock_code, current_price)
-
-                # 변화율 기반 알림 (기존 보유 종목용)
-                change_rate = data.get('change_rate', 0)
-
-                # 큰 변화가 있을 때만 로그
-                if abs(change_rate) >= 3.0:  # 3% 이상 변화
-                    direction = "📈" if change_rate > 0 else "📉"
-                    logger.info(f"{direction} 기존보유 {stock_code}: {current_price:,}원 ({change_rate:+.1f}%)")
-
-                # 5% 이상 급등/급락 시 텔레그램 알림
-                if abs(change_rate) >= 5.0 and hasattr(self, 'telegram_bot') and self.telegram_bot:
-                    alert_msg = f"🚨 기존보유 종목 급변동\n📊 {stock_code}: {current_price:,}원 ({change_rate:+.1f}%)"
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                     try:
-                        self.telegram_bot.send_notification_sync(alert_msg)
-                    except AttributeError:
-                        logger.debug("⚠️ 텔레그램 봇 알림 메서드 없음")
-                    except Exception as e:
-                        logger.error(f"❌ 텔레그램 알림 전송 실패: {e}")
+                        success = loop.run_until_complete(
+                            self.candle_trade_manager.setup_existing_holdings_monitoring()
+                        )
+                        if success:
+                            logger.info("✅ 캔들 시스템을 통한 기존 보유 종목 설정 완료")
+                        else:
+                            logger.warning("⚠️ 캔들 시스템을 통한 기존 보유 종목 설정 실패")
+                    finally:
+                        loop.close()
+                except Exception as e:
+                    logger.error(f"캔들 시스템 설정 오류: {e}")
+            else:
+                logger.warning("캔들 트레이딩 매니저 없음 - 기존 보유 종목 설정 건너뜀")
 
-            except Exception as e:
-                logger.error(f"기존 보유 종목 콜백 오류 ({stock_code}): {e}")
-
-        return existing_holding_callback
+        except Exception as e:
+            logger.error(f"기존 보유 종목 설정 오류: {e}")
 
     def _setup_existing_positions_threaded(self):
-        """보유 종목 설정을 별도 스레드에서 실행 (더 안전한 버전)"""
+        """기존 보유 종목 설정을 별도 스레드에서 실행 (간소화)"""
         try:
-            logger.info("📊 보유 종목 모니터링 설정 시작 (별도 스레드)")
+            logger.info("📊 기존 보유 종목 설정 시작 (별도 스레드)")
 
             def run_setup():
                 """별도 스레드에서 보유 종목 설정 실행"""
                 try:
-                    # 🔧 웹소켓이 완전히 준비될 때까지 더 오래 대기
-                    time.sleep(5)  # 5초 대기 (기존 2초에서 증가)
-
-                    # 🆕 웹소켓 상태 강제 확인 및 재연결 (웹소켓 매니저 메서드 사용)
-                    if self.websocket_manager:
-                        self.websocket_manager.force_ready()
-
+                    # 시스템 안정화 대기
+                    time.sleep(3)
                     self._setup_existing_positions_sync()
                 except Exception as e:
                     logger.error(f"보유 종목 설정 오류: {e}")
@@ -423,10 +227,10 @@ class StockBot:
             )
             setup_thread.start()
 
-            logger.info("✅ 보유 종목 모니터링 설정 스레드 시작")
+            logger.info("✅ 기존 보유 종목 설정 스레드 시작")
 
         except Exception as e:
-            logger.error(f"보유 종목 설정 스레드 시작 실패: {e}")
+            logger.error(f"기존 보유 종목 설정 스레드 시작 실패: {e}")
 
     def start(self):
         """StockBot 시작"""
@@ -436,15 +240,16 @@ class StockBot:
 
         try:
             self.is_running = True
-            logger.info("🔄 StockBot 가동 시작...")
+            logger.info("🚀 StockBot 시작!")
 
+            # 신호 핸들러 등록 (우아한 종료를 위해)
             signal.signal(signal.SIGINT, self._signal_handler)
 
             # 🆕 워커 매니저를 통한 백그라운드 작업 시작
             self.worker_manager.start_all_workers(self)
 
-            # 🆕 전략 스케줄러 백그라운드 시작
-            self._start_strategy_scheduler()
+            # 🆕 캔들 트레이딩 시스템 시작 (기존 전략 스케줄러 대체)
+            self._start_candle_trading_system()
 
             # 🆕 텔레그램 봇 시작
             self._start_telegram_bot()
@@ -452,7 +257,8 @@ class StockBot:
             # 🆕 웹소켓 연결 상태 확인 (이벤트 루프 충돌 방지)
             self._check_websocket_status()
 
-            # 🆕 보유 종목 자동 모니터링 설정
+            # 🆕 보유한 종목 자동 모니터링 설정
+            # 보유한 position_manager 변수에 저장
             self._setup_existing_positions_threaded()
 
             logger.info("✅ StockBot 완전 가동!")
@@ -469,37 +275,105 @@ class StockBot:
         finally:
             self.is_running = False
 
-    def _start_strategy_scheduler(self):
-        """전략 스케줄러 백그라운드 시작"""
+    def _start_candle_trading_system(self):
+        """🕯️ 캔들 트레이딩 시스템 시작"""
         try:
-            logger.info("📅 전략 스케줄러 백그라운드 시작...")
+            logger.info("🕯️ 캔들 트레이딩 시스템 시작")
 
-            def run_scheduler():
-                """스케줄러 실행 함수"""
+            def run_candle_trading():
+                """캔들 트레이딩 백그라운드 실행"""
                 try:
-                    # 새 이벤트 루프 생성
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
 
-                    # 스케줄러 시작
-                    loop.run_until_complete(self.strategy_scheduler.start_scheduler())
-                except Exception as e:
-                    logger.error(f"전략 스케줄러 실행 오류: {e}")
-                finally:
-                    loop.close()
+                    async def candle_trading_main():
+                        """캔들 트레이딩 메인 루프"""
+                        try:
+                            logger.info("🚀 캔들 트레이딩 메인 루프 시작")
 
-            # 별도 스레드에서 스케줄러 실행
-            scheduler_thread = threading.Thread(
-                target=run_scheduler,
-                name="StrategyScheduler",
+                            # 🔄 기존 보유 종목 캔들 분석 (시작 시 1회)
+                            logger.info("🔍 시작 시 기존 보유 종목 캔들 분석")
+                            existing_analysis = await self.candle_trade_manager.analyze_existing_holdings()
+
+                            if existing_analysis['analyzed_count'] > 0:
+                                logger.info(f"📊 기존 보유종목 분석 결과: "
+                                           f"총 {existing_analysis['analyzed_count']}개 종목, "
+                                           f"총평가액 {existing_analysis.get('total_value', 0):,}원")
+
+                                # 매도 권장 종목 로깅
+                                sell_recommendations = [
+                                    r for r in existing_analysis['recommendations']
+                                    if r['recommendation'] in ['STRONG_SELL', 'SELL']
+                                ]
+
+                                if sell_recommendations:
+                                    logger.warning(f"⚠️ 매도 권장 종목 {len(sell_recommendations)}개:")
+                                    for rec in sell_recommendations[:3]:  # 상위 3개만 표시
+                                        logger.warning(f"   {rec['stock_code']}({rec['stock_name']}): "
+                                                     f"{rec['recommendation']} - {rec['reasons'][0]}")
+                            else:
+                                logger.info("📊 분석할 기존 보유 종목 없음")
+
+                            # 메인 캔들 트레이딩 루프
+                            while self.is_running:
+                                try:
+                                    # 1. 새로운 매수 후보 탐색 및 분석
+                                    await self.candle_trade_manager._scan_market_for_patterns("0000")
+
+                                    # 2. 기존 포지션 관리
+                                    await self.candle_trade_manager._manage_existing_positions()
+
+                                    # 3. 주기적 기존 보유 종목 재분석 (2분마다)
+                                    current_time = time.time()
+                                    if not hasattr(self, '_last_existing_analysis_time'):
+                                        setattr(self, '_last_existing_analysis_time', current_time)
+
+                                    if current_time - getattr(self, '_last_existing_analysis_time', 0) > 120:  # 2분
+                                        logger.info("🔄 주기적 기존 보유 종목 재분석")
+                                        existing_analysis = await self.candle_trade_manager.analyze_existing_holdings()
+                                        setattr(self, '_last_existing_analysis_time', current_time)
+
+                                        if existing_analysis['analyzed_count'] > 0:
+                                            urgent_sells = [
+                                                r for r in existing_analysis['recommendations']
+                                                if r['recommendation'] == 'STRONG_SELL'
+                                            ]
+                                            if urgent_sells:
+                                                logger.warning(f"🚨 긴급 매도 권장: {len(urgent_sells)}개 종목")
+                                                for rec in urgent_sells:
+                                                    logger.warning(f"   🚨 {rec['stock_code']}: {rec['reasons'][0]}")
+
+                                    # 4. 대기
+                                    await asyncio.sleep(30)  # 30초 주기
+
+                                except Exception as e:
+                                    logger.error(f"캔들 트레이딩 루프 오류: {e}")
+                                    await asyncio.sleep(10)
+
+                        except Exception as e:
+                            logger.error(f"캔들 트레이딩 메인 루프 오류: {e}")
+
+                    # 비동기 루프 실행
+                    loop.run_until_complete(candle_trading_main())
+
+                except Exception as e:
+                    logger.error(f"캔들 트레이딩 시스템 오류: {e}")
+                finally:
+                    if 'loop' in locals():
+                        loop.close()
+
+            # 별도 스레드에서 실행
+            candle_thread = threading.Thread(
+                target=run_candle_trading,
+                name="CandleTradingSystem",
                 daemon=True
             )
-            scheduler_thread.start()
+            candle_thread.start()
 
-            logger.info("✅ 전략 스케줄러 백그라운드 시작 완료")
+            logger.info("✅ 캔들 트레이딩 시스템 백그라운드 시작 완료")
 
         except Exception as e:
-            logger.error(f"전략 스케줄러 시작 실패: {e}")
+            logger.error(f"캔들 트레이딩 시스템 시작 오류: {e}")
 
     def stop(self):
         """StockBot 중지"""
@@ -518,12 +392,12 @@ class StockBot:
         except Exception as e:
             logger.error(f"❌ 워커 정리 오류: {e}")
 
-        # 전략 스케줄러 중지
+        # 🆕 캔들 트레이딩 시스템 중지 (기존 전략 스케줄러 대체)
         try:
-            self.strategy_scheduler.stop_scheduler()
-            logger.info("✅ 전략 스케줄러 정리 완료")
+            self.candle_trade_manager.stop_trading()
+            logger.info("✅ 캔들 트레이딩 시스템 정리 완료")
         except Exception as e:
-            logger.error(f"❌ 전략 스케줄러 정리 오류: {e}")
+            logger.error(f"❌ 캔들 트레이딩 시스템 정리 오류: {e}")
 
         # 데이터 관리자 정리
         try:
@@ -548,14 +422,18 @@ class StockBot:
 
         # 관리자들 정리
         try:
-            self.position_manager.cleanup()
-            self.trading_manager.cleanup()
+            # 시스템 정리 (새로운 캔들 시스템만 정리)
+            if hasattr(self, 'candle_trade_manager'):
+                self.candle_trade_manager.stop_trading()
+
+            if hasattr(self, 'trading_manager') and hasattr(self.trading_manager, 'cleanup'):
+                self.trading_manager.cleanup()
             logger.info("✅ 모든 관리자 정리 완료")
         except Exception as e:
             logger.error(f"❌ 관리자 정리 오류: {e}")
 
         self._print_final_stats()
-        logger.info("🏁 StockBot 종료 완료")
+        logger.info("🛑 StockBot 종료 완료")
 
     def _main_loop(self):
         """메인 실행 루프"""
@@ -592,10 +470,10 @@ class StockBot:
                     logger.info(f"   💰 실행된 주문: {system_status['stats']['orders_executed']}개")
                     logger.info(f"   🔗 웹소켓 연결: {'✅' if system_status['websocket_connected'] else '❌'}")
 
-                    # 전략 스케줄러 상태
-                    scheduler_status = self.strategy_scheduler.get_status()
-                    logger.info(f"   📅 현재 시간대: {scheduler_status.get('current_slot', 'None')}")
-                    logger.info(f"   🎯 활성 전략: {scheduler_status.get('total_stocks', 0)}개 종목")
+                    # 🆕 캔들 트레이딩 시스템 상태 (기존 전략 스케줄러 대체)
+                    candle_status = self.candle_trade_manager.get_current_status()
+                    logger.info(f"   🕯️ 관찰 중인 종목: {candle_status.get('watching_stocks', 0)}개")
+                    logger.info(f"   📈 활성 포지션: {candle_status.get('active_positions', 0)}개")
 
                 # 기본 체크
                 market_status = self._check_market_status()
@@ -615,31 +493,6 @@ class StockBot:
                 time.sleep(5)
 
         logger.info("🛑 메인 루프 종료")
-
-    def handle_trading_signal(self, signal: dict):
-        """거래 신호 처리 - TradeExecutor 사용"""
-        try:
-            logger.info(f"📊 거래 신호 수신: {signal.get('stock_code', 'UNKNOWN')}")
-
-            # TradeExecutor를 통한 신호 처리
-            result = self.trade_executor.handle_signal(signal)
-
-            if result.get('success'):
-                logger.info(f"✅ 거래 신호 처리 성공: {result.get('message', '')}")
-
-                # 통계 업데이트
-                self.stats['signals_processed'] += 1
-                if result.get('order_executed'):
-                    self.stats['orders_executed'] += 1
-                    if signal.get('action') == 'BUY':
-                        self.stats['positions_opened'] += 1
-                    elif signal.get('action') == 'SELL':
-                        self.stats['positions_closed'] += 1
-            else:
-                logger.warning(f"⚠️ 거래 신호 처리 실패: {result.get('message', '')}")
-
-        except Exception as e:
-            logger.error(f"❌ 거래 신호 처리 오류: {e}")
 
     def _check_market_status(self) -> dict:
         """시장 상태 확인"""
@@ -719,16 +572,34 @@ class StockBot:
     def get_system_status(self) -> dict:
         """시스템 상태 조회"""
         try:
+            # 캔들 트레이딩 시스템 상태 조회
+            candle_stats = {'total_trades': 0, 'successful_trades': 0, 'failed_trades': 0}
+            if hasattr(self, 'candle_trade_manager') and hasattr(self.candle_trade_manager, 'get_current_status'):
+                candle_status = self.candle_trade_manager.get_current_status()
+                candle_stats.update(candle_status.get('daily_stats', {}))
+
             return {
                 'is_running': self.is_running,
                 'uptime': time.time() - self.stats['start_time'],
-                'stats': self.stats.copy(),
+                'stats': self.stats.copy(),  # 기본 통계 (signals_processed 포함)
                 'market_status': self._check_market_status(),
-                'positions': len(self.position_manager.get_positions('active')),
+                'positions': 0,  # 새로운 시스템에서 관리
                 'websocket_connected': (
                     self.websocket_manager.is_connected
                     if self.websocket_manager else False
-                )
+                ),
+                'data_collector_running': (
+                    self.data_collector is not None and
+                    hasattr(self.data_collector, 'is_running') and
+                    getattr(self.data_collector, 'is_running', False)
+                ),
+                'trading_active': (
+                    hasattr(self, 'candle_trade_manager') and
+                    hasattr(self.candle_trade_manager, 'is_running') and
+                    self.candle_trade_manager.is_running
+                ),
+                'active_positions': 0,  # 새로운 시스템에서 관리
+                'candle_stats': candle_stats  # 캔들 트레이딩 통계는 별도 키로
             }
         except Exception as e:
             logger.error(f"시스템 상태 조회 오류: {e}")
@@ -739,17 +610,17 @@ class StockBot:
         try:
             system_status = self.get_system_status()
 
-            # 스케줄러 상태 추가
-            scheduler_status = {}
-            if hasattr(self.strategy_scheduler, 'get_status'):
-                scheduler_status = self.strategy_scheduler.get_status()
+            # 🆕 캔들 트레이딩 시스템 상태 추가 (기존 스케줄러 상태 대체)
+            candle_status = {}
+            if hasattr(self.candle_trade_manager, 'get_current_status'):
+                candle_status = self.candle_trade_manager.get_current_status()
 
             return {
                 'bot_running': self.is_running,
                 'websocket_connected': system_status.get('websocket_connected', False),
                 'api_connected': True,  # REST API는 항상 사용 가능하다고 가정
-                'data_collector_running': True,
-                'scheduler': scheduler_status,
+                'data_collector_running': system_status.get('data_collector_running', False),
+                'candle_trading': candle_status,  # 🆕 캔들 트레이딩 상태
                 'uptime': system_status.get('uptime', 0),
                 'stats': system_status.get('stats', {}),
                 'positions_count': system_status.get('positions', 0)
@@ -816,41 +687,60 @@ class StockBot:
             logger.debug("📱 텔레그램 봇이 비활성화되어 시작하지 않습니다")
 
     def _check_websocket_status(self):
-        """웹소켓 연결 상태 확인 (안전한 방식)"""
+        """웹소켓 상태 확인 (안전한 방식 - RuntimeWarning 방지)"""
         try:
-            logger.info("🔗 웹소켓 연결 상태 확인")
+            logger.info("🔍 웹소켓 상태 확인")
 
             if self.websocket_manager:
-                # 현재 연결 상태만 확인
+                # 🔧 단순한 상태 확인만 수행 (연결 시도 없이)
                 is_connected = getattr(self.websocket_manager, 'is_connected', False)
+                is_healthy = getattr(self.websocket_manager, 'is_healthy', lambda: False)()
 
-                if is_connected:
-                    logger.info("✅ 웹소켓 이미 연결됨")
+                logger.info(f"📡 웹소켓 연결 상태: {'✅' if is_connected else '❌'}")
+                logger.info(f"🏥 웹소켓 건강 상태: {'✅' if is_healthy else '❌'}")
+
+                if is_connected and is_healthy:
+                    logger.info("✅ 웹소켓 상태 정상")
+
+                    # 구독 정보도 확인
+                    try:
+                        subscribed_count = len(self.websocket_manager.get_subscribed_stocks())
+                        usage = self.websocket_manager.get_websocket_usage()
+                        logger.info(f"📊 구독 현황: {subscribed_count}개 종목, 사용량: {usage}")
+                    except Exception as e:
+                        logger.debug(f"구독 정보 확인 중 오류: {e}")
+
+                elif is_connected and not is_healthy:
+                    logger.warning("⚠️ 웹소켓이 연결되었지만 상태가 불안정합니다")
+                    logger.info("💡 백그라운드에서 자동 복구가 진행됩니다")
                 else:
-                    logger.warning("⚠️ 웹소켓 연결되지 않음 - 백그라운드에서 자동 연결됩니다")
+                    logger.warning("❌ 웹소켓이 연결되지 않았습니다")
+                    logger.info("💡 백그라운드에서 자동 연결이 시도됩니다")
 
-                    # 별도 스레드에서 안전하게 연결 시도
-                    def websocket_connect_thread():
+                    # 🆕 비동기 연결 시도 (별도 스레드에서 안전하게)
+                    def async_reconnect():
                         try:
-                            time.sleep(2)  # 초기화 완료 대기
-                            self.websocket_manager.ensure_connection()
-                            logger.info("✅ 웹소켓 백그라운드 연결 완료")
+                            if hasattr(self.websocket_manager, 'start'):
+                                self.websocket_manager.start()
+                                logger.info("🔄 웹소켓 재연결 백그라운드 시도 완료")
                         except Exception as e:
-                            logger.error(f"❌ 웹소켓 백그라운드 연결 실패: {e}")
+                            logger.debug(f"백그라운드 재연결 시도 중 오류: {e}")
 
+                    # 별도 스레드에서 연결 시도 (메인 스레드 블로킹 방지)
                     import threading
-                    websocket_thread = threading.Thread(
-                        target=websocket_connect_thread,
-                        name="WebSocketConnect",
+                    reconnect_thread = threading.Thread(
+                        target=async_reconnect,
+                        name="WebSocketReconnect",
                         daemon=True
                     )
-                    websocket_thread.start()
+                    reconnect_thread.start()
+
             else:
-                logger.error("❌ 웹소켓 매니저가 없습니다")
+                logger.warning("⚠️ 웹소켓 매니저가 초기화되지 않았습니다")
 
         except Exception as e:
-            logger.error(f"❌ 웹소켓 상태 확인 실패: {e}")
-            logger.warning("⚠️ 웹소켓은 필수 구성요소입니다 - 연결 문제를 확인하세요")
+            logger.error(f"웹소켓 상태 확인 오류: {e}")
+            logger.info("💡 웹소켓 매니저가 백그라운드에서 자동으로 관리됩니다")
 
 def main():
     """메인 함수"""

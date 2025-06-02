@@ -1,11 +1,12 @@
 """
-KIS 웹소켓 매니저 (리팩토링 버전 - Facade 패턴)
+KIS 웹소켓 매니저 (Facade 패턴)
 """
 import asyncio
 import threading
 import time
 from typing import Dict, List, Optional, Callable, Any
 from utils.logger import setup_logger
+from datetime import datetime
 
 # 분리된 컴포넌트들
 from .kis_websocket_connection import KISWebSocketConnection
@@ -18,9 +19,7 @@ logger = setup_logger(__name__)
 
 class KISWebSocketManager:
     """
-    KIS 웹소켓 매니저 (리팩토링 버전 - Facade 패턴)
-
-    기존 인터페이스를 100% 유지하면서 내부적으로는 분리된 컴포넌트들을 사용
+    KIS 웹소켓 매니저 (Facade 패턴)
     """
 
     def __init__(self):
@@ -320,15 +319,32 @@ class KISWebSocketManager:
             try:
                 # 연결 정리
                 try:
-                    # 동기식이므로 await 사용 불가
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        loop.run_until_complete(self.connection.safe_disconnect())
-                    finally:
-                        loop.close()
+                    if self.connection:
+                        try:
+                            # 동기 방식으로 안전하게 연결 해제
+                            logger.debug("웹소켓 연결 정리 시작")
+
+                            # 웹소켓 직접 종료
+                            if hasattr(self.connection, 'websocket') and self.connection.websocket:
+                                try:
+                                    if not getattr(self.connection.websocket, 'closed', True):
+                                        self.connection.websocket.close()
+                                        logger.debug("웹소켓 연결 종료됨")
+                                except Exception as e:
+                                    logger.debug(f"웹소켓 종료 중 오류: {e}")
+
+                            # 연결 상태 플래그 정리
+                            if hasattr(self.connection, 'is_connected'):
+                                self.connection.is_connected = False
+                            if hasattr(self.connection, 'is_running'):
+                                self.connection.is_running = False
+
+                            logger.debug("웹소켓 연결 정리 완료")
+
+                        except Exception as e:
+                            logger.debug(f"연결 정리 중 오류: {e}")
                 except Exception as e:
-                    logger.debug(f"연결 정리 중 오류: {e}")
+                    logger.debug(f"연결 해제 중 오류: {e}")
             except Exception as e:
                 logger.debug(f"연결 해제 중 오류: {e}")
 
@@ -631,6 +647,124 @@ class KISWebSocketManager:
             time.sleep(2)  # 연결 대기
 
     # ==========================================
+    # 🆕 main.py를 위한 통합 관리 메서드들
+    # ==========================================
+
+    def check_and_ensure_connection(self) -> bool:
+        """웹소켓 연결 상태 확인 및 필요시 연결 복구"""
+        try:
+            is_connected = self.is_connected
+            is_healthy = self.is_healthy()
+
+            logger.info(f"🔍 웹소켓 상태 확인: 연결={is_connected}, 건강={is_healthy}")
+
+            if is_connected and is_healthy:
+                # 추가 사용량 정보
+                usage = self.get_websocket_usage()
+                logger.info(f"📊 웹소켓 사용량: {usage}")
+                return True
+            elif is_connected and not is_healthy:
+                logger.warning("⚠️ 웹소켓 연결은 있지만 상태 불량 - 복구 시도")
+                return self.ensure_connection()
+            else:
+                logger.warning("❌ 웹소켓 연결 끊어짐 - 재연결 시도")
+                return self.reconnect()
+
+        except Exception as e:
+            logger.error(f"웹소켓 상태 확인 오류: {e}")
+            return False
+
+    def ensure_connection(self) -> bool:
+        """웹소켓 연결 보장 (동기 방식)"""
+        try:
+            if hasattr(self, 'connection') and hasattr(self.connection, 'ensure_connection'):
+                return self.connection.ensure_connection()
+            else:
+                # 백업: 기본 연결 시도
+                return self.connect()
+        except Exception as e:
+            logger.error(f"웹소켓 연결 보장 오류: {e}")
+            return False
+
+    def reconnect(self) -> bool:
+        """웹소켓 재연결 (동기 방식)"""
+        try:
+            if hasattr(self, 'connection') and hasattr(self.connection, 'connect'):
+                return self.connection.connect()
+            else:
+                # 백업: 직접 연결 시도
+                return self.connect()
+        except Exception as e:
+            logger.error(f"웹소켓 재연결 오류: {e}")
+            return False
+
+    def connect(self) -> bool:
+        """웹소켓 연결 (기본 동기 방식)"""
+        try:
+            # 이미 연결되어 있으면 성공
+            if self.is_connected:
+                return True
+
+            # 연결 시도 (실제 구현은 connection 객체에서)
+            if hasattr(self, 'connection'):
+                # 비동기 연결을 동기 방식으로 실행
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # 이미 실행 중인 루프에서는 태스크 생성
+                        return False  # 동기 방식으로는 불가능
+                    else:
+                        # 새 루프에서 실행
+                        return loop.run_until_complete(self.connection.connect())
+                except Exception:
+                    # 이벤트 루프 문제시 기본 연결 시도
+                    if hasattr(self.connection, 'connect_sync'):
+                        return self.connection.connect_sync()
+                    else:
+                        logger.warning("동기 방식 연결 방법 없음")
+                        return False
+            return False
+
+        except Exception as e:
+            logger.error(f"웹소켓 기본 연결 오류: {e}")
+            return False
+
+    def is_healthy(self) -> bool:
+        """웹소켓 건강성 확인"""
+        try:
+            if hasattr(self, 'connection') and hasattr(self.connection, 'is_healthy'):
+                return self.connection.is_healthy()
+            else:
+                # 기본: 연결 상태로 건강성 판단
+                return self.is_connected
+        except Exception as e:
+            logger.debug(f"웹소켓 건강성 확인 오류: {e}")
+            return False
+
+    def get_status_summary(self) -> Dict:
+        """웹소켓 상태 요약 정보"""
+        try:
+            return {
+                'connected': self.is_connected,
+                'healthy': self.is_healthy(),
+                'subscribed_stocks': len(self.get_subscribed_stocks()),
+                'subscription_capacity': self.subscription_manager.has_subscription_capacity(),
+                'usage': self.get_websocket_usage(),
+                'last_check_time': datetime.now().strftime('%H:%M:%S')
+            }
+        except Exception as e:
+            logger.error(f"웹소켓 상태 요약 오류: {e}")
+            return {
+                'connected': False,
+                'healthy': False,
+                'subscribed_stocks': 0,
+                'subscription_capacity': False,
+                'usage': '0/0',
+                'last_check_time': datetime.now().strftime('%H:%M:%S'),
+                'error': str(e)
+            }
+
+    # ==========================================
     # 정리 및 종료
     # ==========================================
 
@@ -667,36 +801,32 @@ class KISWebSocketManager:
 
             # 🔧 안전한 연결 정리 (이벤트 루프 충돌 방지)
             try:
-                # 현재 실행 중인 이벤트 루프 확인
-                try:
-                    current_loop = asyncio.get_running_loop()
-                    logger.debug("이미 실행 중인 이벤트 루프가 있음 - 동기 방식으로 정리")
-
-                    # 웹소켓 동기 방식 정리
-                    if hasattr(self.connection, 'websocket') and self.connection.websocket:
-                        # 웹소켓 직접 종료 (동기)
-                        try:
-                            if not getattr(self.connection.websocket, 'closed', True):
-                                self.connection.websocket.close()
-                        except Exception as e:
-                            logger.debug(f"웹소켓 직접 종료 중 오류: {e}")
-
-                    # 연결 상태 플래그 정리
-                    self.connection.is_connected = False
-                    self.connection.is_running = False
-
-                except RuntimeError:
-                    # 실행 중인 이벤트 루프가 없는 경우 - 새 루프 생성
-                    logger.debug("실행 중인 이벤트 루프 없음 - 새 루프로 정리")
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                if self.connection:
                     try:
-                        loop.run_until_complete(self.connection.safe_disconnect())
-                    finally:
-                        loop.close()
+                        # 동기 방식으로 안전하게 연결 해제
+                        logger.debug("웹소켓 연결 정리 시작")
 
+                        # 웹소켓 직접 종료
+                        if hasattr(self.connection, 'websocket') and self.connection.websocket:
+                            try:
+                                if not getattr(self.connection.websocket, 'closed', True):
+                                    self.connection.websocket.close()
+                                    logger.debug("웹소켓 연결 종료됨")
+                            except Exception as e:
+                                logger.debug(f"웹소켓 종료 중 오류: {e}")
+
+                        # 연결 상태 플래그 정리
+                        if hasattr(self.connection, 'is_connected'):
+                            self.connection.is_connected = False
+                        if hasattr(self.connection, 'is_running'):
+                            self.connection.is_running = False
+
+                        logger.debug("웹소켓 연결 정리 완료")
+
+                    except Exception as e:
+                        logger.debug(f"연결 정리 중 오류: {e}")
             except Exception as e:
-                logger.debug(f"연결 정리 중 오류: {e}")
+                logger.debug(f"연결 해제 중 오류: {e}")
 
             # 구독 정리
             self.subscription_manager.clear_all_subscriptions()

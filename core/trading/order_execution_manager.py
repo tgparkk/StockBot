@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 웹소켓 NOTICE 기반 주문 실행 결과 처리 관리자
 실제 체결 통보를 받아 포지션과 거래 기록을 업데이트
@@ -8,6 +9,7 @@ from typing import Dict, List, Optional, Callable
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from utils.logger import setup_logger
+from core.trading.position_manager import PositionManager
 
 logger = setup_logger(__name__)
 
@@ -24,7 +26,7 @@ class PendingOrder:
     timestamp: datetime
     timeout_seconds: int = 300  # 5분 타임아웃
     account_no: str = ""        # 계좌번호 (체결통보 검증용)
-    
+
     def is_expired(self) -> bool:
         """주문 타임아웃 여부"""
         return (datetime.now() - self.timestamp).total_seconds() > self.timeout_seconds
@@ -32,16 +34,16 @@ class PendingOrder:
 
 class OrderExecutionManager:
     """🎯 웹소켓 NOTICE 기반 주문 실행 결과 처리 관리자"""
-    
-    def __init__(self, position_manager, trade_db, async_logger):
-        """초기화"""
+
+    def __init__(self, trade_db, async_logger, position_manager: Optional[PositionManager] = None):
+        """초기화 - position_manager는 선택적 매개변수로 변경"""
         self.position_manager = position_manager
         self.trade_db = trade_db
         self.async_logger = async_logger
-        
+
         # 🎯 대기 중인 주문들 (주문ID로 관리)
         self.pending_orders: Dict[str, PendingOrder] = {}
-        
+
         # 📊 통계
         self.stats = {
             'orders_sent': 0,
@@ -50,12 +52,15 @@ class OrderExecutionManager:
             'orders_error': 0,
             'last_execution_time': None
         }
-        
+
         # 콜백 함수들
         self.execution_callbacks: List[Callable] = []
-        
-        logger.info("✅ 주문 실행 관리자 초기화 완료")
-    
+
+        if self.position_manager:
+            logger.info("✅ 주문 실행 관리자 초기화 완료 (PositionManager 연동)")
+        else:
+            logger.info("✅ 주문 실행 관리자 초기화 완료 (PositionManager 없음 - API 직접 사용)")
+
     def add_pending_order(self, order_id: str, stock_code: str, order_type: str,
                          quantity: int, price: int, strategy_type: str) -> bool:
         """대기 중인 주문 추가"""
@@ -63,7 +68,7 @@ class OrderExecutionManager:
             if not order_id:
                 logger.error("❌ 주문ID가 없습니다")
                 return False
-            
+
             pending_order = PendingOrder(
                 order_id=order_id,
                 stock_code=stock_code,
@@ -73,17 +78,17 @@ class OrderExecutionManager:
                 strategy_type=strategy_type,
                 timestamp=datetime.now()
             )
-            
+
             self.pending_orders[order_id] = pending_order
             self.stats['orders_sent'] += 1
-            
+
             logger.info(f"📝 대기 주문 등록: {order_type} {stock_code} {quantity:,}주 @{price:,}원 (ID: {order_id})")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ 대기 주문 등록 실패: {e}")
             return False
-    
+
     async def handle_execution_notice(self, notice_data: Dict) -> bool:
         """🔔 웹소켓 NOTICE 체결통보 처리"""
         try:
@@ -92,44 +97,44 @@ class OrderExecutionManager:
             if not execution_info:
                 logger.warning("⚠️ 체결통보 데이터 파싱 실패")
                 return False
-            
+
             order_id = execution_info.get('order_id', '')
             if not order_id:
                 logger.warning("⚠️ 체결통보에 주문ID가 없습니다")
                 return False
-            
+
             # 대기 중인 주문 확인
             if order_id not in self.pending_orders:
                 logger.warning(f"⚠️ 대기 중이지 않은 주문ID: {order_id}")
                 return False
-            
+
             pending_order = self.pending_orders[order_id]
-            
+
             # 체결 정보 검증
             if not self._validate_execution(pending_order, execution_info):
                 logger.error(f"❌ 체결 정보 검증 실패: {order_id}")
                 return False
-            
+
             # 체결 처리
             success = await self._process_execution(pending_order, execution_info)
-            
+
             if success:
                 # 대기 목록에서 제거
                 del self.pending_orders[order_id]
                 self.stats['orders_filled'] += 1
                 self.stats['last_execution_time'] = datetime.now()
-                
+
                 logger.info(f"✅ 체결 처리 완료: {pending_order.order_type} {pending_order.stock_code}")
-                
+
                 # 콜백 실행
                 await self._execute_callbacks(pending_order, execution_info)
-                
+
             return success
-            
+
         except Exception as e:
             logger.error(f"❌ 체결통보 처리 오류: {e}")
             return False
-    
+
     def _parse_notice_data(self, notice_data: Dict) -> Optional[Dict]:
         """🔔 체결통보 데이터 파싱 - KIS 공식 문서 기준 (실전투자 전용)"""
         try:
@@ -138,19 +143,19 @@ class OrderExecutionManager:
             if not data:
                 logger.warning("⚠️ 체결통보 데이터가 없습니다")
                 return None
-            
+
             # 🔒 체결통보 데이터는 암호화되어 전송됨 - 복호화 필요
             # 실제로는 data_parser에서 복호화된 데이터가 전달되어야 함
             if isinstance(data, str) and data.startswith('encrypt:'):
                 logger.warning("⚠️ 암호화된 체결통보 데이터 - 복호화 처리 필요")
                 return None
-            
+
             # KIS 공식 문서에 따른 '^' 구분자로 필드 분리
             parts = data.split('^')
             if len(parts) < 25:  # 최소 필요 필드 수
                 logger.warning(f"⚠️ 체결통보 데이터 필드 부족: {len(parts)}개 (최소 25개 필요)")
                 return None
-            
+
             # 🎯 KIS 공식 문서에 따른 정확한 필드 매핑
             execution_info = {
                 'cust_id': parts[0],                    # CUST_ID: 고객 ID
@@ -181,18 +186,18 @@ class OrderExecutionManager:
                 'order_price': parts[25] if len(parts) > 25 else '',  # ODER_PRC: 주문가격
                 'timestamp': notice_data.get('timestamp', datetime.now())
             }
-            
+
             # 🎯 체결여부 검증 (가장 중요!)
             execution_yn = execution_info['execution_yn']
             if execution_yn != '2':
                 logger.debug(f"📋 체결통보가 아님 (CNTG_YN={execution_yn}): 1=접수통보, 2=체결통보")
                 return None  # 체결통보가 아니면 처리하지 않음
-            
+
             # 🔍 거부 여부 확인
             if execution_info['reject_yn'] == 'Y':
                 logger.warning(f"❌ 주문 거부됨: {execution_info['order_id']}")
                 return None
-            
+
             # 📊 숫자 필드 변환 및 검증
             try:
                 execution_info['executed_quantity'] = int(execution_info['executed_quantity']) if execution_info['executed_quantity'] else 0
@@ -202,7 +207,7 @@ class OrderExecutionManager:
             except (ValueError, TypeError) as e:
                 logger.error(f"❌ 숫자 필드 변환 오류: {e}")
                 return None
-            
+
             # 💰 매매구분 변환 (KIS 코드 -> 표준 형식)
             buy_sell_code = execution_info['buy_sell_code']
             if buy_sell_code == '01':
@@ -212,43 +217,43 @@ class OrderExecutionManager:
             else:
                 logger.warning(f"⚠️ 알 수 없는 매매구분: {buy_sell_code}")
                 execution_info['order_type'] = 'UNKNOWN'
-            
+
             # ✅ 체결 수량 검증
             if execution_info['executed_quantity'] <= 0:
                 logger.warning(f"⚠️ 체결수량이 0 이하: {execution_info['executed_quantity']}")
                 return None
-            
-            # ✅ 체결 가격 검증  
+
+            # ✅ 체결 가격 검증
             if execution_info['executed_price'] <= 0:
                 logger.warning(f"⚠️ 체결가격이 0 이하: {execution_info['executed_price']}")
                 return None
-            
+
             logger.info(f"✅ 체결통보 파싱 성공: {execution_info['order_type']} {execution_info['stock_code']} "
                        f"{execution_info['executed_quantity']:,}주 @{execution_info['executed_price']:,}원 "
                        f"(주문ID: {execution_info['order_id']})")
-            
+
             return execution_info
-            
+
         except Exception as e:
             logger.error(f"❌ 체결통보 파싱 오류: {e}")
             return None
-    
+
     def _validate_execution(self, pending_order: PendingOrder, execution_info: Dict) -> bool:
         """🔍 체결 정보 검증 - KIS 공식 문서 기준 (임시 주문ID 지원)"""
         try:
             pending_order_id = pending_order.order_id
             execution_order_id = execution_info.get('order_id', '')
-            
+
             # 🎯 주문번호 일치 확인 (임시 주문ID 처리)
             if pending_order_id.startswith('TEMP_'):
                 # 임시 주문ID인 경우: 종목코드와 시간으로 매칭
                 logger.info(f"🔄 임시 주문ID 검증: {pending_order_id}")
-                
+
                 # 종목코드가 일치하는지 확인
                 if pending_order.stock_code != execution_info.get('stock_code', ''):
                     logger.error(f"❌ 임시주문 종목코드 불일치: {pending_order.stock_code} vs {execution_info.get('stock_code')}")
                     return False
-                
+
                 # 시간 범위 확인 (임시 주문ID 생성 후 5분 이내)
                 try:
                     temp_timestamp = int(pending_order_id.split('_')[-1])
@@ -258,60 +263,60 @@ class OrderExecutionManager:
                         return False
                 except (ValueError, IndexError):
                     logger.warning(f"⚠️ 임시주문ID 형식 오류: {pending_order_id}")
-                    
+
                 logger.info(f"✅ 임시 주문ID 검증 통과: {pending_order_id} → {execution_order_id}")
-                
+
             else:
                 # 일반 주문ID인 경우: 정확히 일치해야 함
                 if pending_order_id != execution_order_id:
                     logger.error(f"❌ 주문번호 불일치: {pending_order_id} vs {execution_order_id}")
                     return False
-            
+
             # 🎯 종목코드 일치 확인
             if pending_order.stock_code != execution_info.get('stock_code', ''):
                 logger.error(f"❌ 종목코드 불일치: {pending_order.stock_code} vs {execution_info.get('stock_code')}")
                 return False
-            
+
             # 🎯 주문구분 일치 확인
             if pending_order.order_type != execution_info.get('order_type', ''):
                 logger.error(f"❌ 주문구분 불일치: {pending_order.order_type} vs {execution_info.get('order_type')}")
                 return False
-            
+
             # 🎯 체결수량 검증
             executed_quantity = execution_info.get('executed_quantity', 0)
             if executed_quantity <= 0:
                 logger.error(f"❌ 체결수량 오류: {executed_quantity}")
                 return False
-            
+
             # 🎯 체결수량이 주문수량을 초과하지 않는지 확인
             if executed_quantity > pending_order.quantity:
                 logger.error(f"❌ 체결수량 초과: {executed_quantity} > {pending_order.quantity}")
                 return False
-            
+
             # 🎯 체결가격 검증
             executed_price = execution_info.get('executed_price', 0)
             if executed_price <= 0:
                 logger.error(f"❌ 체결가격 오류: {executed_price}")
                 return False
-            
+
             # 🎯 주문가격과 체결가격 비교 (합리적 범위 내인지)
             if pending_order.price > 0:
                 price_diff_pct = abs(executed_price - pending_order.price) / pending_order.price
                 if price_diff_pct > 0.1:  # 10% 이상 차이나면 경고
                     logger.warning(f"⚠️ 주문가격과 체결가격 차이 큼: 주문={pending_order.price:,}원, 체결={executed_price:,}원 ({price_diff_pct:.1%})")
                     # 하지만 체결은 유효하므로 계속 진행
-            
+
             # 🎯 거부 상태 재확인 (파싱에서도 확인했지만 이중 검증)
             if execution_info.get('reject_yn', 'N') == 'Y':
                 logger.error(f"❌ 거부된 주문: {execution_info.get('order_id')}")
                 return False
-            
+
             # 🎯 계좌번호 검증 (선택사항 - TradingManager에서 계좌번호 가져올 수 있으면)
             expected_account = getattr(pending_order, 'account_no', None)
             if expected_account and expected_account != execution_info.get('account_no', ''):
                 logger.warning(f"⚠️ 계좌번호 불일치: {expected_account} vs {execution_info.get('account_no')}")
                 # 경고만 출력하고 계속 진행
-            
+
             # 🎯 체결시간 검증 (너무 오래된 체결통보는 무시)
             execution_time = execution_info.get('execution_time', '')
             if execution_time and len(execution_time) == 6:  # HHMMSS 형식
@@ -321,64 +326,68 @@ class OrderExecutionManager:
                     exec_hour = int(execution_time[0:2])
                     exec_minute = int(execution_time[2:4])
                     exec_second = int(execution_time[4:6])
-                    
+
                     # 오늘 날짜의 체결시간 생성
                     execution_datetime = datetime.combine(
-                        current_time.date(), 
+                        current_time.date(),
                         dt_time(exec_hour, exec_minute, exec_second)
                     )
-                    
+
                     # 체결시간이 현재시간보다 미래이거나 1시간 이상 과거면 경고
                     time_diff = (current_time - execution_datetime).total_seconds()
                     if time_diff < -60:  # 미래 시간
                         logger.warning(f"⚠️ 미래 체결시간: {execution_time}")
                     elif time_diff > 3600:  # 1시간 이상 과거
                         logger.warning(f"⚠️ 오래된 체결통보: {execution_time} ({time_diff/60:.1f}분 전)")
-                    
+
                 except ValueError:
                     logger.warning(f"⚠️ 체결시간 형식 오류: {execution_time}")
-            
+
             logger.debug(f"✅ 체결 정보 검증 통과: {pending_order.order_type} {pending_order.stock_code} "
                         f"{executed_quantity:,}주 @{executed_price:,}원")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ 체결 검증 오류: {e}")
             return False
-    
+
     async def _process_execution(self, pending_order: PendingOrder, execution_info: Dict) -> bool:
         """체결 처리"""
         try:
             executed_quantity = execution_info['executed_quantity']
             executed_price = execution_info['executed_price']
-            
+
             if pending_order.order_type == 'BUY':
                 # 📈 매수 체결 처리
                 success = await self._process_buy_execution(pending_order, execution_info)
             else:
                 # 📉 매도 체결 처리
                 success = await self._process_sell_execution(pending_order, execution_info)
-            
+
             return success
-            
+
         except Exception as e:
             logger.error(f"❌ 체결 처리 오류: {e}")
             return False
-    
+
     async def _process_buy_execution(self, pending_order: PendingOrder, execution_info: Dict) -> bool:
         """매수 체결 처리"""
         try:
             executed_quantity = execution_info['executed_quantity']
             executed_price = execution_info['executed_price']
-            
-            # 1. 포지션 매니저에 추가
-            self.position_manager.add_position(
-                stock_code=pending_order.stock_code,
-                quantity=executed_quantity,
-                buy_price=executed_price,
-                strategy_type=pending_order.strategy_type
-            )
-            
+
+            # 1. 포지션 매니저에 추가 (선택적)
+            if self.position_manager:
+                self.position_manager.add_position(
+                    stock_code=pending_order.stock_code,
+                    quantity=executed_quantity,
+                    buy_price=executed_price,
+                    strategy_type=pending_order.strategy_type
+                )
+                logger.debug(f"✅ PositionManager에 포지션 추가: {pending_order.stock_code}")
+            else:
+                logger.info(f"💡 PositionManager 없음 - KIS API로 포지션 관리: {pending_order.stock_code}")
+
             # 2. 거래 기록 저장
             trade_id = self.trade_db.record_buy_trade(
                 stock_code=pending_order.stock_code,
@@ -396,7 +405,7 @@ class OrderExecutionManager:
                 },
                 notes=f"웹소켓 체결통보 기반 매수 완료"
             )
-            
+
             # 3. 비동기 로깅
             from .async_data_logger import log_buy_success
             log_buy_success(
@@ -410,33 +419,37 @@ class OrderExecutionManager:
                     'execution_info': execution_info
                 }
             )
-            
+
             logger.info(f"✅ 매수 체결 완료: {pending_order.stock_code} {executed_quantity:,}주 @{executed_price:,}원 (거래ID: {trade_id})")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ 매수 체결 처리 오류: {e}")
             return False
-    
+
     async def _process_sell_execution(self, pending_order: PendingOrder, execution_info: Dict) -> bool:
         """매도 체결 처리"""
         try:
             executed_quantity = execution_info['executed_quantity']
             executed_price = execution_info['executed_price']
-            
-            # 1. 포지션에서 제거/수정
-            self.position_manager.remove_position(
-                pending_order.stock_code, 
-                executed_quantity, 
-                executed_price
-            )
-            
+
+            # 1. 포지션에서 제거/수정 (선택적)
+            if self.position_manager:
+                self.position_manager.remove_position(
+                    pending_order.stock_code,
+                    executed_quantity,
+                    executed_price
+                )
+                logger.debug(f"✅ PositionManager에서 포지션 제거: {pending_order.stock_code}")
+            else:
+                logger.info(f"💡 PositionManager 없음 - KIS API로 포지션 관리: {pending_order.stock_code}")
+
             # 2. 거래 기록 저장
             buy_trade_id = self.trade_db.find_buy_trade_for_sell(
-                pending_order.stock_code, 
+                pending_order.stock_code,
                 executed_quantity
             )
-            
+
             trade_id = self.trade_db.record_sell_trade(
                 stock_code=pending_order.stock_code,
                 stock_name=pending_order.stock_code,  # 실제로는 종목명 조회
@@ -454,14 +467,14 @@ class OrderExecutionManager:
                 },
                 notes=f"웹소켓 체결통보 기반 매도 완료"
             )
-            
+
             logger.info(f"✅ 매도 체결 완료: {pending_order.stock_code} {executed_quantity:,}주 @{executed_price:,}원 (거래ID: {trade_id})")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ 매도 체결 처리 오류: {e}")
             return False
-    
+
     async def _execute_callbacks(self, pending_order: PendingOrder, execution_info: Dict):
         """콜백 함수들 실행"""
         try:
@@ -475,40 +488,40 @@ class OrderExecutionManager:
                     logger.error(f"❌ 콜백 실행 오류: {e}")
         except Exception as e:
             logger.error(f"❌ 콜백 실행 중 오류: {e}")
-    
+
     def add_execution_callback(self, callback: Callable):
         """체결 콜백 함수 추가"""
         self.execution_callbacks.append(callback)
-    
+
     def cleanup_expired_orders(self):
         """만료된 대기 주문 정리"""
         try:
             current_time = datetime.now()
             expired_orders = []
-            
+
             for order_id, pending_order in self.pending_orders.items():
                 if pending_order.is_expired():
                     expired_orders.append(order_id)
-            
+
             for order_id in expired_orders:
                 pending_order = self.pending_orders.pop(order_id)
                 self.stats['orders_timeout'] += 1
-                
+
                 logger.warning(f"⏰ 주문 타임아웃: {pending_order.order_type} {pending_order.stock_code} (ID: {order_id})")
-                
+
                 # 타임아웃된 주문에 대한 추가 처리 (필요시)
                 # 예: 주문 취소 API 호출
-            
+
             if expired_orders:
                 logger.info(f"🧹 만료된 주문 정리 완료: {len(expired_orders)}개")
-                
+
         except Exception as e:
             logger.error(f"❌ 만료 주문 정리 오류: {e}")
-    
+
     def get_pending_orders_count(self) -> int:
         """대기 중인 주문 수"""
         return len(self.pending_orders)
-    
+
     def get_stats(self) -> Dict:
         """통계 정보"""
         return {
@@ -525,4 +538,4 @@ class OrderExecutionManager:
                 }
                 for order in self.pending_orders.values()
             ]
-        } 
+        }
