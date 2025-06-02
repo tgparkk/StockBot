@@ -422,50 +422,6 @@ class TechnicalIndicators:
             'timestamp': ''
         }
 
-    @classmethod
-    def get_quick_signals(cls, price_data: List[Dict]) -> Dict[str, any]:
-        """빠른 신호 분석 (단기거래용)"""
-        try:
-            if not price_data or len(price_data) < 3:
-                return {'action': 'HOLD', 'strength': 0, 'reason': '데이터 부족'}
-
-            # 최근 3개 데이터만 사용 (빠른 분석)
-            recent_data = price_data[-3:]
-            closes = [float(d.get('stck_clpr', 0)) for d in recent_data]
-            volumes = [int(d.get('acml_vol', 0)) for d in recent_data]
-
-            current_price = closes[-1]
-            prev_price = closes[-2] if len(closes) > 1 else current_price
-            change_rate = ((current_price - prev_price) / prev_price * 100) if prev_price > 0 else 0
-
-            # 간단한 RSI (3기간)
-            simple_rsi = cls.calculate_rsi(closes, period=min(3, len(closes)))[-1]
-
-            # 빠른 판단
-            if change_rate > 2.0 and simple_rsi < 70:
-                return {
-                    'action': 'BUY',
-                    'strength': min(int(change_rate * 10), 100),
-                    'reason': f'상승 {change_rate:.1f}%, RSI {simple_rsi:.0f}'
-                }
-            elif change_rate < -1.5 and simple_rsi > 30:
-                return {
-                    'action': 'SELL',
-                    'strength': min(int(abs(change_rate) * 10), 100),
-                    'reason': f'하락 {change_rate:.1f}%, RSI {simple_rsi:.0f}'
-                }
-            else:
-                return {
-                    'action': 'HOLD',
-                    'strength': 0,
-                    'reason': f'변화율 {change_rate:.1f}%, RSI {simple_rsi:.0f}'
-                }
-
-        except Exception as e:
-            logger.error(f"빠른 신호 분석 오류: {e}")
-            return {'action': 'HOLD', 'strength': 0, 'reason': '분석 오류'}
-
-
 # 편의 함수들
 def get_rsi(prices: List[float], period: int = 14) -> float:
     """RSI 현재값만 반환"""
