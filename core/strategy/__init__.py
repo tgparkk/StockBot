@@ -1,20 +1,27 @@
 """
-전략 모듈
-시간대별 전략 조합을 통한 매매 신호 생성
+전략 모듈 (캔들 기반 시스템으로 전환됨)
+레거시 호환성을 위한 기본 클래스들만 제공
 """
 
-from .base import BaseStrategy, Signal, MarketData
-from .gap_trading import GapTradingStrategy
-from .volume_breakout import VolumeBreakoutStrategy
-from .momentum import MomentumStrategy
-from .ensemble import TimeBasedEnsembleManager
+# 🎯 기본 클래스들 (레거시 호환성)
+from .base import BaseStrategy, Signal, MarketData, SignalType
+
+# 🆕 캔들 기반 시스템 (메인)
+from .candle_trade_manager import CandleTradeManager
+from .candle_pattern_detector import CandlePatternDetector
+from .candle_stock_manager import CandleStockManager
+from .candle_trade_candidate import CandleTradeCandidate
 
 __all__ = [
+    # 레거시 호환성 클래스들
     'BaseStrategy',
-    'Signal', 
+    'Signal',
+    'SignalType',
     'MarketData',
-    'GapTradingStrategy',
-    'VolumeBreakoutStrategy', 
-    'MomentumStrategy',
-    'TimeBasedEnsembleManager'
+
+    # 🆕 캔들 기반 시스템 (실제 사용)
+    'CandleTradeManager',
+    'CandlePatternDetector',
+    'CandleStockManager',
+    'CandleTradeCandidate'
 ]

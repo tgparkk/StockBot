@@ -12,10 +12,9 @@ from .trading.trading_manager import TradingManager
 from .trading.position_manager import PositionManager
 from .trading.trade_executor import TradeExecutor, TradeConfig
 from .trading.trade_database import TradeDatabase
-from .strategy_system.strategy_scheduler import StrategyScheduler
-from .strategy_system.stock_discovery import StockDiscovery
-from .strategy_system.signal_processor import SignalProcessor
-from .strategy_system.time_slot_manager import TimeSlotManager
+from .strategy.candle_trade_manager import CandleTradeManager
+from .strategy.candle_stock_manager import CandleStockManager
+from .strategy.candle_pattern_detector import CandlePatternDetector
 from .api.rest_api_manager import KISRestAPIManager
 from .data.kis_data_collector import KISDataCollector
 from .data.hybrid_data_manager import SimpleHybridDataManager
@@ -28,10 +27,9 @@ trading_manager = TradingManager
 position_manager = PositionManager
 trade_executor = TradeExecutor
 trade_database = TradeDatabase
-strategy_scheduler = StrategyScheduler
-stock_discovery = StockDiscovery
-signal_processor = SignalProcessor
-time_slot_manager = TimeSlotManager
+candle_trade_manager = CandleTradeManager
+candle_stock_manager = CandleStockManager
+candle_pattern_detector = CandlePatternDetector
 rest_api_manager = KISRestAPIManager
 kis_data_collector = KISDataCollector
 hybrid_data_manager = SimpleHybridDataManager
@@ -57,12 +55,11 @@ class TradingModule:
     TradeConfig = TradeConfig
     TradeDatabase = TradeDatabase
 
-class StrategySystemModule:
+class StrategyModule:
     """전략 시스템 관련 모듈 접근자"""
-    StrategyScheduler = StrategyScheduler
-    StockDiscovery = StockDiscovery
-    SignalProcessor = SignalProcessor
-    TimeSlotManager = TimeSlotManager
+    CandleTradeManager = CandleTradeManager
+    CandleStockManager = CandleStockManager
+    CandlePatternDetector = CandlePatternDetector
 
 class DataModule:
     """데이터 관련 모듈 접근자"""
@@ -78,7 +75,7 @@ class SystemModule:
 websocket = WebSocketModule()
 api = APIModule()
 trading = TradingModule()
-strategy_system = StrategySystemModule()
+strategy = StrategyModule()
 data = DataModule()
 system = SystemModule()
 
@@ -90,10 +87,9 @@ __all__ = [
     'TradeExecutor',
     'TradeConfig',
     'TradeDatabase',
-    'StrategyScheduler',
-    'StockDiscovery',
-    'SignalProcessor',
-    'TimeSlotManager',
+    'CandleTradeManager',
+    'CandleStockManager',
+    'CandlePatternDetector',
     'KISRestAPIManager',
     'KISDataCollector',
     'SimpleHybridDataManager',
@@ -104,7 +100,10 @@ __all__ = [
     'websocket',
     'api',
     'trading',
-    'strategy_system',
+    'strategy',
     'data',
-    'system'
+    'system',
+
+    # 모듈 그룹
+    'APIModule', 'DataModule', 'WebSocketModule', 'TradingModule', 'StrategyModule', 'SystemModule'
 ]

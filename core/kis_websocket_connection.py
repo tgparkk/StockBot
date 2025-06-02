@@ -10,7 +10,7 @@ import websockets
 import requests
 from typing import Optional, Any, Dict
 from utils.logger import setup_logger
-from . import kis_auth as kis
+from core.api import kis_auth
 
 logger = setup_logger(__name__)
 
@@ -56,20 +56,20 @@ class KISWebSocketConnection:
                 return self.approval_key
 
             # 새로운 승인키 발급
-            url = f"{kis.get_base_url()}/oauth2/Approval"
+            url = f"{kis_auth.get_base_url()}/oauth2/Approval"
             headers = {
                 "content-type": "application/json; charset=utf-8",
-                "authorization": f"Bearer {kis.get_access_token()}",
-                "appkey": kis.get_app_key(),
-                "appsecret": kis.get_app_secret(),
+                "authorization": f"Bearer {kis_auth.get_access_token()}",
+                "appkey": kis_auth.get_app_key(),
+                "appsecret": kis_auth.get_app_secret(),
                 "tr_id": "CTRP6548R",
                 "custtype": "P"
             }
 
             body = {
                 "grant_type": "client_credentials",
-                "appkey": kis.get_app_key(),
-                "secretkey": kis.get_app_secret()
+                "appkey": kis_auth.get_app_key(),
+                "secretkey": kis_auth.get_app_secret()
             }
 
             response = requests.post(url, headers=headers, json=body, timeout=10)

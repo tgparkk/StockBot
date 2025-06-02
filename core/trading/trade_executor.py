@@ -31,11 +31,11 @@ class TradeConfig:
     # - 하지만 max_investment_amount=50만원이므로 실제로는 50만원까지만 매수
 
     # 전략별 포지션 배수
-    strategy_multipliers: Dict[str, float] = None
+    strategy_multipliers: Optional[Dict[str, float]] = None
 
     # 가격 프리미엄/할인
-    buy_premiums: Dict[str, float] = None
-    sell_discounts: Dict[str, float] = None
+    buy_premiums: Optional[Dict[str, float]] = None
+    sell_discounts: Optional[Dict[str, float]] = None
 
     def __post_init__(self):
         if self.strategy_multipliers is None:
@@ -94,10 +94,9 @@ class TradeResult:
 class TradeExecutor:
     """거래 실행 전담 클래스"""
 
-    def __init__(self, trading_manager, position_manager, data_manager, trade_db, config: TradeConfig = None):
-        """초기화"""
+    def __init__(self, trading_manager, data_manager, trade_db, config: Optional[TradeConfig] = None):
+        """초기화 (PositionManager 제거됨)"""
         self.trading_manager = trading_manager
-        self.position_manager = position_manager
         self.data_manager = data_manager
         self.trade_db = trade_db
         self.config = config or TradeConfig()
@@ -107,32 +106,31 @@ class TradeExecutor:
 
         # 🆕 비동기 데이터 로거 초기화
         self.async_logger = get_async_logger()
-        
-        # 🆕 웹소켓 NOTICE 기반 주문 실행 관리자
+
+        # 🆕 웹소켓 NOTICE 기반 주문 실행 관리자 (PositionManager 제거)
         self.execution_manager = OrderExecutionManager(
-            position_manager=position_manager,
             trade_db=trade_db,
             async_logger=self.async_logger
         )
-        
+
         # 웹소켓 NOTICE 콜백 등록
         self._register_websocket_callbacks()
-        
+
         # 중복 신호 방지
         self.last_signals = {}
         self.signal_cooldown = 300  # 5분
-        
-        logger.info("✅ TradeExecutor 초기화 완료 (실전투자 체결통보 연동)")
+
+        logger.info("✅ TradeExecutor 초기화 완료 (실전투자 체결통보 연동, PositionManager 제거됨)")
 
     def _register_websocket_callbacks(self):
         """🔔 WebSocketMessageHandler에 OrderExecutionManager 직접 설정"""
         try:
             # 데이터 매니저의 웹소켓 매니저 확인
-            if (hasattr(self.data_manager, 'websocket_manager') and 
+            if (hasattr(self.data_manager, 'websocket_manager') and
                 self.data_manager.websocket_manager):
-                
+
                 websocket_manager = self.data_manager.websocket_manager
-                
+
                 # 🎯 WebSocketMessageHandler에 OrderExecutionManager 직접 설정
                 if hasattr(websocket_manager, 'message_handler'):
                     message_handler = websocket_manager.message_handler
@@ -145,10 +143,10 @@ class TradeExecutor:
                         logger.warning("⚠️ WebSocketMessageHandler에 set_execution_manager 메서드 없음")
                 else:
                     logger.warning("⚠️ WebSocketManager에 message_handler 속성 없음")
-                
+
                 # 🔄 기존 콜백 시스템 사용 (fallback)
                 logger.info("💡 기존 콜백 시스템을 fallback으로 사용")
-                
+
                 # 🎯 체결통보 처리 함수
                 async def handle_execution_notice(data_type: str, data: Dict):
                     """체결통보 데이터 처리 - 🆕 data_type 포함 글로벌 콜백 시그니처"""
@@ -157,524 +155,231 @@ class TradeExecutor:
                         if data_type != 'STOCK_EXECUTION':
                             logger.debug(f"🔄 체결통보가 아닌 데이터 무시: {data_type}")
                             return
-                        
+
                         logger.info(f"🔔 체결통보 수신 (fallback): data_type={data_type}")
-                        
+
                         # OrderExecutionManager로 전달
                         await self.execution_manager.handle_execution_notice(data)
-                        
+
                     except Exception as e:
                         logger.error(f"❌ 체결통보 처리 오류: {e}")
-                
+
                 # 기존 콜백 시스템에 등록
                 if hasattr(websocket_manager, 'add_global_callback'):
                     websocket_manager.add_global_callback('STOCK_EXECUTION', handle_execution_notice)
                     logger.info("✅ 체결통보 콜백 등록 완료 (fallback)")
                 else:
                     logger.warning("⚠️ 웹소켓 매니저에 add_global_callback 메서드 없음")
-                
+
             else:
                 logger.warning("⚠️ 웹소켓 매니저가 없어 체결통보 처리 설정 실패")
                 logger.info("💡 힌트: DataManager에 KisWebSocketManager 인스턴스가 필요합니다")
-                
+
         except Exception as e:
             logger.error(f"❌ 웹소켓 콜백 등록 오류: {e}")
 
     def execute_buy_signal(self, signal: Dict) -> TradeResult:
-        """매수 신호 실행 - 🆕 웹소켓 NOTICE 기반으로 개선"""
+        """
+        매수 신호 실행 - 캔들차트 전략 전용 간소화 버전
+
+        Args:
+            signal: 매수 신호 딕셔너리
+                - stock_code: 종목코드 (필수)
+                - price: 매수가격 (필수)
+                - quantity: 매수수량 (선택, 없으면 자동계산)
+                - total_amount: 매수금액 (선택)
+                - strategy: 전략명 (기본: 'candle')
+                - pre_validated: 사전 검증 완료 여부 (캔들 시스템에서는 True)
+        """
         stock_code = signal.get('stock_code', '')
-        strategy = signal.get('strategy', 'unknown')
-        signal_strength = signal.get('strength', 0.0)
-        
-        # 🆕 매수 시도 시작 로깅
-        attempt_start_time = time.time()
-        validation_details = {}
-        
+        strategy = signal.get('strategy', 'candle')
+        is_pre_validated = signal.get('pre_validated', False)
+
         try:
-            logger.info(f"📈 매수 신호 처리 시작: {stock_code} (전략: {strategy}, 강도: {signal_strength:.2f})")
+            logger.info(f"📈 캔들 매수 주문 실행: {stock_code}")
 
-            # 1. 기본 신호 검증
-            validation_result = self._validate_buy_signal_enhanced(signal, stock_code)
-            validation_details['enhanced_validation'] = validation_result
-            
-            if not validation_result:
-                reason = "강화된 매수 검증 실패"
-                # 🆕 매수 실패 로깅
-                log_buy_failed(
-                    stock_code=stock_code,
-                    reason=reason,
-                    signal_data=signal,
-                    validation_details=validation_details
-                )
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='BUY',
-                    quantity=0,
-                    price=signal.get('price', 0),
-                    total_amount=0,
-                    error_message=reason
-                )
+            # 🎯 캔들 시스템에서 온 신호는 이미 검증 완료 (검증 생략)
+            if not is_pre_validated:
+                logger.warning(f"⚠️ 사전 검증되지 않은 신호: {stock_code} - 기본 검증 수행")
+                if not self._validate_buy_signal_basic(signal, stock_code):
+                    return TradeResult(
+                        success=False, stock_code=stock_code, order_type='BUY',
+                        quantity=0, price=signal.get('price', 0), total_amount=0,
+                        error_message="기본 검증 실패"
+                    )
 
-            # 2. 잔고 확인
-            balance = self.trading_manager.get_balance()
-            available_cash = balance.get('available_cash', 0)
-            validation_details['available_cash'] = available_cash
-            
-            if available_cash < self.config.min_investment_amount:
-                reason = f"잔고 부족: {available_cash:,}원 < {self.config.min_investment_amount:,}원"
-                # 🆕 매수 실패 로깅
-                log_buy_failed(
-                    stock_code=stock_code,
-                    reason=reason,
-                    signal_data=signal,
-                    validation_details=validation_details
-                )
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='BUY',
-                    quantity=0,
-                    price=signal.get('price', 0),
-                    total_amount=0,
-                    error_message=reason
-                )
+            # 💰 매수 가격 및 수량 계산
+            target_price = signal.get('price', 0)
+            if target_price <= 0:
+                target_price = self._get_current_price(stock_code)
+                if target_price <= 0:
+                    return TradeResult(
+                        success=False, stock_code=stock_code, order_type='BUY',
+                        quantity=0, price=0, total_amount=0,
+                        error_message="현재가 조회 실패"
+                    )
 
-            # 3. 매수 가격 및 수량 계산
-            current_price = signal.get('price', 0)
-            if current_price <= 0:
-                reason = "유효하지 않은 가격"
-                log_buy_failed(stock_code, reason, signal, validation_details)
-                return TradeResult(False, stock_code, 'BUY', 0, 0, 0, reason)
+            # 매수가격 조정 (틱 단위 맞춤)
+            buy_price = self._calculate_buy_price(target_price, strategy, stock_code)
 
-            # 호가 단위로 조정된 매수 가격
-            buy_price = self._adjust_to_tick_size(current_price)
-            validation_details['buy_price'] = buy_price
-            
             # 매수 수량 계산
-            quantity = self._calculate_buy_quantity(
-                current_price, buy_price, available_cash, strategy, signal_strength
-            )
-            validation_details['calculated_quantity'] = quantity
-            
-            if quantity <= 0:
-                reason = "매수 수량 부족"
-                log_buy_failed(stock_code, reason, signal, validation_details)
-                return TradeResult(False, stock_code, 'BUY', 0, buy_price, 0, reason)
-
-            total_amount = quantity * buy_price
-            validation_details['total_amount'] = total_amount
-
-            # 4. 최종 잔고 재확인
-            if total_amount > available_cash:
-                reason = f"총 매수금액 초과: {total_amount:,}원 > {available_cash:,}원"
-                log_buy_failed(stock_code, reason, signal, validation_details)
-                return TradeResult(False, stock_code, 'BUY', quantity, buy_price, total_amount, reason)
-
-            # 5. 실제 매수 주문 실행
-            logger.info(f"💰 매수 주문 실행: {stock_code} {quantity:,}주 @{buy_price:,}원 (총 {total_amount:,}원)")
-            
-            buy_result = self.trading_manager.execute_order(
-                stock_code=stock_code,
-                order_type="BUY",
-                quantity=quantity,
-                price=buy_price,
-                strategy_type=strategy
-            )
-
-            if buy_result and buy_result.get('success', False):
-                order_id = buy_result.get('order_id', '')
-                
-                # 🆕 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 주문 등록
-                if order_id:
-                    success = self.execution_manager.add_pending_order(
-                        order_id=order_id,
-                        stock_code=stock_code,
-                        order_type='BUY',
-                        quantity=quantity,
-                        price=buy_price,
-                        strategy_type=strategy
-                    )
-                    
-                    if success:
-                        logger.info(f"✅ 매수 주문 전송 성공 - 웹소켓 NOTICE 대기 중: {stock_code} (주문ID: {order_id})")
-                        return TradeResult(
-                            success=True,
-                            stock_code=stock_code,
-                            order_type='BUY',
-                            quantity=quantity,
-                            price=buy_price,
-                            total_amount=total_amount,
-                            order_no=order_id,
-                            is_pending=True  # 🆕 웹소켓 NOTICE 대기 중
-                        )
-                    else:
-                        reason = "주문 대기 등록 실패"
-                        log_buy_failed(stock_code, reason, signal, validation_details)
-                        return TradeResult(False, stock_code, 'BUY', quantity, buy_price, total_amount, reason)
-                else:
-                    # 🚨 주문ID가 없는 경우도 체결통보를 기다려야 함
-                    logger.warning(f"⚠️ 주문ID 없음 - 체결통보 기반 처리 불가: {stock_code}")
-                    
-                    # 🆕 임시 주문ID 생성하여 대기 목록에 추가
-                    temp_order_id = f"TEMP_{stock_code}_{int(time.time())}"
-                    
-                    success = self.execution_manager.add_pending_order(
-                        order_id=temp_order_id,
-                        stock_code=stock_code,
-                        order_type='BUY',
-                        quantity=quantity,
-                        price=buy_price,
-                        strategy_type=strategy
-                    )
-                    
-                    if success:
-                        logger.info(f"⏳ 임시 주문ID로 체결통보 대기: {stock_code} (임시ID: {temp_order_id})")
-                        return TradeResult(
-                            success=True,
-                            stock_code=stock_code,
-                            order_type='BUY',
-                            quantity=quantity,
-                            price=buy_price,
-                            total_amount=total_amount,
-                            order_no=temp_order_id,
-                            is_pending=True  # 체결통보 대기 중
-                        )
-                    else:
-                        # 대기 등록 실패시에만 기존 방식 사용 (최후 수단)
-                        logger.error(f"❌ 임시 주문ID 등록 실패 - 기존방식 적용: {stock_code}")
-                        
-                        # 기존 방식: 즉시 포지션에 추가 (비추천, 최후 수단)
-                        self.position_manager.add_position(
-                            stock_code=stock_code,
-                            quantity=quantity,
-                            buy_price=buy_price,
-                            strategy_type=strategy
-                        )
-                        
-                        # 기존 방식: 즉시 성공 로깅 (비추천, 최후 수단)
-                        log_buy_success(
-                            stock_code=stock_code,
-                            buy_price=buy_price,
-                            quantity=quantity,
-                            strategy=strategy,
-                            signal_data=signal
-                        )
-                        
-                        logger.warning(f"⚠️ 비추천 방식으로 매수 처리됨: {stock_code} {quantity:,}주 @{buy_price:,}원")
-                        return TradeResult(
-                            success=True,
-                            stock_code=stock_code,
-                            order_type='BUY',
-                            quantity=quantity,
-                            price=buy_price,
-                            total_amount=total_amount,
-                            order_no=buy_result.get('order_id', temp_order_id)
-                        )
+            if 'quantity' in signal and signal['quantity'] > 0:
+                # 신호에서 수량 지정된 경우
+                buy_quantity = int(signal['quantity'])
+            elif 'total_amount' in signal and signal['total_amount'] > 0:
+                # 신호에서 총 금액 지정된 경우
+                buy_quantity = signal['total_amount'] // buy_price
             else:
-                reason = f"매수 주문 실패: {buy_result.get('error_message', '알 수 없는 오류') if buy_result else '주문 결과 없음'}"
-                log_buy_failed(stock_code, reason, signal, validation_details)
-                return TradeResult(False, stock_code, 'BUY', quantity, buy_price, total_amount, reason)
+                # 자동 계산 (계좌 잔고 기반)
+                available_cash = self._get_available_cash()
+                buy_quantity = self._calculate_buy_quantity_simple(buy_price, available_cash)
+
+            if buy_quantity <= 0:
+                return TradeResult(
+                    success=False, stock_code=stock_code, order_type='BUY',
+                    quantity=0, price=buy_price, total_amount=0,
+                    error_message="매수 수량 부족"
+                )
+
+            total_amount = buy_quantity * buy_price
+
+            # 🚀 실제 매수 주문 실행
+            logger.info(f"💰 매수 주문: {stock_code} {buy_quantity:,}주 @ {buy_price:,}원 (총 {total_amount:,}원)")
+
+            order_result = self.trading_manager.buy_order(
+                stock_code=stock_code,
+                quantity=str(buy_quantity),
+                price=str(buy_price)
+            )
+
+            if order_result and order_result.get('rt_cd') == '0':
+                order_id = order_result.get('output', {}).get('ODNO', '')
+
+                # 📝 거래 기록 저장
+                self._record_buy_trade(stock_code, buy_quantity, buy_price, strategy, signal, order_result)
+
+                # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록
+                if order_id:
+                    self.execution_manager.add_pending_order(
+                        order_id=order_id, stock_code=stock_code, order_type='BUY',
+                        quantity=buy_quantity, price=buy_price, strategy_type=strategy
+                    )
+
+                logger.info(f"✅ 매수 주문 성공: {stock_code} (주문번호: {order_id})")
+                return TradeResult(
+                    success=True, stock_code=stock_code, order_type='BUY',
+                    quantity=buy_quantity, price=buy_price, total_amount=total_amount,
+                    order_no=order_id, is_pending=True
+                )
+            else:
+                error_msg = order_result.get('msg1', '매수 주문 실패') if order_result else '주문 API 호출 실패'
+                logger.error(f"❌ 매수 주문 실패: {stock_code} - {error_msg}")
+                return TradeResult(
+                    success=False, stock_code=stock_code, order_type='BUY',
+                    quantity=buy_quantity, price=buy_price, total_amount=total_amount,
+                    error_message=error_msg
+                )
 
         except Exception as e:
-            reason = f"매수 신호 처리 오류: {e}"
-            logger.error(reason)
-            # 🆕 예외 상황 로깅
-            log_buy_failed(
-                stock_code=stock_code,
-                reason=reason,
-                signal_data=signal,
-                validation_details=validation_details
+            logger.error(f"❌ 매수 주문 실행 중 오류: {stock_code} - {str(e)}")
+            return TradeResult(
+                success=False, stock_code=stock_code, order_type='BUY',
+                quantity=0, price=signal.get('price', 0), total_amount=0,
+                error_message=f"매수 실행 오류: {str(e)}"
             )
-            return TradeResult(False, stock_code, 'BUY', 0, 0, 0, reason)
 
     def execute_sell_signal(self, signal: Dict) -> TradeResult:
-        """매도 신호 실행"""
+        """
+        매도 신호 실행 - 캔들차트 전략 전용 간소화 버전
+
+        Args:
+            signal: 매도 신호 딕셔너리
+                - stock_code: 종목코드 (필수)
+                - price: 매도가격 (필수)
+                - quantity: 매도수량 (필수)
+                - reason: 매도 이유 (선택)
+                - strategy: 전략명 (기본: 'candle')
+        """
+        stock_code = signal.get('stock_code', '')
+        strategy = signal.get('strategy', 'candle')
+        reason = signal.get('reason', '매도신호')
+
         try:
-            stock_code = signal.get('stock_code', '')
-            signal_type = signal.get('signal_type', '').upper()
-            strategy = signal.get('strategy', 'auto_existing_holding')
-            reason = signal.get('reason', '신호')
+            logger.info(f"📉 캔들 매도 주문 실행: {stock_code} ({reason})")
 
-            if signal_type != 'SELL':
+            # 필수 필드 검증
+            required_fields = ['stock_code', 'price', 'quantity']
+            for field in required_fields:
+                if field not in signal or not signal[field]:
+                    return TradeResult(
+                        success=False, stock_code=stock_code, order_type='SELL',
+                        quantity=0, price=signal.get('price', 0), total_amount=0,
+                        error_message=f"필수 필드 누락: {field}"
+                    )
+
+            # 매도 정보 추출
+            sell_price = int(signal.get('price', 0))
+            sell_quantity = int(signal.get('quantity', 0))
+
+            if sell_price <= 0 or sell_quantity <= 0:
                 return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=0,
-                    total_amount=0,
-                    error_message=f"잘못된 신호 타입: {signal_type}"
+                    success=False, stock_code=stock_code, order_type='SELL',
+                    quantity=sell_quantity, price=sell_price, total_amount=0,
+                    error_message="유효하지 않은 가격 또는 수량"
                 )
 
-            # 1. 포지션 확인
-            positions = self.position_manager.get_positions('active')
-            if stock_code not in positions:
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=0,
-                    total_amount=0,
-                    error_message=f"매도할 포지션 없음: {stock_code}"
-                )
+            total_amount = sell_quantity * sell_price
 
-            position = positions[stock_code]
-            position_quantity = position.get('quantity', 0)
+            # 🚀 실제 매도 주문 실행
+            logger.info(f"💰 매도 주문: {stock_code} {sell_quantity:,}주 @ {sell_price:,}원 (총 {total_amount:,}원)")
 
-            if position_quantity <= 0:
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=0,
-                    total_amount=0,
-                    error_message=f"매도할 수량 없음: {stock_code} (수량: {position_quantity})"
-                )
-
-            # 2. 현재가 조회
-            current_price = self._get_current_price(stock_code)
-            if current_price <= 0:
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=0,
-                    total_amount=0,
-                    error_message=f"현재가 조회 실패: {stock_code}"
-                )
-
-            # 3. 매도가 계산
-            sell_price = self._calculate_sell_price(current_price, strategy, stock_code=stock_code)
-
-            # 🔧 4. 계좌와 포지션 동기화 (매도 전 필수)
-            logger.info(f"🔧 매도 전 계좌-포지션 동기화 실행: {stock_code}")
-            sync_result = self.position_manager.sync_with_account()
-            
-            # 🔍 동기화 결과 상세 로깅
-            logger.info(f"📊 동기화 결과: 성공={sync_result.get('success')}, "
-                       f"확인={sync_result.get('total_checked', 0)}개, "
-                       f"조정={len(sync_result.get('quantity_adjustments', []))}개")
-            
-            if sync_result.get('quantity_adjustments'):
-                for adj in sync_result['quantity_adjustments']:
-                    if adj['stock_code'] == stock_code:
-                        logger.warning(f"🔧 {stock_code} 수량 동기화: {adj['old_quantity']:,}주 → {adj['new_quantity']:,}주")
-            
-            if not sync_result.get('success', False):
-                sync_error = sync_result.get('error', '동기화 실패')
-                logger.error(f"❌ 계좌 동기화 실패: {stock_code} - {sync_error}")
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=sell_price,
-                    total_amount=0,
-                    error_message=f"계좌 동기화 실패: {sync_error}"
-                )
-            
-            # 🔧 동기화 후 포지션 정보 재확인
-            positions = self.position_manager.get_positions('active')
-            if stock_code not in positions:
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=sell_price,
-                    total_amount=0,
-                    error_message=f"동기화 후 매도할 포지션 없음: {stock_code}"
-                )
-            
-            # 동기화된 포지션 정보 사용
-            position = positions[stock_code]
-            position_quantity = position.get('quantity', 0)
-            
-            if position_quantity <= 0:
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=sell_price,
-                    total_amount=0,
-                    error_message=f"동기화 후 매도할 수량 없음: {stock_code} (수량: {position_quantity})"
-                )
-
-            # 5. 실제 보유 수량 검증 (동기화 후 이중 확인)
-            actual_quantity = self._get_actual_holding_quantity(stock_code)
-            logger.info(f"🔍 수량 검증: {stock_code} - 포지션매니저={position_quantity:,}주, 실제계좌={actual_quantity:,}주")
-            
-            verified_quantity = min(position_quantity, actual_quantity) if actual_quantity > 0 else 0
-            
-            if verified_quantity != position_quantity:
-                logger.warning(f"⚠️ 수량 불일치 조정: {stock_code} {position_quantity:,}주 → {verified_quantity:,}주")
-            
-            if verified_quantity <= 0:
-                error_msg = f"실제 보유 수량 부족: 요청={position_quantity:,}주, 실제={actual_quantity:,}주, 검증={verified_quantity:,}주"
-                logger.error(f"❌ {error_msg}")
-                
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=sell_price,
-                    total_amount=0,
-                    error_message=error_msg
-                )
-
-            # 🛡️ 6. 안전 여유분 적용 (90% 룰)
-            safe_quantity = int(verified_quantity * 0.9)  # 90%만 매도 시도
-            if safe_quantity < verified_quantity:
-                logger.info(f"🛡️ 안전 여유분 적용: {stock_code} {verified_quantity:,}주 → {safe_quantity:,}주 (90% 룰)")
-            
-            final_sell_quantity = safe_quantity
-            
-            if final_sell_quantity <= 0:
-                error_msg = f"안전 매도 수량 부족: 원본={verified_quantity:,}주, 안전={safe_quantity:,}주"
-                logger.error(f"❌ {error_msg}")
-                
-                return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=0,
-                    price=sell_price,
-                    total_amount=0,
-                    error_message=error_msg
-                )
-
-            # 7. 매도 주문 실행
-            total_amount = final_sell_quantity * sell_price
             sell_result = self.trading_manager.execute_order(
                 stock_code=stock_code,
                 order_type="SELL",
-                quantity=final_sell_quantity,
+                quantity=sell_quantity,
                 price=sell_price,
                 strategy_type=strategy
             )
 
-            # 🔧 None 체크 추가 - trading_manager.execute_order는 주문번호(str) 또는 None을 반환
             if sell_result:  # 주문번호가 반환되면 성공
-                # 🆕 체결통보 기반 매도 처리
                 order_id = sell_result if isinstance(sell_result, str) else str(sell_result)
-                
+
+                # 📝 거래 기록 저장 (임시 포지션 정보)
+                position = {
+                    'strategy_type': strategy,
+                    'stock_name': stock_code,
+                    'buy_price': sell_price
+                }
+                sell_result_dict = {'order_no': order_id, 'status': 'pending'}
+                self._record_sell_trade(stock_code, sell_quantity, sell_price, position, signal, sell_result_dict)
+
+                # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록
                 if order_id:
-                    # 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 주문 등록
-                    success = self.execution_manager.add_pending_order(
-                        order_id=order_id,
-                        stock_code=stock_code,
-                        order_type='SELL',
-                        quantity=final_sell_quantity,
-                        price=sell_price,
-                        strategy_type=strategy
+                    self.execution_manager.add_pending_order(
+                        order_id=order_id, stock_code=stock_code, order_type='SELL',
+                        quantity=sell_quantity, price=sell_price, strategy_type=strategy
                     )
-                    
-                    if success:
-                        # 📝 거래 기록은 저장하되 포지션 제거는 체결통보 후
-                        sell_result_dict = {'order_no': order_id, 'status': 'pending'}
-                        self._record_sell_trade(stock_code, final_sell_quantity, sell_price, position, signal, sell_result_dict)
-                        
-                        logger.info(f"📤 매도 주문 전송 성공 - 체결통보 대기 중: {stock_code} {final_sell_quantity:,}주 @{sell_price:,}원")
-                        
-                        return TradeResult(
-                            success=True,
-                            stock_code=stock_code,
-                            order_type='SELL',
-                            quantity=final_sell_quantity,
-                            price=sell_price,
-                            total_amount=total_amount,
-                            order_no=order_id,
-                            is_pending=True  # 체결통보 대기 중
-                        )
-                    else:
-                        # 대기 등록 실패시 기존 방식 (최후 수단)
-                        logger.warning(f"⚠️ 매도 주문 대기 등록 실패 - 기존방식 적용: {stock_code}")
-                        
-                        # 기존 방식: 즉시 처리
-                        sell_result_dict = {'order_no': order_id, 'status': 'success'}
-                        self._record_sell_trade(stock_code, final_sell_quantity, sell_price, position, signal, sell_result_dict)
-                        
-                        # 포지션에서 제거 (비추천, 최후 수단)
-                        self.position_manager.remove_position(stock_code, final_sell_quantity, sell_price)
-                        
-                        logger.warning(f"⚠️ 비추천 방식으로 매도 처리됨: {stock_code} {final_sell_quantity:,}주 @{sell_price:,}원")
-                        
-                        return TradeResult(
-                            success=True,
-                            stock_code=stock_code,
-                            order_type='SELL',
-                            quantity=final_sell_quantity,
-                            price=sell_price,
-                            total_amount=total_amount,
-                            order_no=order_id
-                        )
-                else:
-                    # 주문ID가 없는 경우 임시ID 생성
-                    temp_order_id = f"TEMP_SELL_{stock_code}_{int(time.time())}"
-                    
-                    success = self.execution_manager.add_pending_order(
-                        order_id=temp_order_id,
-                        stock_code=stock_code,
-                        order_type='SELL',
-                        quantity=final_sell_quantity,
-                        price=sell_price,
-                        strategy_type=strategy
-                    )
-                    
-                    if success:
-                        # 거래 기록 저장
-                        sell_result_dict = {'order_no': temp_order_id, 'status': 'pending'}
-                        self._record_sell_trade(stock_code, final_sell_quantity, sell_price, position, signal, sell_result_dict)
-                        
-                        logger.info(f"⏳ 임시ID로 매도 체결통보 대기: {stock_code} (임시ID: {temp_order_id})")
-                        
-                        return TradeResult(
-                            success=True,
-                            stock_code=stock_code,
-                            order_type='SELL',
-                            quantity=final_sell_quantity,
-                            price=sell_price,
-                            total_amount=total_amount,
-                            order_no=temp_order_id,
-                            is_pending=True
-                        )
-                    else:
-                        error_msg = f"매도 주문 대기 등록 실패: {stock_code}"
-                        logger.error(f"❌ {error_msg}")
-                        return TradeResult(False, stock_code, 'SELL', final_sell_quantity, sell_price, total_amount, error_msg)
-            else:
-                # 🔧 매도 주문 실패 (trading_manager.execute_order가 None 반환)
-                error_msg = f"매도 주문 실패: {stock_code} - trading_manager에서 None 반환"
-                logger.error(f"❌ {error_msg}")
-                
+
+                logger.info(f"✅ 매도 주문 성공: {stock_code} (주문번호: {order_id})")
                 return TradeResult(
-                    success=False,
-                    stock_code=stock_code,
-                    order_type='SELL',
-                    quantity=final_sell_quantity,
-                    price=sell_price,
-                    total_amount=total_amount,
-                    error_message=error_msg
+                    success=True, stock_code=stock_code, order_type='SELL',
+                    quantity=sell_quantity, price=sell_price, total_amount=total_amount,
+                    order_no=order_id, is_pending=True
+                )
+            else:
+                logger.error(f"❌ 매도 주문 실패: {stock_code}")
+                return TradeResult(
+                    success=False, stock_code=stock_code, order_type='SELL',
+                    quantity=sell_quantity, price=sell_price, total_amount=total_amount,
+                    error_message="매도 주문 API 실패"
                 )
 
         except Exception as e:
-            error_msg = f"매도 신호 실행 오류: {e}"
-            logger.error(error_msg)
-
+            logger.error(f"❌ 매도 주문 실행 중 오류: {stock_code} - {str(e)}")
             return TradeResult(
-                success=False,
-                stock_code=signal.get('stock_code', 'UNKNOWN'),
-                order_type='SELL',
-                quantity=0,
-                price=0,
-                total_amount=0,
-                error_message=error_msg
+                success=False, stock_code=stock_code, order_type='SELL',
+                quantity=signal.get('quantity', 0), price=signal.get('price', 0), total_amount=0,
+                error_message=f"매도 실행 오류: {str(e)}"
             )
 
     def execute_auto_sell(self, sell_signal: Dict) -> TradeResult:
@@ -762,302 +467,38 @@ class TradeExecutor:
     # === 내부 헬퍼 메서드들 ===
 
     def _validate_buy_signal(self, signal: Dict, stock_code: str) -> bool:
-        """기본 매수 신호 검증"""
+        """🔍 매수 신호 검증 - 캔들 전용 (기본 검증만)"""
+        return self._validate_buy_signal_basic(signal, stock_code)
+
+    def _validate_buy_signal_basic(self, signal: Dict, stock_code: str) -> bool:
+        """기본적인 매수 신호 검증 (캔들 전용 간소화 버전)"""
         try:
-            logger.debug(f"🔍 기본 매수 검증 시작: {stock_code} - 신호: {signal}")
-            
-            # 1. 필수 필드 확인
-            required_fields = ['stock_code', 'strategy', 'strength', 'price']
+            # 필수 필드 확인
+            required_fields = ['stock_code', 'price']
             for field in required_fields:
-                if field not in signal:
-                    reason = f"필수 필드 누락: {field}"
-                    logger.warning(f"❌ 매수 신호 검증 실패: {reason} ({stock_code})")
-                    logger.debug(f"   신호 내용: {signal}")
-                    # 🆕 필수 필드 누락 로깅
-                    log_signal_failed(
-                        stock_code=stock_code,
-                        strategy=signal.get('strategy', 'unknown'),
-                        signal_strength=signal.get('strength', 0.0),
-                        threshold=1.0,
-                        reason=reason,
-                        market_data=signal
-                    )
+                if field not in signal or not signal[field]:
+                    logger.warning(f"❌ 필수 필드 누락: {field} ({stock_code})")
                     return False
 
-            logger.debug(f"✅ 1단계 통과: 필수 필드 확인 ({stock_code})")
-
-            # 2. 신호 강도 확인
-            strength = signal.get('strength', 0.0)
-            min_strength = 0.3  # 최소 신호 강도
-            if strength < min_strength:
-                reason = f"신호 강도 부족 ({strength:.2f} < {min_strength})"
-                logger.warning(f"❌ 매수 신호 검증 실패: {reason} ({stock_code})")
-                # 🆕 신호 강도 부족 로깅
-                log_signal_failed(
-                    stock_code=stock_code,
-                    strategy=signal.get('strategy', 'unknown'),
-                    signal_strength=strength,
-                    threshold=min_strength,
-                    reason=reason,
-                    market_data=signal
-                )
-                return False
-
-            logger.debug(f"✅ 2단계 통과: 신호 강도 확인 ({stock_code}, 강도:{strength:.2f})")
-
-            # 3. 쿨다운 확인 (같은 종목 중복 신호 방지)
-            current_time = time.time()
-            if stock_code in self.last_signals:
-                last_signal_time = self.last_signals[stock_code]
-                if current_time - last_signal_time < self.signal_cooldown:
-                    remaining_time = int(self.signal_cooldown - (current_time - last_signal_time))
-                    reason = f"신호 쿨다운 중 (남은 시간: {remaining_time}초)"
-                    logger.warning(f"❌ 매수 신호 검증 실패: {reason} ({stock_code})")
-                    # 🆕 쿨다운 로깅
-                    log_signal_failed(
-                        stock_code=stock_code,
-                        strategy=signal.get('strategy', 'unknown'),
-                        signal_strength=strength,
-                        threshold=self.signal_cooldown,
-                        reason=reason,
-                        market_data=signal
-                    )
-                    return False
-
-            logger.debug(f"✅ 3단계 통과: 쿨다운 확인 ({stock_code})")
-
-            # 4. 중복 포지션 확인
-            existing_positions = self.position_manager.get_positions('active')
-            if stock_code in existing_positions:
-                reason = "이미 보유 중인 종목"
-                logger.warning(f"❌ 매수 신호 검증 실패: {reason} ({stock_code})")
-                logger.debug(f"   기존 포지션: {existing_positions.get(stock_code, {})}")
-                # 🆕 중복 포지션 로깅
-                log_signal_failed(
-                    stock_code=stock_code,
-                    strategy=signal.get('strategy', 'unknown'),
-                    signal_strength=strength,
-                    threshold=1.0,
-                    reason=reason,
-                    market_data=signal
-                )
-                return False
-
-            logger.debug(f"✅ 4단계 통과: 중복 포지션 확인 ({stock_code})")
-
-
-            # # 5. 진행중인 주문 확인
-            # if stock_code in self.pending_orders:
-            #     reason = "처리 중인 주문 존재"
-            #     logger.warning(f"❌ 매수 신호 검증 실패: {reason} ({stock_code})")
-            #     logger.debug(f"   진행중 주문: {stock_code} (set에 포함됨)")
-            #     # 🆕 중복 주문 로깅
-            #     log_signal_failed(
-            #         stock_code=stock_code,
-            #         strategy=signal.get('strategy', 'unknown'),
-            #         signal_strength=strength,
-            #         threshold=1.0,
-            #         reason=reason,
-            #         market_data=signal
-            #     )
-            #     return False
-
-            # logger.debug(f"✅ 5단계 통과: 진행중 주문 확인 ({stock_code})")
-
-            # 6. 가격 유효성 확인
+            # 가격 검증
             price = signal.get('price', 0)
             if price <= 0:
-                reason = f"유효하지 않은 가격: {price}"
-                logger.warning(f"❌ 매수 신호 검증 실패: {reason} ({stock_code})")
-                # 🆕 가격 오류 로깅
-                log_signal_failed(
-                    stock_code=stock_code,
-                    strategy=signal.get('strategy', 'unknown'),
-                    signal_strength=strength,
-                    threshold=1.0,
-                    reason=reason,
-                    market_data=signal
-                )
+                logger.warning(f"❌ 유효하지 않은 가격: {price} ({stock_code})")
                 return False
 
-            logger.debug(f"✅ 6단계 통과: 가격 유효성 확인 ({stock_code}, 가격:{price:,}원)")
+            # 쿨다운 확인 (30초)
+            current_time = time.time()
+            if stock_code in self.last_signals:
+                if current_time - self.last_signals[stock_code] < 30:
+                    logger.warning(f"❌ 쿨다운 중: {stock_code}")
+                    return False
 
-            # 7. 거래 시간 확인 (선택사항)
-            # 현재는 시간 제한 없이 모든 시간에 거래 허용
-
-            # 모든 검증 통과
+            # 마지막 신호 시간 업데이트
             self.last_signals[stock_code] = current_time
-            logger.info(f"✅ 기본 매수 신호 검증 완전 통과: {stock_code} (강도:{strength:.2f}, 가격:{price:,}원)")
             return True
 
         except Exception as e:
-            reason = f"검증 과정 오류: {e}"
-            logger.error(f"❌ 매수 신호 검증 오류: {reason} ({stock_code})")
-            # 🆕 검증 오류 로깅
-            log_signal_failed(
-                stock_code=stock_code,
-                strategy=signal.get('strategy', 'unknown'),
-                signal_strength=signal.get('strength', 0.0),
-                threshold=1.0,
-                reason=reason,
-                market_data=signal
-            )
-            return False
-
-    def _validate_buy_signal_enhanced(self, signal: Dict, stock_code: str) -> bool:
-        """🆕 강화된 매수 신호 검증 (고도화된 다중 이격도 활용)"""
-        try:
-            # 기본 검증
-            basic_validation = self._validate_buy_signal(signal, stock_code)
-            if not basic_validation:
-                # 🆕 기본 검증 실패 로깅
-                log_signal_failed(
-                    stock_code=stock_code,
-                    strategy=signal.get('strategy', 'unknown'),
-                    signal_strength=signal.get('strength', 0.0),
-                    threshold=0.3,  # 기본 임계값
-                    reason="기본 검증 실패",
-                    market_data=signal
-                )
-                logger.warning(f"🚫 강화된 매수 검증 실패: 기본 검증 단계에서 실패 ({stock_code})")
-                return False
-
-            # 🎯 다중 기간 이격도 종합 검증
-            try:
-                # 특정 종목에 대한 5일, 20일, 60일 이격도 확인
-                d5_data = get_disparity_rank(
-                    fid_input_iscd="0000",
-                    fid_hour_cls_code="5",
-                    fid_vol_cnt="10000"
-                )
-                d20_data = get_disparity_rank(
-                    fid_input_iscd="0000",
-                    fid_hour_cls_code="20",
-                    fid_vol_cnt="10000"
-                )
-                d60_data = get_disparity_rank(
-                    fid_input_iscd="0000",
-                    fid_hour_cls_code="60",
-                    fid_vol_cnt="10000"
-                )
-
-                # 해당 종목의 다중 이격도 검증
-                d5_val = d20_val = d60_val = None
-
-                if d5_data is not None and not d5_data.empty:
-                    d5_row = d5_data[d5_data['mksc_shrn_iscd'] == stock_code]
-                    if not d5_row.empty:
-                        d5_val = float(d5_row.iloc[0].get('d5_dsrt', 100))
-
-                if d20_data is not None and not d20_data.empty:
-                    d20_row = d20_data[d20_data['mksc_shrn_iscd'] == stock_code]
-                    if not d20_row.empty:
-                        d20_val = float(d20_row.iloc[0].get('d20_dsrt', 100))
-
-                if d60_data is not None and not d60_data.empty:
-                    d60_row = d60_data[d60_data['mksc_shrn_iscd'] == stock_code]
-                    if not d60_row.empty:
-                        d60_val = float(d60_row.iloc[0].get('d60_dsrt', 100))
-
-                # 🎯 다중 이격도 기반 매수 검증 로직
-                if all(val is not None for val in [d5_val, d20_val, d60_val]):
-                    # 전략별 차별화된 검증
-                    strategy = signal.get('strategy', 'default')
-
-                    if strategy == 'disparity_reversal':
-                        # 이격도 반등 전략: 과매도 구간에서만 매수
-                        if d20_val <= 90 and d60_val <= 95:
-                            logger.info(f"🎯 이격도반등 매수 허용: {stock_code} "
-                                      f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f}")
-                            return True
-                        else:
-                            # 🆕 이격도 반등 전략 실패 로깅
-                            log_signal_failed(
-                                stock_code=stock_code,
-                                strategy=strategy,
-                                signal_strength=signal.get('strength', 0.0),
-                                threshold=90.0,  # D20 임계값
-                                reason=f"이격도반등 조건 미달 (D20:{d20_val:.1f} > 90, D60:{d60_val:.1f} > 95)",
-                                market_data={**signal, 'disparity_5d': d5_val, 'disparity_20d': d20_val, 'disparity_60d': d60_val}
-                            )
-                            logger.warning(f"🎯 이격도반등 매수 거부: {stock_code} "
-                                         f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매도 미달)")
-                            return False
-
-                    elif strategy in ['gap_trading', 'volume_breakout', 'momentum']:
-                        # 기존 전략들: 과매수 구간 매수 금지
-                        if d5_val >= 135 or d20_val >= 125:  # 단기/중기 과매수 (1단계 완화)
-                            # 🆕 과매수 구간 매수 거부 로깅
-                            log_signal_failed(
-                                stock_code=stock_code,
-                                strategy=strategy,
-                                signal_strength=signal.get('strength', 0.0),
-                                threshold=125.0,  # D20 임계값
-                                reason=f"과매수 구간 매수 금지 (D5:{d5_val:.1f} >= 135 또는 D20:{d20_val:.1f} >= 125)",
-                                market_data={**signal, 'disparity_5d': d5_val, 'disparity_20d': d20_val, 'disparity_60d': d60_val}
-                            )
-                            logger.warning(f"🎯 {strategy} 매수 거부: {stock_code} "
-                                         f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매수)")
-                            return False
-                        elif d20_val <= 90:  # 중기 과매도 구간 = 매수 우대
-                            logger.info(f"🎯 {strategy} 매수 우대: {stock_code} "
-                                       f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f} (과매도)")
-                            return True
-                        else:  # 중립 구간
-                            logger.debug(f"🎯 {strategy} 매수 중립: {stock_code} "
-                                        f"D5:{d5_val:.1f} D20:{d20_val:.1f} D60:{d60_val:.1f}")
-                            return True
-
-                    else:
-                        # 기타 전략: 기본 검증
-                        if d20_val >= 125:  # 과매수 매수 금지 (1단계 완화)
-                            # 🆕 기타 전략 과매수 거부 로깅
-                            log_signal_failed(
-                                stock_code=stock_code,
-                                strategy=strategy,
-                                signal_strength=signal.get('strength', 0.0),
-                                threshold=125.0,
-                                reason=f"기타전략 과매수 구간 (D20:{d20_val:.1f} >= 125)",
-                                market_data={**signal, 'disparity_20d': d20_val}
-                            )
-                            logger.warning(f"🎯 기타전략 매수 거부: {stock_code} "
-                                         f"D20:{d20_val:.1f} (과매수)")
-                            return False
-                        else:
-                            return True
-
-                elif d20_val is not None:
-                    # 20일 이격도만 확인 가능한 경우 (기존 로직)
-                    if d20_val <= 90:
-                        logger.info(f"🎯 20일 이격도 매수 허용: {stock_code} D20:{d20_val:.1f}% (과매도)")
-                        return True
-                    elif d20_val >= 125:  # 1단계 완화
-                        # 🆕 20일 이격도만으로 과매수 거부 로깅
-                        log_signal_failed(
-                            stock_code=stock_code,
-                            strategy=signal.get('strategy', 'unknown'),
-                            signal_strength=signal.get('strength', 0.0),
-                            threshold=125.0,
-                            reason=f"20일 이격도 과매수 (D20:{d20_val:.1f} >= 125)",
-                            market_data={**signal, 'disparity_20d': d20_val}
-                        )
-                        logger.warning(f"🎯 20일 이격도 매수 거부: {stock_code} D20:{d20_val:.1f}% (과매수)")
-                        return False
-                    else:
-                        logger.debug(f"🎯 20일 이격도 중립: {stock_code} D20:{d20_val:.1f}%")
-                        return True
-
-            except Exception as e:
-                logger.warning(f"🚫 다중 이격도 확인 실패 ({stock_code}): {e}")
-                logger.info(f"🎯 이격도 확인 실패로 기본 검증 결과 사용 ({stock_code})")
-                # 이격도 확인 실패시 기본 검증 결과 사용
-                pass
-
-            logger.debug(f"✅ 강화된 매수 검증 통과: {stock_code} (이격도 조건 만족 또는 확인 불가)")
-            return True  # 기본 검증 통과시 매수 허용
-
-        except Exception as e:
-            logger.error(f"🚫 강화된 매수 신호 검증 오류 ({stock_code}): {e}")
+            logger.error(f"기본 검증 오류 ({stock_code}): {e}")
             return False
 
     def _get_current_price(self, stock_code: str) -> int:
@@ -1095,51 +536,53 @@ class TradeExecutor:
     def _calculate_buy_price(self, current_price: int, strategy: str = 'default', stock_code: str = '') -> int:
         """매수 지정가 계산 - 🚨 실제 상하한가 조회 적용"""
         try:
-            base_premium = self.config.buy_premiums.get(strategy, self.config.buy_premiums['default'])
+            # 🆕 안전한 프리미엄 설정 (config가 None인 경우 대비)
+            if hasattr(self.config, 'buy_premiums') and self.config.buy_premiums:
+                base_premium = self.config.buy_premiums.get(strategy, 0.001)  # 기본 0.1%
+            else:
+                # config가 없거나 buy_premiums가 None인 경우 기본값 사용
+                base_premium = 0.001  # 기본 0.1% 프리미엄
 
             # 시장 상황별 동적 조정
             volatility_adjustment = 0
-            if current_price < 5000:
-                volatility_adjustment = 0.002   # 저가주: +0.2%
-            elif current_price > 100000:
-                volatility_adjustment = -0.001  # 고가주: -0.1%
+
+            # 캔들 전략의 경우 더 적극적인 가격
+            if strategy == 'candle':
+                base_premium = 0.002  # 0.2% 프리미엄 (빠른 체결)
 
             # 최종 프리미엄 계산
             final_premium = base_premium + volatility_adjustment
-            final_premium = max(0.001, min(final_premium, 0.01))  # 0.1%~1.0% 범위 제한
+
+            # 프리미엄 적용된 목표가 계산
+            target_price = int(current_price * (1 + final_premium))
 
             # 🚨 실제 상하한가 조회
             price_limits = self._get_price_limits(stock_code, current_price)
-            upper_limit = price_limits['upper_limit']
-            lower_limit = price_limits['lower_limit']
-            source = price_limits['source']
+            upper_limit = price_limits.get('upper_limit', current_price * 1.3)
+            lower_limit = price_limits.get('lower_limit', current_price * 0.7)
 
-            # 계산된 매수가
-            calculated_buy_price = int(current_price * (1 + final_premium))
+            # 상한가 체크
+            if target_price >= upper_limit:
+                # 상한가 근처라면 상한가 직전 가격으로 조정
+                target_price = int(upper_limit * 0.998)  # 상한가의 99.8%
+                logger.warning(f"⚠️ {stock_code} 상한가 근처 - 매수가 조정: {target_price:,}원")
 
-            # 🚨 상한가 초과 방지
-            if calculated_buy_price > upper_limit:
-                logger.warning(f"🚨 매수가 상한가 초과 조정: {stock_code} {calculated_buy_price:,}원 → {upper_limit:,}원 ({source})")
-                calculated_buy_price = upper_limit
+            # 틱 단위 조정
+            final_price = self._adjust_to_tick_size(target_price)
 
-            # 호가 단위로 조정
-            buy_price = self._adjust_to_tick_size(calculated_buy_price)
+            # 최종 검증 (현재가보다 너무 높으면 제한)
+            max_buy_price = int(current_price * 1.05)  # 현재가의 105% 이하
+            final_price = min(final_price, max_buy_price)
 
-            # 🚨 최종 상한가 검증
-            if buy_price > upper_limit:
-                buy_price = upper_limit
-                logger.warning(f"🚨 최종 매수가 상한가 제한: {stock_code} {buy_price:,}원")
+            logger.debug(f"💰 매수가 계산: {stock_code} 현재가{current_price:,}원 → 주문가{final_price:,}원 "
+                        f"(프리미엄{final_premium*100:.2f}%)")
 
-            logger.debug(f"💰 매수가 계산 (실제 상하한가): {stock_code} {current_price:,}원 → {buy_price:,}원 "
-                        f"(프리미엄: {final_premium:.1%}, 상한가: {upper_limit:,}원, 소스: {source})")
-            return buy_price
+            return final_price
 
         except Exception as e:
-            logger.error(f"매수가 계산 오류: {stock_code} - {e}")
-            # 오류시 기본 계산 (10% 제한)
-            backup_price = int(current_price * 1.003)
-            emergency_upper = int(current_price * 1.10)
-            return min(backup_price, emergency_upper)
+            logger.error(f"매수가 계산 오류 ({stock_code}): {e}")
+            # 오류시 현재가의 100.1% 반환 (안전장치)
+            return int(current_price * 1.001)
 
     def _calculate_sell_price(self, current_price: int, strategy: str = 'default', is_auto_sell: bool = False, stock_code: str = '') -> int:
         """매도 지정가 계산 - 🚨 실제 상하한가 조회 적용"""
@@ -1157,7 +600,7 @@ class TradeExecutor:
             lower_limit = price_limits['lower_limit']
             base_price = price_limits['base_price']
             source = price_limits['source']
-            
+
             # 상한가/하한가 여부 확인
             tick_size = self._get_tick_size(current_price)
             is_upper_limit = abs(current_price - upper_limit) <= tick_size
@@ -1167,7 +610,7 @@ class TradeExecutor:
                 logger.warning(f"🚨 상한가 종목 감지: {stock_code} {current_price:,}원 (상한가: {upper_limit:,}원, 기준가: {base_price:,}원)")
                 # 상한가 종목은 현재가 이하에서만 매도 가능
                 return current_price
-                
+
             elif is_lower_limit:
                 logger.warning(f"🚨 하한가 종목 감지: {stock_code} {current_price:,}원 (하한가: {lower_limit:,}원)")
                 # 하한가 종목은 추가 하락 제한적이므로 할인 완화
@@ -1199,7 +642,7 @@ class TradeExecutor:
 
             logger.debug(f"💰 매도가 계산 (실제 상하한가): {stock_code} 현재{current_price:,}원 → 최종{final_sell_price:,}원 "
                         f"(할인: {discount:.1%}, 기준가: {base_price:,}원, 상한가: {upper_limit:,}원, 소스: {source})")
-            
+
             return final_sell_price
 
         except Exception as e:
@@ -1300,15 +743,15 @@ class TradeExecutor:
         """실제 보유 수량 확인 - 🔧 KIS API 응답 필드 다중 확인"""
         try:
             logger.debug(f"📊 실제 보유 수량 조회 시작: {stock_code}")
-            
+
             balance = self.trading_manager.get_balance()
             if not balance or not balance.get('success'):
                 logger.error(f"❌ 잔고 조회 실패: {stock_code} - {balance}")
                 return 0
-                
+
             holdings = balance.get('holdings', [])
             logger.debug(f"📊 총 보유 종목 수: {len(holdings)}개")
-            
+
             if not holdings:
                 logger.warning(f"⚠️ 보유 종목 목록이 비어있음: {stock_code}")
                 return 0
@@ -1316,10 +759,10 @@ class TradeExecutor:
             # 🔧 KIS API 응답 필드명 다중 확인
             possible_code_fields = ['pdno', 'stock_code', 'stck_shrn_iscd', 'mksc_shrn_iscd']
             possible_quantity_fields = ['hldg_qty', 'quantity', 'ord_psbl_qty', 'available_quantity']
-            
+
             for holding in holdings:
                 logger.debug(f"📋 보유종목 확인: {holding}")
-                
+
                 # 종목코드 매칭 (다양한 필드명 확인)
                 found_stock_code = None
                 for field in possible_code_fields:
@@ -1329,7 +772,7 @@ class TradeExecutor:
                             found_stock_code = code_value
                             logger.debug(f"✅ 종목코드 매칭: {field}={code_value}")
                             break
-                
+
                 if found_stock_code:
                     # 수량 확인 (다양한 필드명 확인)
                     for qty_field in possible_quantity_fields:
@@ -1341,7 +784,7 @@ class TradeExecutor:
                             except (ValueError, TypeError):
                                 logger.warning(f"⚠️ 수량 변환 실패: {qty_field}={holding.get(qty_field)}")
                                 continue
-                    
+
                     # 수량 필드를 찾지 못한 경우
                     logger.error(f"❌ 수량 필드를 찾을 수 없음: {stock_code}")
                     logger.debug(f"   보유종목 데이터: {holding}")
@@ -1590,13 +1033,13 @@ class TradeExecutor:
         try:
             execution_stats = self.execution_manager.get_stats()
             pending_count = self.execution_manager.get_pending_orders_count()
-            
+
             return {
                 'traditional_orders': self.stats if hasattr(self, 'stats') else {},
                 'websocket_executions': execution_stats,
                 'pending_orders_count': pending_count,
                 'total_success_rate': (
-                    execution_stats['orders_filled'] / 
+                    execution_stats['orders_filled'] /
                     max(execution_stats['orders_sent'], 1)
                 ) if execution_stats['orders_sent'] > 0 else 0
             }
@@ -1615,22 +1058,22 @@ class TradeExecutor:
         """🚨 KIS API에서 실제 상하한가 정보 조회"""
         try:
             logger.debug(f"📊 상하한가 정보 조회 시작: {stock_code}")
-            
+
             # KIS API에서 현재가 정보 조회 (상하한가 포함)
             current_data = self.data_manager.get_latest_data(stock_code)
-            
+
             if not current_data or current_data.get('status') != 'success':
                 logger.warning(f"⚠️ 가격 정보 조회 실패, 기본값 사용: {stock_code}")
                 return self._get_fallback_price_limits(current_price)
-            
+
             # KIS API 응답에서 상하한가 정보 추출
             data = current_data.get('data', {})
-            
+
             # 다양한 필드명 확인
             base_price = self._extract_field(data, ['prdy_clpr', 'base_price', 'previous_close'])
             upper_limit = self._extract_field(data, ['stck_hgpr', 'upper_limit', 'high_limit'])
             lower_limit = self._extract_field(data, ['stck_lwpr', 'lower_limit', 'low_limit'])
-            
+
             # 값 검증 및 변환
             try:
                 if base_price:
@@ -1642,7 +1085,7 @@ class TradeExecutor:
             except (ValueError, TypeError):
                 logger.warning(f"⚠️ 상하한가 값 변환 실패: {stock_code}")
                 return self._get_fallback_price_limits(current_price)
-            
+
             # 상하한가가 직접 제공되는 경우
             if upper_limit and lower_limit and upper_limit > 0 and lower_limit > 0:
                 logger.debug(f"✅ API에서 상하한가 직접 조회: {stock_code} - 상한가:{upper_limit:,}원, 하한가:{lower_limit:,}원")
@@ -1652,16 +1095,16 @@ class TradeExecutor:
                     'lower_limit': lower_limit,
                     'source': 'api_direct'
                 }
-            
+
             # 전일 종가만 제공되는 경우 계산
             elif base_price and base_price > 0:
                 calculated_upper = int(base_price * 1.30)
                 calculated_lower = int(base_price * 0.70)
-                
+
                 # 호가 단위로 조정
                 calculated_upper = self._adjust_to_tick_size(calculated_upper)
                 calculated_lower = self._adjust_to_tick_size(calculated_lower)
-                
+
                 logger.debug(f"✅ 전일종가 기준 계산: {stock_code} - 기준가:{base_price:,}원, 상한가:{calculated_upper:,}원")
                 return {
                     'base_price': base_price,
@@ -1669,11 +1112,11 @@ class TradeExecutor:
                     'lower_limit': calculated_lower,
                     'source': 'calculated'
                 }
-            
+
             else:
                 logger.warning(f"⚠️ 상하한가 정보 부족, 기본값 사용: {stock_code}")
                 return self._get_fallback_price_limits(current_price)
-                
+
         except Exception as e:
             logger.error(f"❌ 상하한가 조회 오류: {stock_code} - {e}")
             return self._get_fallback_price_limits(current_price)
@@ -1692,23 +1135,23 @@ class TradeExecutor:
             max_possible_base = int(current_price / 0.70)
             min_possible_base = int(current_price / 1.30)
             estimated_base = int((min_possible_base + max_possible_base) / 2)
-            
+
             fallback_upper = int(estimated_base * 1.30)
             fallback_lower = int(estimated_base * 0.70)
-            
+
             # 호가 단위로 조정
             fallback_upper = self._adjust_to_tick_size(fallback_upper)
             fallback_lower = self._adjust_to_tick_size(fallback_lower)
-            
+
             logger.warning(f"🔧 백업 상하한가 계산: 추정기준가={estimated_base:,}원, 상한가={fallback_upper:,}원")
-            
+
             return {
                 'base_price': estimated_base,
                 'upper_limit': fallback_upper,
                 'lower_limit': fallback_lower,
                 'source': 'fallback'
             }
-            
+
         except Exception as e:
             logger.error(f"❌ 백업 계산 오류: {e}")
             return {
@@ -1717,3 +1160,22 @@ class TradeExecutor:
                 'lower_limit': int(current_price * 0.90),
                 'source': 'emergency'
             }
+
+    def _calculate_buy_quantity_simple(self, buy_price: float, available_cash: int) -> int:
+        """간단한 매수 수량 계산 (캔들 전용)"""
+        try:
+            if available_cash < self.config.min_investment_amount:
+                return 0
+
+            # 기본 투자 금액 (계좌의 20%)
+            target_amount = min(
+                available_cash * self.config.base_position_ratio,
+                self.config.max_investment_amount
+            )
+
+            quantity = int(target_amount // buy_price)
+            return max(0, quantity)
+
+        except Exception as e:
+            logger.error(f"수량 계산 오류: {e}")
+            return 0

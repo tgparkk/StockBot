@@ -140,6 +140,19 @@ def auth(svr: str = 'prod', product: str = '01') -> bool:
     """토큰 발급"""
     global _last_auth_time
 
+    # 🔧 설정값 검증 추가
+    if not APP_KEY or not SECRET_KEY:
+        logger.error(f"❌ KIS API 키가 설정되지 않았습니다!")
+        logger.error(f"APP_KEY: {'설정됨' if APP_KEY else '미설정'}")
+        logger.error(f"SECRET_KEY: {'설정됨' if SECRET_KEY else '미설정'}")
+        logger.error("🔧 .env 파일을 확인하고 실제 KIS API 키를 입력해주세요.")
+        return False
+
+    if APP_KEY == 'your_app_key_here' or SECRET_KEY == 'your_app_secret_here':
+        logger.error(f"❌ KIS API 키가 템플릿 값으로 설정되어 있습니다!")
+        logger.error("🔧 .env 파일에서 실제 KIS API 키로 변경해주세요.")
+        return False
+
     # 기존 토큰 확인
     saved_token = read_token()
 
@@ -163,17 +176,20 @@ def auth(svr: str = 'prod', product: str = '01') -> bool:
                 my_token = result.access_token
                 my_expired = result.access_token_token_expired
                 save_token(my_token, my_expired)
-                logger.info('토큰 발급 완료')
+                logger.info('✅ 토큰 발급 완료')
             else:
-                logger.error('토큰 발급 실패!')
+                logger.error(f'❌ 토큰 발급 실패! 상태코드: {res.status_code}')
+                logger.error(f'응답: {res.text}')
+                if res.status_code == 401:
+                    logger.error("🔧 API 키가 잘못되었을 가능성이 높습니다. .env 파일을 확인해주세요.")
                 return False
 
         except Exception as e:
-            logger.error(f'토큰 발급 오류: {e}')
+            logger.error(f'❌ 토큰 발급 오류: {e}')
             return False
     else:
         my_token = saved_token
-        logger.debug('기존 토큰 사용')
+        logger.debug('✅ 기존 토큰 사용')
 
     # 환경 설정
     changeTREnv(f"Bearer {my_token}", svr, product)
@@ -183,8 +199,10 @@ def auth(svr: str = 'prod', product: str = '01') -> bool:
         _base_headers["authorization"] = _TRENV.my_token
         _base_headers["appkey"] = _TRENV.my_app
         _base_headers["appsecret"] = _TRENV.my_sec
+        logger.info("✅ KIS API 인증 헤더 설정 완료")
     else:
-        logger.error("_TRENV가 설정되지 않았습니다")
+        logger.error("❌ _TRENV가 설정되지 않았습니다")
+        return False
 
     _last_auth_time = datetime.now()
 
