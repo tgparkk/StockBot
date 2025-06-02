@@ -208,9 +208,9 @@ class CandleTradeManager:
                 logger.info(f"   🛑 손절가: {stop_loss_price:,}원 ({stop_pct:.1f}%)")
             else:
                 # 기본 목표가/손절가 계산
-                default_target = int(buy_price * 1.08)  # 8% 익절
+                default_target = int(buy_price * 1.05)  # 5% 익절
                 default_stop = int(buy_price * 0.95)    # 5% 손절
-                logger.info(f"   🎯 목표가: {default_target:,}원 (+8% 기본설정)")
+                logger.info(f"   🎯 목표가: {default_target:,}원 (+5% 기본설정)")
                 logger.info(f"   🛑 손절가: {default_stop:,}원 (-5% 기본설정)")
 
             # 현재 추천 사항
