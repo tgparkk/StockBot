@@ -66,17 +66,17 @@ if errorlevel 1 (
 )
 
 :: 데이터베이스 초기화 확인
-if not exist "data\stockbot.db" (
-    echo.
-    echo 📊 데이터베이스 초기화 중...
-    python database\init_db.py
-    if errorlevel 1 (
-        echo ❌ 데이터베이스 초기화 실패
-        pause
-        exit /b 1
-    )
-    echo ✅ 데이터베이스 초기화 완료
-)
+::if not exist "data\stockbot.db" (
+::    echo.
+::    echo 📊 데이터베이스 초기화 중...
+::    python database\init_db.py
+::    if errorlevel 1 (
+::        echo ❌ 데이터베이스 초기화 실패
+::        pause
+::        exit /b 1
+::    )
+::    echo ✅ 데이터베이스 초기화 완료
+::)
 
 :: 로그 디렉토리 생성
 if not exist "logs" mkdir logs

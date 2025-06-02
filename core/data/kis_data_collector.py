@@ -356,8 +356,8 @@ class KISDataCollector:
             logger.error(f"실시간 구독 해제 오류: {stock_code} - {e}")
             return False
 
-    def _websocket_callback(self, stock_code: str, data: Dict) -> None:
-        """WebSocket 데이터 콜백"""
+    def _websocket_callback(self, data_type: str, stock_code: str, data: Dict) -> None:
+        """WebSocket 데이터 콜백 - 🆕 data_type 파라미터 추가"""
         try:
             self.stats['websocket_data'] += 1
 
@@ -381,7 +381,19 @@ class KISDataCollector:
             if stock_code in self.data_callbacks:
                 for callback in self.data_callbacks[stock_code]:
                     try:
-                        callback(stock_code, data)
+                        # 🆕 기존 콜백 호환성을 위해 data_type 없이 호출
+                        if callable(callback):
+                            # 콜백 함수 시그니처 확인해서 적절히 호출
+                            import inspect
+                            sig = inspect.signature(callback)
+                            param_count = len(sig.parameters)
+                            
+                            if param_count >= 3:
+                                # 새로운 형식: callback(data_type, stock_code, data)
+                                callback(data_type, stock_code, data)
+                            else:
+                                # 기존 형식: callback(stock_code, data)
+                                callback(stock_code, data)
                     except Exception as e:
                         logger.error(f"콜백 실행 오류: {stock_code} - {e}")
 

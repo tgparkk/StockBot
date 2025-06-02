@@ -15,7 +15,7 @@ logger = setup_logger(__name__)
 class PositionManager:
     """간소화된 포지션 관리자"""
 
-    def __init__(self, trading_manager: TradingManager):
+    def __init__(self, trading_manager: TradingManager, data_collector: KISDataCollector):
         """초기화"""
         self.trading_manager = trading_manager
         self.data_collector = trading_manager.data_collector
@@ -429,8 +429,8 @@ class PositionManager:
                 logger.error(f"포지션 제거 오류: {stock_code} - {e}")
                 return False
 
-    def update_position_prices(self, force_rest_api: bool = False) -> None:
-        """포지션 가격 업데이트"""
+    def update_position_prices(self, force_rest_api: bool = True) -> None:
+        """포지션 가격 업데이트 - 🔧 웹소켓 재연결 스팸 방지"""
         if not self.positions:
             return
 
@@ -440,28 +440,37 @@ class PositionManager:
         websocket_available = False
 
         if not force_rest_api:
-            websocket_available = self._check_websocket_connection()
+            # 🔧 _check_websocket_connection 메서드 대신 직접 확인
+            try:
+                if (hasattr(self.data_collector, 'websocket') and 
+                    self.data_collector.websocket):
+                    websocket_manager = self.data_collector.websocket
+                    websocket_available = getattr(websocket_manager, 'is_connected', False)
+                else:
+                    websocket_available = False
+            except Exception as e:
+                logger.debug(f"웹소켓 연결 상태 확인 오류: {e}")
+                websocket_available = False
 
             if not websocket_available:
-                # 재연결 시도 빈도 제한 (5분 간격)
+                # 🔧 재연결 시도 빈도 제한 (15분 간격으로 연장)
                 if not hasattr(self, '_last_reconnect_attempt'):
                     self._last_reconnect_attempt = 0
 
-                if current_time - self._last_reconnect_attempt > 300:  # 5분
-                    logger.warning("🔴 웹소켓 연결 확인 불가 - 재연결 시도 중... (5분 간격)")
+                if current_time - self._last_reconnect_attempt > 900:  # 🔧 15분 (기존 5분에서 증가)
+                    logger.info("🔴 웹소켓 연결 확인 불가 - 재연결 시도 중... (15분 간격)")
 
                     # 재연결 시도
-                    reconnected = self._attempt_websocket_reconnection_with_retry()
+                    reconnected = self._attempt_websocket_reconnection_simple()
 
                     if reconnected:
-                        logger.info("✅ 웹소켓 필수 재연결 성공")
+                        logger.info("✅ 웹소켓 재연결 성공")
                         websocket_available = True
                     else:
-                        logger.debug("재연결 실패 - REST API 백업 사용")
+                        logger.debug("재연결 실패 - REST API 계속 사용")
 
                     self._last_reconnect_attempt = current_time
-                else:
-                    logger.debug("재연결 시도 쿨다운 중 - REST API 사용")
+                # 🔧 쿨다운 중 로그 제거 (스팸 방지)
 
         # 웹소켓 우선 시도 (사용 가능한 경우)
         websocket_success = False
@@ -477,8 +486,15 @@ class PositionManager:
                 logger.error(f"웹소켓 가격 업데이트 오류: {e}")
 
         # REST API 백업 또는 강제 사용
-        reason = "강제 모드" if force_rest_api else "웹소켓 재연결시도했으나 실패"
-        logger.info(f"💾 REST API 백업 사용: {reason}")
+        # 🔧 로그 빈도 제한 (15분마다 한번만)
+        if not hasattr(self, '_last_rest_api_log'):
+            self._last_rest_api_log = 0
+            
+        if current_time - self._last_rest_api_log > 900:  # 15분마다
+            reason = "강제 모드" if force_rest_api else "웹소켓 연결불가"
+            logger.info(f"💾 REST API 백업 사용: {reason}")
+            self._last_rest_api_log = current_time
+            
         self._update_prices_via_rest_api()
 
     def _update_prices_via_rest_api(self):
@@ -542,6 +558,44 @@ class PositionManager:
 
                     logger.debug(f"📊 포지션 업데이트: {stock_code} {current_price:,}원 "
                                f"(수익률: {position['profit_rate']:.2f}%)")
+
+    def _attempt_websocket_reconnection_simple(self) -> bool:
+        """🔧 간소화된 웹소켓 재연결 시도 (1회만)"""
+        try:
+            # 데이터 수집기를 통한 웹소켓 재연결
+            if hasattr(self.data_collector, 'websocket'):
+                websocket_manager = self.data_collector.websocket
+
+                if websocket_manager:
+                    # 현재 연결 상태 확인
+                    is_connected = getattr(websocket_manager, 'is_connected', False)
+
+                    if not is_connected:
+                        logger.debug("🔄 웹소켓 간소화 재연결 시도...")
+
+                        # 웹소켓 재시작 시도 (간단한 버전)
+                        if hasattr(websocket_manager, 'ensure_connection'):
+                            try:
+                                websocket_manager.ensure_connection()
+                                if getattr(websocket_manager, 'is_connected', False):
+                                    logger.debug("✅ 웹소켓 간소화 재연결 성공")
+                                    return True
+                            except Exception as e:
+                                logger.debug(f"웹소켓 간소화 재연결 실패: {e}")
+                                return False
+                        
+                        return False
+                    else:
+                        logger.debug("웹소켓이 이미 연결되어 있음")
+                        return True
+                else:
+                    return False
+            else:
+                return False
+
+        except Exception as e:
+            logger.debug(f"웹소켓 간소화 재연결 오류: {e}")
+            return False
 
     def _attempt_websocket_reconnection(self) -> bool:
         """🎯 웹소켓 재연결 시도"""
@@ -644,27 +698,39 @@ class PositionManager:
         return updated_count
 
     def check_exit_conditions(self) -> List[Dict]:
-        """매도 조건 확인 - 개선된 수익성 중심 로직"""
-        sell_signals = []
+        """🆕 매도 조건 확인 및 신호 반환 (직접 실행하지 않음)"""
+        try:
+            sell_signals = []
 
-        with self.position_lock:
-            for stock_code, position in self.positions.items():
-                if position['status'] != 'active':
-                    continue
+            # 1. 포지션 현재가 업데이트 (이미 worker에서 호출됨)
+            # self.update_position_prices()  # 제거 - worker에서 별도 호출
 
-                current_price = position.get('current_price')
-                if not current_price:
-                    continue
+            # 2. 활성 포지션들의 매도 조건 확인
+            active_positions = self.get_positions('active')
+            
+            for stock_code, position in active_positions.items():
+                try:
+                    # 🔧 통합된 매도 조건 확인 (기본 + 이격도 조건 모두 포함)
+                    sell_signal = self._check_position_exit_conditions(position)
+                    
+                    if sell_signal:
+                        sell_signals.append(sell_signal)
+                        logger.info(f"💡 매도 신호 생성: {stock_code} - {sell_signal['reason']}")
 
-                # 개별 포지션 매도 조건 확인
-                sell_signal = self._check_position_exit_conditions(position)
-                if sell_signal:
-                    sell_signals.append(sell_signal)
+                except Exception as e:
+                    logger.error(f"❌ 포지션 매도 조건 확인 오류: {stock_code} - {e}")
 
-        return sell_signals
+            if sell_signals:
+                logger.info(f"📊 총 {len(sell_signals)}개 매도 신호 생성됨")
+            
+            return sell_signals
+
+        except Exception as e:
+            logger.error(f"❌ 매도 조건 확인 오류: {e}")
+            return []
 
     def _check_position_exit_conditions(self, position: Dict) -> Optional[Dict]:
-        """개별 포지션의 매도 조건 확인 - 최적 매도 가격 포함"""
+        """🔧 통합된 포지션 매도 조건 확인 - 기본 조건 + 이격도 조건 통합"""
         stock_code = position['stock_code']
         current_price = position.get('current_price')
 
@@ -677,12 +743,30 @@ class PositionManager:
         max_profit_rate = position.get('max_profit_rate', 0)
         strategy_type = position.get('strategy_type', 'default')
         buy_time = position.get('buy_time', time.time())
-
-        # 전략별 손익 기준
-        targets = self.profit_targets.get(strategy_type, self.profit_targets['default'])
         holding_minutes = (time.time() - buy_time) / 60
 
-        # 매도 조건 확인
+        # 🎯 1. 우선순위: 이격도 기반 매도 신호 확인 (시장 상황 우선)
+        disparity_signal = self._check_disparity_sell_signal(position)
+        if disparity_signal:
+            optimal_sell_price = disparity_signal.get('suggested_price', current_price)
+            logger.info(f"🎯 이격도 매도 신호: {stock_code} - {disparity_signal['reason']}")
+            
+            return {
+                'stock_code': stock_code,
+                'quantity': position['quantity'],
+                'current_price': current_price,
+                'optimal_sell_price': optimal_sell_price,
+                'profit_rate': profit_rate,
+                'max_profit_rate': max_profit_rate,
+                'holding_minutes': holding_minutes,
+                'reason': disparity_signal['reason'],
+                'strategy_type': strategy_type,
+                'urgency': disparity_signal.get('urgency', 'MEDIUM'),
+                'signal_source': 'DISPARITY'  # 신호 출처 구분
+            }
+
+        # 🎯 2. 기본 매도 조건 확인 (이격도 신호가 없는 경우에만)
+        targets = self.profit_targets.get(strategy_type, self.profit_targets['default'])
         sell_reason = self._evaluate_sell_conditions(
             profit_rate, max_profit_rate, holding_minutes, targets, position
         )
@@ -691,19 +775,20 @@ class PositionManager:
             # 매도 조건 충족시 최적 매도 가격 계산
             optimal_sell_price = self._calculate_optimal_sell_price(stock_code, current_price, sell_reason)
 
-            logger.info(f"매도 신호 생성: {stock_code} - {sell_reason} (최고수익: {max_profit_rate:.2f}%)")
+            logger.info(f"💡 기본 매도 신호: {stock_code} - {sell_reason} (최고수익: {max_profit_rate:.2f}%)")
             logger.info(f"매도가격: 현재{current_price:,}원 → 최적{optimal_sell_price:,}원")
 
             return {
                 'stock_code': stock_code,
                 'quantity': position['quantity'],
                 'current_price': current_price,
-                'optimal_sell_price': optimal_sell_price,  # 계산된 최적 매도 가격
+                'optimal_sell_price': optimal_sell_price,
                 'profit_rate': profit_rate,
                 'max_profit_rate': max_profit_rate,
                 'holding_minutes': holding_minutes,
                 'reason': sell_reason,
-                'strategy_type': strategy_type
+                'strategy_type': strategy_type,
+                'signal_source': 'BASIC'  # 신호 출처 구분
             }
 
         return None
@@ -807,7 +892,11 @@ class PositionManager:
             # 1. 🎯 이격도 기반 과매도 분석 (최고 40점)
             try:
                 from ..api.kis_market_api import get_disparity_rank
-                disparity_data = get_disparity_rank("0000", "20", "5000")
+                disparity_data = get_disparity_rank(
+                    fid_input_iscd="0000",      # 전체 시장
+                    fid_hour_cls_code="20",     # 20일 이격도  
+                    fid_vol_cnt="5000"          # 거래량 5천주 이상
+                )
 
                 if disparity_data is not None and not disparity_data.empty:
                     stock_row = disparity_data[disparity_data['mksc_shrn_iscd'] == stock_code]
@@ -1099,80 +1188,6 @@ class PositionManager:
             logger.debug(f"다중 이격도 매도 신호 확인 오류 ({position.get('stock_code', 'Unknown')}): {e}")
             return None
 
-    def check_auto_sell(self) -> List[str]:
-        """자동 매도 체크 및 실행 - worker_manager 호환용"""
-        try:
-            executed_orders = []
-
-            # 1. 포지션 현재가 업데이트
-            self.update_position_prices()
-
-            # 2. 매도 조건 확인
-            sell_signals = self.check_exit_conditions()
-
-            # 3. 매도 신호 실행
-            for sell_signal in sell_signals:
-                try:
-                    order_no = self.execute_auto_sell(sell_signal)
-                    if order_no:
-                        executed_orders.append(order_no)
-
-                        # 포지션에서 제거
-                        stock_code = sell_signal['stock_code']
-                        quantity = sell_signal['quantity']
-                        current_price = sell_signal['current_price']
-
-                        self.remove_position(stock_code, quantity, current_price)
-
-                        logger.info(f"✅ 자동 매도 완료: {stock_code} - {sell_signal['reason']}")
-                    else:
-                        logger.warning(f"⚠️ 자동 매도 주문 실패: {sell_signal['stock_code']}")
-
-                except Exception as e:
-                    logger.error(f"❌ 자동 매도 실행 오류: {sell_signal['stock_code']} - {e}")
-
-            return executed_orders
-
-        except Exception as e:
-            logger.error(f"❌ 자동 매도 체크 오류: {e}")
-            return []
-
-    def _check_websocket_connection(self) -> bool:
-        """웹소켓 연결 상태 확인 (간소화 버전)"""
-        try:
-            # data_collector를 통해 웹소켓 매니저 접근
-            websocket_manager = getattr(
-                getattr(self.trading_manager, 'data_collector', None),
-                'websocket',
-                None
-            )
-
-            if not websocket_manager:
-                logger.debug("웹소켓 매니저를 찾을 수 없음")
-                return False
-
-            # 기본 연결 상태 확인
-            is_connected = getattr(websocket_manager, 'is_connected', False)
-            is_running = getattr(websocket_manager, 'is_running', False)
-
-            # 실제 연결 상태 확인
-            actual_connected = websocket_manager._check_actual_connection_status()
-
-            # 건강성 체크
-            is_healthy = getattr(websocket_manager, 'is_healthy', lambda: False)()
-
-            # 전체 상태 판단
-            websocket_available = is_connected and is_running and actual_connected and is_healthy
-
-            logger.debug(f"웹소켓 상태: connected={is_connected}, running={is_running}, "
-                        f"actual={actual_connected}, healthy={is_healthy}")
-
-            return websocket_available
-
-        except Exception as e:
-            logger.debug(f"웹소켓 연결 상태 확인 오류: {e}")
-            return False
-
     def _check_intelligent_trailing_stop(self, position: Dict) -> Optional[str]:
         """🧠 지능형 추격매도 - 기술적 지표 활용"""
         try:
@@ -1230,7 +1245,11 @@ class PositionManager:
             # 1. 🎯 이격도 기반 과매도 분석 (가장 강력한 지표)
             try:
                 from ..api.kis_market_api import get_disparity_rank
-                disparity_data = get_disparity_rank("0000", "20", "5000")
+                disparity_data = get_disparity_rank(
+                    fid_input_iscd="0000",      # 전체 시장
+                    fid_hour_cls_code="20",     # 20일 이격도  
+                    fid_vol_cnt="5000"          # 거래량 5천주 이상
+                )
 
                 if disparity_data is not None and not disparity_data.empty:
                     stock_row = disparity_data[disparity_data['mksc_shrn_iscd'] == stock_code]
@@ -1331,43 +1350,6 @@ class PositionManager:
             logger.error(f"반등 예측 분석 오류: {e}")
             return {'should_hold': False, 'reason': '분석오류', 'confidence': 0.0}
 
-    def execute_auto_sell(self, sell_signal: Dict) -> Optional[str]:
-        """자동 매도 실행 - 🎯 이미 계산된 가격 사용"""
-        try:
-            stock_code = sell_signal['stock_code']
-            quantity = sell_signal['quantity']
-            reason = sell_signal['reason']
-
-            # 🎯 이미 계산된 최적 매도 가격 사용
-            optimal_sell_price = sell_signal.get('optimal_sell_price')
-            current_price = sell_signal.get('current_price', 0)
-
-            if not optimal_sell_price or optimal_sell_price <= 0:
-                logger.error(f"❌ 유효하지 않은 매도 가격: {stock_code} - {optimal_sell_price}")
-                return None
-
-            logger.info(f"📊 {stock_code} 매도 주문: 계산된 가격 {optimal_sell_price:,}원 사용 ({reason})")
-
-            # 계산된 가격으로 매도 주문 실행
-            order_no = self.trading_manager.execute_order(
-                stock_code=stock_code,
-                order_type="SELL",
-                quantity=quantity,
-                price=optimal_sell_price,  # 🎯 이미 계산된 가격 사용
-                strategy_type=f"auto_sell_{reason}"
-            )
-
-            if order_no:
-                logger.info(f"✅ 자동 매도 주문 성공: {stock_code} {quantity}주 {optimal_sell_price:,}원 - {reason}")
-                return order_no
-            else:
-                logger.error(f"❌ 자동 매도 주문 실패: {stock_code} - {reason}")
-                return None
-
-        except Exception as e:
-            logger.error(f"자동 매도 실행 오류: {sell_signal['stock_code']} - {e}")
-            return None
-
     def _calculate_optimal_sell_price(self, stock_code: str, current_price: int, reason: str) -> int:
         """🎯 최적 매도 가격 계산"""
         try:
@@ -1410,24 +1392,8 @@ class PositionManager:
                 logger.debug(f"스프레드 분석 오류: {e}")
                 spread_adjustment = 0.005
 
-            # 3. 🎯 시장 상황별 조정
-            try:
-                # 장 마감 30분 전이면 추가 할인 (빠른 체결 우선)
-                from datetime import datetime
-                now = datetime.now()
-                if now.hour >= 14 and now.minute >= 30:  # 14:30 이후
-                    market_urgency = 0.003  # 0.3% 추가 할인
-                    logger.debug(f"장마감 임박 - 추가 할인 적용: {market_urgency:.1%}")
-                else:
-                    market_urgency = 0.0
-
-            except Exception as e:
-                logger.debug(f"시장 상황 분석 오류: {e}")
-                market_urgency = 0.0
-
             # 4. 🎯 총 할인율 계산 및 제한
-            total_discount = discount_rate + spread_adjustment + market_urgency
-            total_discount = min(total_discount, 0.025)  # 최대 2.5% 할인으로 제한
+            total_discount = discount_rate + spread_adjustment
 
             # 5. 🎯 최종 매도 가격 계산
             calculated_price = int(current_price * (1 - total_discount))
@@ -1575,3 +1541,152 @@ class PositionManager:
                 logger.info(f"- {stock_code}: {position['quantity']}주, 수익률 {profit_rate:.2f}%")
 
         logger.info("포지션 관리자 정리 완료")
+
+    def sync_with_account(self) -> Dict:
+        """🔧 실제 계좌와 포지션 동기화"""
+        try:
+            logger.info("📊 계좌-포지션 동기화 시작...")
+            
+            # 실제 계좌 잔고 조회
+            balance = self.trading_manager.get_balance()
+            if not balance or not balance.get('success'):
+                error_msg = f"계좌 조회 실패: {balance}"
+                logger.error(f"❌ {error_msg}")
+                return {'success': False, 'error': error_msg}
+            
+            account_holdings = balance.get('holdings', [])
+            logger.info(f"📊 계좌 보유 종목: {len(account_holdings)}개")
+            
+            # 포지션과 계좌 비교
+            sync_result = {
+                'success': True,
+                'total_checked': 0,
+                'synced_count': 0,
+                'quantity_adjustments': [],
+                'removed_positions': [],
+                'missing_in_positions': [],
+                'errors': []
+            }
+            
+            # 🔍 1. 포지션 매니저의 종목들을 계좌와 비교
+            with self.position_lock:
+                active_positions = self.get_positions('active')
+                
+                for stock_code, position in active_positions.items():
+                    sync_result['total_checked'] += 1
+                    position_quantity = position['quantity']
+                    
+                    # 계좌에서 해당 종목 찾기
+                    account_quantity = 0
+                    for holding in account_holdings:
+                        # 다양한 필드명 확인
+                        for field in ['pdno', 'stock_code', 'stck_shrn_iscd', 'mksc_shrn_iscd']:
+                            if field in holding and str(holding[field]).strip() == stock_code:
+                                # 수량 확인
+                                for qty_field in ['hldg_qty', 'quantity', 'ord_psbl_qty', 'available_quantity']:
+                                    if qty_field in holding:
+                                        try:
+                                            account_quantity = int(holding[qty_field])
+                                            break
+                                        except (ValueError, TypeError):
+                                            continue
+                                break
+                        if account_quantity > 0:
+                            break
+                    
+                    # 수량 비교 및 조정
+                    if account_quantity != position_quantity:
+                        logger.warning(f"⚠️ 수량 불일치 발견: {stock_code} - 포지션={position_quantity:,}주, 계좌={account_quantity:,}주")
+                        
+                        if account_quantity == 0:
+                            # 계좌에 없는 종목 - 포지션에서 제거
+                            try:
+                                self.positions[stock_code]['status'] = 'missing_in_account'
+                                del self.positions[stock_code]
+                                sync_result['removed_positions'].append({
+                                    'stock_code': stock_code,
+                                    'removed_quantity': position_quantity,
+                                    'reason': '계좌에서 종목이 없음'
+                                })
+                                logger.info(f"🗑️ 포지션 제거: {stock_code} (계좌에 없음)")
+                            except Exception as e:
+                                sync_result['errors'].append(f"포지션 제거 실패: {stock_code} - {e}")
+                        else:
+                            # 수량 조정
+                            try:
+                                old_quantity = self.positions[stock_code]['quantity']
+                                self.positions[stock_code]['quantity'] = account_quantity
+                                self.positions[stock_code]['last_update'] = time.time()
+                                
+                                sync_result['quantity_adjustments'].append({
+                                    'stock_code': stock_code,
+                                    'old_quantity': old_quantity,
+                                    'new_quantity': account_quantity,
+                                    'adjustment': account_quantity - old_quantity
+                                })
+                                
+                                logger.info(f"🔧 수량 조정: {stock_code} {old_quantity:,}주 → {account_quantity:,}주")
+                                sync_result['synced_count'] += 1
+                                
+                            except Exception as e:
+                                sync_result['errors'].append(f"수량 조정 실패: {stock_code} - {e}")
+                    else:
+                        # 수량 일치
+                        logger.debug(f"✅ 수량 일치: {stock_code} = {position_quantity:,}주")
+                        sync_result['synced_count'] += 1
+                
+                # 🔍 2. 계좌에만 있고 포지션에 없는 종목들 확인
+                for holding in account_holdings:
+                    found_stock_code = None
+                    holding_quantity = 0
+                    
+                    # 종목코드 찾기
+                    for field in ['pdno', 'stock_code', 'stck_shrn_iscd', 'mksc_shrn_iscd']:
+                        if field in holding:
+                            code_value = str(holding[field]).strip()
+                            if code_value and len(code_value) == 6:  # 6자리 종목코드
+                                found_stock_code = code_value
+                                break
+                    
+                    # 수량 찾기
+                    if found_stock_code:
+                        for qty_field in ['hldg_qty', 'quantity', 'ord_psbl_qty', 'available_quantity']:
+                            if qty_field in holding:
+                                try:
+                                    holding_quantity = int(holding[qty_field])
+                                    break
+                                except (ValueError, TypeError):
+                                    continue
+                    
+                    # 포지션에 없는 종목 확인
+                    if found_stock_code and holding_quantity > 0:
+                        if found_stock_code not in active_positions:
+                            sync_result['missing_in_positions'].append({
+                                'stock_code': found_stock_code,
+                                'quantity': holding_quantity,
+                                'reason': '포지션 매니저에 없는 보유 종목'
+                            })
+                            logger.warning(f"⚠️ 포지션 누락 발견: {found_stock_code} {holding_quantity:,}주 (계좌에만 존재)")
+            
+            # 통계 업데이트
+            self.stats['active_positions'] = len([p for p in self.positions.values() if p['status'] == 'active'])
+            
+            # 결과 로깅
+            logger.info(f"✅ 계좌-포지션 동기화 완료:")
+            logger.info(f"   - 확인된 종목: {sync_result['total_checked']}개")
+            logger.info(f"   - 동기화된 종목: {sync_result['synced_count']}개")
+            logger.info(f"   - 수량 조정: {len(sync_result['quantity_adjustments'])}개")
+            logger.info(f"   - 제거된 포지션: {len(sync_result['removed_positions'])}개")
+            logger.info(f"   - 누락된 포지션: {len(sync_result['missing_in_positions'])}개")
+            
+            if sync_result['errors']:
+                logger.warning(f"   - 오류: {len(sync_result['errors'])}개")
+                for error in sync_result['errors']:
+                    logger.warning(f"     {error}")
+            
+            return sync_result
+            
+        except Exception as e:
+            error_msg = f"계좌-포지션 동기화 오류: {e}"
+            logger.error(f"❌ {error_msg}")
+            return {'success': False, 'error': error_msg}

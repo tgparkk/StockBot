@@ -72,8 +72,8 @@ class TradingManager:
                 result = self.rest_api.sell_order(stock_code, quantity, price)
                 self.stats['sell_orders'] += 1
 
-            # 3. 결과 처리
-            if result and result.get('success'):
+            # 3. 결과 처리 - rest_api는 status 필드를 사용
+            if result and result.get('status') == 'success':
                 order_no = result.get('order_no', f"order_{int(time.time())}")
 
                 # 주문 정보 저장

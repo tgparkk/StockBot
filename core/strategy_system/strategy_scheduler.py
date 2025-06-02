@@ -762,15 +762,15 @@ class StrategyScheduler:
                 return DataPriority.BACKGROUND
 
     async def _monitor_strategy_signals(self, strategy_name: str, stock_codes: list):
-        """전략 신호 모니터링 (주기적 체크)"""
+        """전략 신호 모니터링 (주기적 체크) - 🎯 10초 주기로 개선"""
         try:
-            logger.info(f"🔍 {strategy_name} 신호 모니터링 시작: {len(stock_codes)}개 종목")
+            logger.info(f"🔍 {strategy_name} 신호 모니터링 시작: {len(stock_codes)}개 종목 (10초 주기)")
 
-            # 30초 간격으로 신호 체크 (총 30분간)
-            for cycle in range(60):  # 30초 * 60 = 30분
-                await asyncio.sleep(30)  # 30초 대기
+            # 🎯 10초 간격으로 신호 체크 (기존 30초에서 3배 단축) - 총 30분간
+            for cycle in range(180):  # 10초 * 180 = 30분
+                await asyncio.sleep(10)  # 🎯 10초 대기 (30초에서 단축)
 
-                logger.debug(f"🔄 {strategy_name} 신호 체크 사이클 {cycle + 1}/60")
+                logger.debug(f"🔄 {strategy_name} 신호 체크 사이클 {cycle + 1}/180 (10초 주기)")
 
                 for stock_code in stock_codes:
                     try:
@@ -794,26 +794,32 @@ class StrategyScheduler:
                                     'risk_reward': signal.risk_reward,
                                     'confidence': signal.confidence,
                                     'warnings': signal.warnings,
-                                    'advanced_signal': True
+                                    'advanced_signal': True,
+                                    'periodic_check': True  # 🆕 주기적 체크 표시
                                 }
-                                logger.info(f"✅ 주기적 체크에서 신호 발견: {stock_code}")
-                                self.send_signal_to_main_bot(converted_signal, source="periodic_check")
+                                #logger.info(f"✅ 주기적 체크에서 신호 발견: {stock_code} (10초 주기)")
+                                self.send_signal_to_main_bot(converted_signal, source="periodic_check_10s")
 
                     except Exception as e:
                         logger.error(f"신호 체크 오류 ({stock_code}): {e}")
 
-                # 10개 종목마다 잠시 대기 (API 부하 방지)
+                # 🎯 10개 종목마다 잠시 대기 (API 부하 방지 - 짧게 조정)
                 if len(stock_codes) > 10:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)  # 5초에서 2초로 단축
 
         except Exception as e:
             logger.error(f"{strategy_name} 신호 모니터링 오류: {e}")
 
     def _create_strategy_callback(self, strategy_name: str) -> Callable:
         """전략별 콜백 함수 생성"""
-        def strategy_callback(stock_code: str, data: Dict, source: str = 'websocket') -> None:
-            """전략별 데이터 콜백"""
+        def strategy_callback(data_type: str, stock_code: str, data: Dict, source: str = 'websocket') -> None:
+            """전략별 데이터 콜백 - 🆕 data_type 파라미터 추가"""
             try:
+                # 🆕 데이터 타입 검증
+                if data_type not in ['stock_price', 'stock_orderbook', 'stock_execution']:
+                    logger.debug(f"지원하지 않는 데이터 타입: {data_type}")
+                    return
+
                 # 기본 데이터 검증
                 if not data or data.get('status') != 'success':
                     return
@@ -1204,12 +1210,12 @@ class StrategyScheduler:
             )
 
             if advanced_signal:
-                logger.info(f"✅ 고도화 신호 생성 성공: {stock_code}")
-                logger.info(f"   📈 RSI: {advanced_signal.technical_analysis.rsi:.1f} ({advanced_signal.technical_analysis.rsi_signal})")
-                logger.info(f"   📊 MACD: {advanced_signal.technical_analysis.macd_trend}")
-                logger.info(f"   📉 이평선: {advanced_signal.technical_analysis.ma_signal}")
-                logger.info(f"   📦 거래량: {advanced_signal.volume_profile.volume_ratio:.1f}x ({advanced_signal.volume_profile.volume_trend})")
-                logger.info(f"   🎯 포지션사이즈: {advanced_signal.position_size:.1%}")
+                # logger.info(f"✅ 고도화 신호 생성 성공: {stock_code}")
+                # logger.info(f"   📈 RSI: {advanced_signal.technical_analysis.rsi:.1f} ({advanced_signal.technical_analysis.rsi_signal})")
+                # logger.info(f"   📊 MACD: {advanced_signal.technical_analysis.macd_trend}")
+                # logger.info(f"   📉 이평선: {advanced_signal.technical_analysis.ma_signal}")
+                # logger.info(f"   📦 거래량: {advanced_signal.volume_profile.volume_ratio:.1f}x ({advanced_signal.volume_profile.volume_trend})")
+                # logger.info(f"   🎯 포지션사이즈: {advanced_signal.position_size:.1%}")
 
                 return advanced_signal
             else:
