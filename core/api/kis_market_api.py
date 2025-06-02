@@ -885,27 +885,30 @@ def get_disparity_rank(fid_cond_mrkt_div_code: str = "J",
     tr_id = "FHPST01780000"  # 이격도 순위
 
     params = {
-        "fid_input_price_2": fid_input_price_2,
-        "fid_cond_mrkt_div_code": fid_cond_mrkt_div_code,
-        "fid_cond_scr_div_code": fid_cond_scr_div_code,
-        "fid_div_cls_code": fid_div_cls_code,
-        "fid_rank_sort_cls_code": fid_rank_sort_cls_code,
-        "fid_hour_cls_code": fid_hour_cls_code,
-        "fid_input_iscd": fid_input_iscd,
-        "fid_trgt_cls_code": fid_trgt_cls_code,
-        "fid_trgt_exls_cls_code": fid_trgt_exls_cls_code,
-        "fid_input_price_1": fid_input_price_1,
-        "fid_vol_cnt": fid_vol_cnt
+        "FID_INPUT_PRICE_2": fid_input_price_2,          # 입력 가격2  
+        "FID_COND_MRKT_DIV_CODE": fid_cond_mrkt_div_code, # 조건 시장 분류 코드
+        "FID_COND_SCR_DIV_CODE": fid_cond_scr_div_code,   # 조건 화면 분류 코드
+        "FID_DIV_CLS_CODE": fid_div_cls_code,             # 분류 구분 코드
+        "FID_RANK_SORT_CLS_CODE": fid_rank_sort_cls_code, # 순위 정렬 구분 코드
+        "FID_HOUR_CLS_CODE": fid_hour_cls_code,           # 시간 구분 코드
+        "FID_INPUT_ISCD": fid_input_iscd,                 # 입력 종목코드
+        "FID_TRGT_CLS_CODE": fid_trgt_cls_code,           # 대상 구분 코드
+        "FID_TRGT_EXLS_CLS_CODE": fid_trgt_exls_cls_code, # 대상 제외 구분 코드
+        "FID_INPUT_PRICE_1": fid_input_price_1,           # 입력 가격1
+        "FID_VOL_CNT": fid_vol_cnt                        # 거래량 수
     }
 
     try:
+        logger.debug(f"🔍 이격도순위 API 호출 - 시장:{fid_input_iscd}, 이격도:{fid_hour_cls_code}일")
+        logger.debug(f"📋 파라미터: {params}")
+        
         res = kis._url_fetch(url, tr_id, tr_cont, params)
 
         if res and res.isOK():
             output_data = res.getBody().output
             if output_data:
                 current_data = pd.DataFrame(output_data)
-                #logger.info(f"이격도 순위 조회 성공: {len(current_data)}건")
+                #logger.info(f"✅ 이격도 순위 조회 성공: {len(current_data)}건 (이격도{fid_hour_cls_code}일)")
                 return current_data
             else:
                 logger.warning("이격도 순위 조회: 데이터 없음")
@@ -1786,3 +1789,1014 @@ def _combine_market_signals(kospi_signals: Dict, kosdaq_signals: Dict) -> Dict:
     except Exception as e:
         logger.error(f"시장 신호 통합 오류: {e}")
         return {'overall_sentiment': 'error', 'recommendation': 'hold', 'confidence': 'low'}
+
+
+# =============================================================================
+# 🎯 상한가 기반 매수 판단 시스템 (기존 get_inquire_price 활용)
+# =============================================================================
+
+def get_tick_unit(price: int) -> int:
+    """
+    🎯 가격대별 호가단위 계산 (한국거래소 기준)
+    
+    Args:
+        price: 주식 가격
+        
+    Returns:
+        호가단위 (원)
+    """
+    if price < 1000:
+        return 1
+    elif price < 5000:
+        return 5
+    elif price < 10000:
+        return 10
+    elif price < 50000:
+        return 50
+    elif price < 100000:
+        return 100
+    elif price < 500000:
+        return 500
+    else:
+        return 1000
+
+
+def adjust_price_to_tick_unit(price: int, tick_unit: int = None, round_up: bool = True) -> int:
+    """
+    🎯 호가단위에 맞는 가격으로 조정
+    
+    Args:
+        price: 조정할 가격
+        tick_unit: 호가단위 (None이면 자동 계산)
+        round_up: True=올림, False=내림
+        
+    Returns:
+        호가단위에 맞게 조정된 가격
+    """
+    if tick_unit is None:
+        tick_unit = get_tick_unit(price)
+    
+    if round_up:
+        # 올림 처리
+        adjusted_price = ((price + tick_unit - 1) // tick_unit) * tick_unit
+    else:
+        # 내림 처리
+        adjusted_price = (price // tick_unit) * tick_unit
+    
+    return adjusted_price
+
+
+def get_stock_tick_info(stock_code: str) -> Optional[Dict]:
+    """
+    🎯 종목의 호가단위 정보 조회 (API 활용)
+    
+    Args:
+        stock_code: 종목코드
+        
+    Returns:
+        {
+            'stock_code': str,
+            'current_price': int,
+            'tick_unit': int,           # 실제 호가단위 (API)
+            'calculated_tick': int,     # 계산된 호가단위
+            'tick_match': bool          # 호가단위 일치 여부
+        }
+    """
+    try:
+        # 현재가 정보 조회 (호가단위 포함)
+        current_data = get_inquire_price("J", stock_code)
+        if current_data is None or current_data.empty:
+            logger.error(f"종목 {stock_code} 정보 조회 실패")
+            return None
+            
+        stock_info = current_data.iloc[0]
+        
+        current_price = int(stock_info.get('stck_prpr', 0))
+        api_tick_unit = int(stock_info.get('aspr_unit', 0))  # API 호가단위
+        calculated_tick = get_tick_unit(current_price)       # 계산된 호가단위
+        
+        if current_price <= 0:
+            logger.error(f"종목 {stock_code} 유효하지 않은 가격: {current_price}")
+            return None
+            
+        result = {
+            'stock_code': stock_code,
+            'current_price': current_price,
+            'tick_unit': api_tick_unit if api_tick_unit > 0 else calculated_tick,
+            'calculated_tick': calculated_tick,
+            'tick_match': api_tick_unit == calculated_tick,
+            'price_range': f"{current_price:,}원 (호가단위: {api_tick_unit if api_tick_unit > 0 else calculated_tick}원)"
+        }
+        
+        if not result['tick_match'] and api_tick_unit > 0:
+            logger.warning(f"⚠️ {stock_code} 호가단위 불일치: API={api_tick_unit}원, 계산={calculated_tick}원")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"호가단위 정보 조회 오류 ({stock_code}): {e}")
+        return None
+
+
+def calculate_safe_order_prices(stock_code: str, target_price: int = None, 
+                               is_buy: bool = True) -> Optional[Dict]:
+    """
+    🎯 안전한 주문가격 계산 (호가단위 준수)
+    
+    Args:
+        stock_code: 종목코드
+        target_price: 목표가격 (None이면 현재가 기준)
+        is_buy: True=매수, False=매도
+        
+    Returns:
+        {
+            'original_price': int,      # 원래 가격
+            'adjusted_price': int,      # 조정된 가격
+            'tick_unit': int,          # 호가단위
+            'price_difference': int,    # 가격 차이
+            'is_safe': bool,           # 안전한 가격 여부
+            'order_type_suggestion': str # 주문 방식 제안
+        }
+    """
+    try:
+        # 호가단위 정보 조회
+        tick_info = get_stock_tick_info(stock_code)
+        if not tick_info:
+            return None
+            
+        current_price = tick_info['current_price']
+        tick_unit = tick_info['tick_unit']
+        
+        # 목표가격 설정
+        if target_price is None:
+            target_price = current_price
+            
+        # 호가단위에 맞게 가격 조정
+        if is_buy:
+            # 매수: 올림 처리 (불리하게 조정하여 안전성 확보)
+            adjusted_price = adjust_price_to_tick_unit(target_price, tick_unit, round_up=True)
+        else:
+            # 매도: 내림 처리 (불리하게 조정하여 안전성 확보)
+            adjusted_price = adjust_price_to_tick_unit(target_price, tick_unit, round_up=False)
+            
+        price_difference = adjusted_price - target_price
+        
+        # 주문 방식 제안
+        if adjusted_price == current_price:
+            order_suggestion = "시장가 주문 권장"
+        elif is_buy and adjusted_price > current_price:
+            order_suggestion = "지정가 주문 (현재가보다 높음 - 즉시 체결 가능)"
+        elif not is_buy and adjusted_price < current_price:
+            order_suggestion = "지정가 주문 (현재가보다 낮음 - 즉시 체결 가능)"
+        else:
+            order_suggestion = "지정가 주문 (대기 주문)"
+            
+        result = {
+            'stock_code': stock_code,
+            'original_price': target_price,
+            'adjusted_price': adjusted_price,
+            'current_price': current_price,
+            'tick_unit': tick_unit,
+            'price_difference': price_difference,
+            'is_safe': True,  # 호가단위 조정되었으므로 안전
+            'order_type_suggestion': order_suggestion,
+            'adjustment_direction': "상향" if price_difference > 0 else "하향" if price_difference < 0 else "조정없음"
+        }
+        
+        logger.info(f"🎯 {stock_code} 안전가격 계산: {target_price:,}원 → {adjusted_price:,}원 "
+                   f"(호가단위:{tick_unit}원, {result['adjustment_direction']})")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"안전 주문가격 계산 오류 ({stock_code}): {e}")
+        return None
+
+
+def analyze_price_limit_risk(stock_code: str) -> Optional[Dict]:
+    """
+    🎯 상한가/하한가 위험도 분석 (기존 get_inquire_price 활용)
+    
+    Args:
+        stock_code: 종목코드 (6자리)
+        
+    Returns:
+        {
+            'stock_code': str,             # 종목코드
+            'current_price': int,          # 현재가
+            'upper_limit': int,            # 상한가  
+            'lower_limit': int,            # 하한가
+            'base_price': int,             # 기준가(전일종가)
+            'price_change_rate': float,    # 전일대비율
+            'upper_limit_approach': float, # 상한가 근접률 (0~100%)
+            'lower_limit_approach': float, # 하한가 근접률 (0~100%)
+            'risk_level': str,            # 위험도 (LOW/MEDIUM/HIGH/CRITICAL)
+            'buy_signal': str,            # 매수신호 (STRONG_BUY/BUY/HOLD/SELL/AVOID)
+            'recommendation_reason': str   # 추천 사유
+        }
+    """
+    try:
+        # 현재가 정보 조회 (상한가/하한가 포함)
+        current_data = get_inquire_price("J", stock_code)
+        if current_data is None or current_data.empty:
+            logger.error(f"종목 {stock_code} 현재가 조회 실패")
+            return None
+            
+        stock_info = current_data.iloc[0]
+        
+        # 주요 가격 정보 추출
+        current_price = int(stock_info.get('stck_prpr', 0))      # 현재가
+        upper_limit = int(stock_info.get('stck_mxpr', 0))        # 상한가
+        lower_limit = int(stock_info.get('stck_llam', 0))        # 하한가  
+        base_price = int(stock_info.get('stck_sdpr', 0))         # 기준가(전일종가)
+        change_rate = float(stock_info.get('prdy_ctrt', 0))      # 전일대비율
+        
+        if current_price <= 0 or upper_limit <= 0 or lower_limit <= 0 or base_price <= 0:
+            logger.error(f"종목 {stock_code} 가격 정보 불완전")
+            return None
+            
+        # 🎯 상한가/하한가 근접률 계산
+        price_range = upper_limit - lower_limit  # 전체 가격 범위
+        
+        # 상한가 근접률: 기준가 대비 현재가가 상한가에 얼마나 가까운지 (0~100%)
+        if current_price >= upper_limit:
+            upper_limit_approach = 100.0  # 상한가 도달
+        else:
+            # (현재가 - 기준가) / (상한가 - 기준가) * 100
+            upper_range = upper_limit - base_price
+            if upper_range > 0:
+                upper_limit_approach = ((current_price - base_price) / upper_range) * 100
+                upper_limit_approach = max(0, min(100, upper_limit_approach))
+            else:
+                upper_limit_approach = 0.0
+                
+        # 하한가 근접률: 기준가 대비 현재가가 하한가에 얼마나 가까운지 (0~100%)
+        if current_price <= lower_limit:
+            lower_limit_approach = 100.0  # 하한가 도달
+        else:
+            # (기준가 - 현재가) / (기준가 - 하한가) * 100
+            lower_range = base_price - lower_limit
+            if lower_range > 0 and current_price < base_price:
+                lower_limit_approach = ((base_price - current_price) / lower_range) * 100
+                lower_limit_approach = max(0, min(100, lower_limit_approach))
+            else:
+                lower_limit_approach = 0.0
+                
+        # 🎯 위험도 및 매수 신호 판정
+        risk_level, buy_signal, reason = _determine_buy_signal(
+            upper_limit_approach, lower_limit_approach, change_rate, current_price
+        )
+        
+        result = {
+            'stock_code': stock_code,
+            'current_price': current_price,
+            'upper_limit': upper_limit,
+            'lower_limit': lower_limit,
+            'base_price': base_price,
+            'price_change_rate': round(change_rate, 2),
+            'upper_limit_approach': round(upper_limit_approach, 1),
+            'lower_limit_approach': round(lower_limit_approach, 1),
+            'risk_level': risk_level,
+            'buy_signal': buy_signal,
+            'recommendation_reason': reason,
+            'price_range': price_range,
+            'analysis_time': datetime.now().strftime('%H:%M:%S')
+        }
+        
+        logger.info(f"🎯 {stock_code} 가격분석: {current_price:,}원 ({change_rate:+.1f}%) "
+                   f"상한가근접{upper_limit_approach:.1f}% → {buy_signal}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"상한가 위험도 분석 오류 ({stock_code}): {e}")
+        return None
+
+
+def _determine_buy_signal(upper_approach: float, lower_approach: float, 
+                         change_rate: float, current_price: int) -> Tuple[str, str, str]:
+    """
+    위험도 및 매수 신호 판정
+    
+    Returns:
+        (risk_level, buy_signal, reason)
+    """
+    
+    # 🎯 상한가 근접 위험도 체크 (최우선)
+    if upper_approach >= 95:
+        return "CRITICAL", "AVOID", f"상한가 임박 ({upper_approach:.1f}%) - 매수 위험"
+    elif upper_approach >= 85:
+        return "HIGH", "AVOID", f"상한가 근접 ({upper_approach:.1f}%) - 고위험 구간"
+    elif upper_approach >= 70:
+        return "HIGH", "HOLD", f"급등 구간 ({upper_approach:.1f}%) - 신중 관망"
+    elif upper_approach >= 60:
+        return "MEDIUM", "HOLD", f"상승 과열 ({upper_approach:.1f}%) - 조정 대기"
+        
+    # 🎯 하한가 근접 체크
+    if lower_approach >= 95:
+        return "CRITICAL", "AVOID", f"하한가 임박 ({lower_approach:.1f}%) - 추가 하락 위험"
+    elif lower_approach >= 80:
+        return "HIGH", "HOLD", f"급락 구간 ({lower_approach:.1f}%) - 바닥 확인 필요"
+    elif lower_approach >= 60:
+        return "MEDIUM", "BUY", f"과매도 구간 ({lower_approach:.1f}%) - 반등 기회"
+        
+    # 🎯 적정 매수 구간 판정
+    if 20 <= upper_approach <= 50:
+        if change_rate > 0:
+            return "LOW", "BUY", f"상승 추세 ({upper_approach:.1f}%) - 매수 적기"
+        else:
+            return "LOW", "BUY", f"조정 매수 ({upper_approach:.1f}%) - 좋은 진입점"
+    elif 0 <= upper_approach < 20:
+        if change_rate >= 0:
+            return "LOW", "STRONG_BUY", f"저점 돌파 ({upper_approach:.1f}%) - 강력 매수"
+        else:
+            return "LOW", "BUY", f"저점 근처 ({upper_approach:.1f}%) - 매수 기회"
+    elif 50 < upper_approach < 70:
+        return "MEDIUM", "HOLD", f"상승 중반 ({upper_approach:.1f}%) - 신중 접근"
+    else:
+        return "LOW", "BUY", f"정상 범위 ({upper_approach:.1f}%) - 매수 가능"
+
+
+def smart_buy_decision(stock_code: str, target_amount: int = 1000000) -> Optional[Dict]:
+    """
+    🎯 스마트 매수 의사결정 (상한가 고려 + 포지션 관리 + 호가단위 준수)
+    
+    Args:
+        stock_code: 종목코드
+        target_amount: 목표 투자금액 (기본 100만원)
+        
+    Returns:
+        {
+            'buy_decision': bool,           # 매수 결정 (True/False)
+            'buy_amount': int,              # 매수 금액
+            'buy_quantity': int,            # 매수 수량
+            'entry_strategy': str,          # 진입 전략
+            'stop_loss_price': int,         # 손절가 (호가단위 적용)
+            'target_price': int,            # 목표가 (호가단위 적용)
+            'position_size': str,           # 포지션 크기
+            'risk_management': List[str],   # 위험관리 사항
+            'analysis_summary': Dict,       # 분석 요약
+            'tick_info': Dict               # 호가단위 정보
+        }
+    """
+    try:
+        logger.info(f"🎯 스마트 매수 의사결정 시작: {stock_code} (목표: {target_amount:,}원)")
+        
+        # 1단계: 상한가 위험도 분석
+        risk_analysis = analyze_price_limit_risk(stock_code)
+        if not risk_analysis:
+            return {'buy_decision': False, 'reason': '가격 분석 실패'}
+            
+        current_price = risk_analysis['current_price']
+        buy_signal = risk_analysis['buy_signal']
+        risk_level = risk_analysis['risk_level']
+        upper_approach = risk_analysis['upper_limit_approach']
+        
+        # 2단계: 기본 매수 결정
+        buy_decision = buy_signal in ['STRONG_BUY', 'BUY']
+        
+        if not buy_decision:
+            return {
+                'buy_decision': False,
+                'reason': risk_analysis['recommendation_reason'],
+                'analysis_summary': risk_analysis
+            }
+            
+        # 3단계: 호가단위 정보 조회
+        tick_info = get_stock_tick_info(stock_code)
+        if not tick_info:
+            logger.warning(f"⚠️ {stock_code} 호가단위 정보 조회 실패 - 기본값 사용")
+            tick_unit = get_tick_unit(current_price)
+            tick_info = {
+                'stock_code': stock_code,
+                'current_price': current_price,
+                'tick_unit': tick_unit,
+                'calculated_tick': tick_unit,
+                'tick_match': True
+            }
+        
+        # 4단계: 포지션 크기 결정 (위험도 기반)
+        if buy_signal == 'STRONG_BUY' and risk_level == 'LOW':
+            position_ratio = 0.8  # 80% 포지션
+            entry_strategy = "적극적 매수 - 2회 분할"
+        elif buy_signal == 'BUY' and risk_level == 'LOW':
+            position_ratio = 0.6  # 60% 포지션  
+            entry_strategy = "일반 매수 - 3회 분할"
+        elif buy_signal == 'BUY' and risk_level == 'MEDIUM':
+            position_ratio = 0.3  # 30% 포지션
+            entry_strategy = "신중 매수 - 5회 분할"
+        else:
+            position_ratio = 0.2  # 20% 포지션
+            entry_strategy = "시험 매수 - 소량"
+            
+        # 5단계: 실제 매수 금액 및 수량 계산
+        buy_amount = int(target_amount * position_ratio)
+        buy_quantity = buy_amount // current_price
+        actual_buy_amount = buy_quantity * current_price
+        
+        # 6단계: 손절가/목표가 설정 (호가단위 고려)
+        if risk_level == 'LOW':
+            stop_loss_rate = 0.05  # 5% 손절
+            target_profit_rate = 0.15  # 15% 익절
+        elif risk_level == 'MEDIUM':
+            stop_loss_rate = 0.03  # 3% 손절 (타이트)
+            target_profit_rate = 0.10  # 10% 익절
+        else:
+            stop_loss_rate = 0.02  # 2% 손절 (매우 타이트)
+            target_profit_rate = 0.07  # 7% 익절
+            
+        # 🎯 호가단위에 맞는 안전한 가격 계산
+        raw_stop_loss = int(current_price * (1 - stop_loss_rate))
+        raw_target_price = int(current_price * (1 + target_profit_rate))
+        
+        # 손절가 조정 (매도이므로 내림)
+        stop_loss_safe = calculate_safe_order_prices(stock_code, raw_stop_loss, is_buy=False)
+        if stop_loss_safe:
+            stop_loss_price = stop_loss_safe['adjusted_price']
+        else:
+            stop_loss_price = adjust_price_to_tick_unit(raw_stop_loss, tick_info['tick_unit'], round_up=False)
+            
+        # 목표가 조정 (매도이므로 내림)
+        target_price_safe = calculate_safe_order_prices(stock_code, raw_target_price, is_buy=False)
+        if target_price_safe:
+            target_price = target_price_safe['adjusted_price']
+        else:
+            target_price = adjust_price_to_tick_unit(raw_target_price, tick_info['tick_unit'], round_up=False)
+        
+        # 7단계: 위험관리 사항
+        risk_management = []
+        
+        if upper_approach > 50:
+            risk_management.append("상한가 50% 이상 - 포지션 축소")
+        if risk_level in ['MEDIUM', 'HIGH']:
+            risk_management.append("분할 매수 필수")
+        if current_price < 1000:
+            risk_management.append("저가주 - 변동성 주의")
+        if current_price > 100000:
+            risk_management.append("고가주 - 유동성 확인")
+        if not tick_info.get('tick_match', True):
+            risk_management.append("호가단위 불일치 감지 - 주문시 재확인 필요")
+            
+        # 🎯 매수가격도 호가단위에 맞게 조정 (매수이므로 올림)
+        buy_price_safe = calculate_safe_order_prices(stock_code, current_price, is_buy=True)
+        if buy_price_safe:
+            safe_buy_price = buy_price_safe['adjusted_price']
+            # 수량 재계산 (안전한 가격 기준)
+            buy_quantity = buy_amount // safe_buy_price
+            actual_buy_amount = buy_quantity * safe_buy_price
+        else:
+            safe_buy_price = current_price
+            
+        # 최종 결과
+        result = {
+            'buy_decision': True,
+            'buy_amount': actual_buy_amount,
+            'buy_quantity': buy_quantity,
+            'current_price': current_price,
+            'safe_buy_price': safe_buy_price,  # 🆕 호가단위 적용된 안전한 매수가
+            'entry_strategy': entry_strategy,
+            'stop_loss_price': stop_loss_price,
+            'target_price': target_price,
+            'position_size': f"{position_ratio*100:.0f}%",
+            'expected_return': f"{target_profit_rate*100:.0f}%",
+            'max_loss': f"{stop_loss_rate*100:.0f}%",
+            'risk_management': risk_management,
+            'analysis_summary': risk_analysis,
+            'tick_info': tick_info,  # 🆕 호가단위 정보
+            'price_adjustments': {   # 🆕 가격 조정 내역
+                'raw_stop_loss': raw_stop_loss,
+                'adjusted_stop_loss': stop_loss_price,
+                'raw_target': raw_target_price,
+                'adjusted_target': target_price,
+                'stop_loss_diff': stop_loss_price - raw_stop_loss,
+                'target_diff': target_price - raw_target_price
+            },
+            'decision_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        logger.info(f"🎯 매수 결정: {stock_code} {buy_quantity:,}주 ({actual_buy_amount:,}원) "
+                   f"진입{safe_buy_price:,} 목표{target_price:,} 손절{stop_loss_price:,} "
+                   f"호가단위:{tick_info['tick_unit']}원")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"스마트 매수 의사결정 오류 ({stock_code}): {e}")
+        return {'buy_decision': False, 'reason': f'분석 오류: {e}'}
+
+
+def batch_buy_analysis(stock_codes: List[str], budget: int = 5000000) -> Optional[pd.DataFrame]:
+    """
+    🎯 다중 종목 매수 분석 및 포트폴리오 구성
+    
+    Args:
+        stock_codes: 분석할 종목 리스트
+        budget: 총 투자 예산 (기본 500만원)
+        
+    Returns:
+        매수 추천 종목 DataFrame (우선순위별 정렬)
+    """
+    try:
+        logger.info(f"🎯 다중 종목 매수 분석 시작: {len(stock_codes)}개 종목, 예산 {budget:,}원")
+        
+        results = []
+        individual_budget = budget // max(len(stock_codes), 5)  # 종목당 최대 예산
+        
+        for i, stock_code in enumerate(stock_codes, 1):
+            try:
+                logger.info(f"📊 {i}/{len(stock_codes)} 분석: {stock_code}")
+                
+                # 스마트 매수 분석
+                buy_analysis = smart_buy_decision(stock_code, individual_budget)
+                
+                if buy_analysis and buy_analysis.get('buy_decision'):
+                    summary = buy_analysis['analysis_summary']
+                    
+                    result_row = {
+                        'stock_code': stock_code,
+                        'buy_signal': summary['buy_signal'],
+                        'risk_level': summary['risk_level'],
+                        'current_price': summary['current_price'],
+                        'upper_limit_approach': summary['upper_limit_approach'],
+                        'price_change_rate': summary['price_change_rate'],
+                        'buy_amount': buy_analysis['buy_amount'],
+                        'buy_quantity': buy_analysis['buy_quantity'],
+                        'position_size': buy_analysis['position_size'],
+                        'entry_strategy': buy_analysis['entry_strategy'],
+                        'expected_return': buy_analysis['expected_return'],
+                        'stop_loss_price': buy_analysis['stop_loss_price'],
+                        'target_price': buy_analysis['target_price'],
+                        'recommendation_reason': summary['recommendation_reason']
+                    }
+                    results.append(result_row)
+                    
+                time.sleep(0.2)  # API 제한 방지
+                
+            except Exception as e:
+                logger.error(f"종목 {stock_code} 분석 오류: {e}")
+                continue
+                
+        if results:
+            df = pd.DataFrame(results)
+            
+            # 우선순위 정렬 (STRONG_BUY > BUY, LOW risk > MEDIUM risk)
+            signal_priority = {'STRONG_BUY': 2, 'BUY': 1}
+            risk_priority = {'LOW': 3, 'MEDIUM': 2, 'HIGH': 1}
+            
+            df['signal_score'] = df['buy_signal'].map(signal_priority)
+            df['risk_score'] = df['risk_level'].map(risk_priority)
+            df['total_score'] = df['signal_score'] + df['risk_score']
+            
+            # 우선순위 정렬
+            df = df.sort_values(['total_score', 'upper_limit_approach'], 
+                               ascending=[False, True])
+            
+            # 임시 점수 컬럼 제거
+            df = df.drop(['signal_score', 'risk_score', 'total_score'], axis=1)
+            
+            # 예산 배분 확인
+            total_investment = df['buy_amount'].sum()
+            df['budget_ratio'] = (df['buy_amount'] / budget * 100).round(1)
+            
+            logger.info(f"🎯 매수 추천 완료: {len(df)}개 종목, 총 투자액 {total_investment:,}원 "
+                       f"({total_investment/budget*100:.1f}%)")
+            
+            return df
+        else:
+            logger.warning("매수 추천 종목 없음")
+            return pd.DataFrame()
+            
+    except Exception as e:
+        logger.error(f"다중 종목 매수 분석 오류: {e}")
+        return None
+
+
+def print_buy_decision_summary(analysis_result: Dict):
+    """매수 의사결정 결과 요약 출력"""
+    if not analysis_result or not analysis_result.get('buy_decision'):
+        print(f"❌ 매수 비추천: {analysis_result.get('reason', '알 수 없음')}")
+        return
+        
+    print("=" * 60)
+    print(f"🎯 매수 의사결정 결과")
+    print("=" * 60)
+    print(f"종목코드: {analysis_result['analysis_summary']['stock_code']}")
+    print(f"현재가: {analysis_result['current_price']:,}원")
+    print(f"매수신호: {analysis_result['analysis_summary']['buy_signal']}")
+    print(f"위험도: {analysis_result['analysis_summary']['risk_level']}")
+    print(f"상한가 근접률: {analysis_result['analysis_summary']['upper_limit_approach']:.1f}%")
+    print()
+    print(f"💰 매수 계획:")
+    print(f"  - 매수 금액: {analysis_result['buy_amount']:,}원")
+    print(f"  - 매수 수량: {analysis_result['buy_quantity']:,}주")
+    print(f"  - 포지션 크기: {analysis_result['position_size']}")
+    print(f"  - 진입 전략: {analysis_result['entry_strategy']}")
+    print()
+    print(f"🎯 목표 설정:")
+    print(f"  - 목표가: {analysis_result['target_price']:,}원 (+{analysis_result['expected_return']})")
+    print(f"  - 손절가: {analysis_result['stop_loss_price']:,}원 ({analysis_result['max_loss']})")
+    print()
+    if analysis_result['risk_management']:
+        print(f"⚠️ 위험관리:")
+        for risk in analysis_result['risk_management']:
+            print(f"  - {risk}")
+    print()
+    print(f"📋 추천 사유: {analysis_result['analysis_summary']['recommendation_reason']}")
+    print("=" * 60)
+
+
+# =============================================================================
+# 🎯 데모 및 테스트 함수들
+# =============================================================================
+
+def demo_price_limit_analysis():
+    """🎯 상한가 기반 매수 판단 시스템 데모"""
+    try:
+        print("=" * 70)
+        print("🎯 상한가 기반 매수 판단 시스템 데모")
+        print("=" * 70)
+        
+        # 샘플 종목들 (대형주)
+        sample_stocks = [
+            ("005930", "삼성전자"),
+            ("000660", "SK하이닉스"),
+            ("035420", "NAVER"),
+            ("005490", "POSCO홀딩스")
+        ]
+        
+        print("\n📊 1. 개별 종목 상한가 위험도 분석")
+        print("-" * 50)
+        
+        for stock_code, stock_name in sample_stocks[:2]:  # 처음 2개만 상세 분석
+            try:
+                print(f"\n🔍 {stock_code} ({stock_name}) 분석:")
+                
+                # 상한가 위험도 분석
+                risk_analysis = analyze_price_limit_risk(stock_code)
+                if risk_analysis:
+                    print(f"   현재가: {risk_analysis['current_price']:,}원")
+                    print(f"   상한가: {risk_analysis['upper_limit']:,}원")
+                    print(f"   하한가: {risk_analysis['lower_limit']:,}원")
+                    print(f"   등락률: {risk_analysis['price_change_rate']:+.1f}%")
+                    print(f"   상한가 근접률: {risk_analysis['upper_limit_approach']:.1f}%")
+                    print(f"   하한가 근접률: {risk_analysis['lower_limit_approach']:.1f}%")
+                    print(f"   위험도: {risk_analysis['risk_level']}")
+                    print(f"   매수신호: {risk_analysis['buy_signal']}")
+                    print(f"   추천사유: {risk_analysis['recommendation_reason']}")
+                else:
+                    print("   ❌ 분석 실패")
+                
+                time.sleep(1)  # API 제한 방지
+                
+            except Exception as e:
+                print(f"   ❌ 분석 오류: {e}")
+        
+        print(f"\n📊 2. 스마트 매수 의사결정 (목표: 1,000,000원)")
+        print("-" * 50)
+        
+        for stock_code, stock_name in sample_stocks[2:3]:  # 1개 종목 매수 분석
+            try:
+                print(f"\n💰 {stock_code} ({stock_name}) 매수 의사결정:")
+                
+                # 스마트 매수 분석
+                buy_decision = smart_buy_decision(stock_code, 1000000)
+                if buy_decision:
+                    if buy_decision.get('buy_decision'):
+                        print(f"   ✅ 매수 추천!")
+                        print(f"   매수 금액: {buy_decision['buy_amount']:,}원")
+                        print(f"   매수 수량: {buy_decision['buy_quantity']:,}주")
+                        print(f"   포지션 크기: {buy_decision['position_size']}")
+                        print(f"   진입 전략: {buy_decision['entry_strategy']}")
+                        print(f"   목표가: {buy_decision['target_price']:,}원 (+{buy_decision['expected_return']})")
+                        print(f"   손절가: {buy_decision['stop_loss_price']:,}원 ({buy_decision['max_loss']})")
+                        
+                        if buy_decision['risk_management']:
+                            print(f"   ⚠️ 위험관리: {', '.join(buy_decision['risk_management'])}")
+                    else:
+                        print(f"   ❌ 매수 비추천: {buy_decision.get('reason', '알 수 없음')}")
+                else:
+                    print("   ❌ 분석 실패")
+                
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"   ❌ 분석 오류: {e}")
+        
+        print(f"\n📊 3. 다중 종목 포트폴리오 분석 (예산: 5,000,000원)")
+        print("-" * 50)
+        
+        stock_codes = [code for code, _ in sample_stocks]
+        portfolio_analysis = batch_buy_analysis(stock_codes, 5000000)
+        
+        if portfolio_analysis is not None and not portfolio_analysis.empty:
+            print(f"\n🎯 매수 추천 종목 ({len(portfolio_analysis)}개):")
+            for idx, (_, row) in enumerate(portfolio_analysis.iterrows(), 1):
+                print(f"{idx}. {row['stock_code']} - {row['buy_signal']} (위험도: {row['risk_level']})")
+                print(f"   현재가: {row['current_price']:,}원 ({row['price_change_rate']:+.1f}%)")
+                print(f"   상한가 근접: {row['upper_limit_approach']:.1f}%")
+                print(f"   매수금액: {row['buy_amount']:,}원 ({row['buy_quantity']:,}주)")
+                print(f"   목표수익: {row['expected_return']}, 예산비중: {row['budget_ratio']:.1f}%")
+                print(f"   전략: {row['entry_strategy']}")
+                print()
+        else:
+            print("   ❌ 매수 추천 종목 없음")
+        
+        print("🎯 데모 완료!")
+        print("=" * 70)
+        
+    except Exception as e:
+        logger.error(f"데모 실행 오류: {e}")
+        print(f"❌ 데모 실행 중 오류 발생: {e}")
+
+
+def test_specific_stock_analysis(stock_code: str, investment_amount: int = 1000000):
+    """
+    🎯 특정 종목 상세 분석 테스트
+    
+    Args:
+        stock_code: 종목코드
+        investment_amount: 투자 금액
+    """
+    try:
+        print("=" * 70)
+        print(f"🎯 {stock_code} 종목 상세 분석")
+        print("=" * 70)
+        
+        # 1. 상한가 위험도 분석
+        print("\n📊 1. 상한가/하한가 위험도 분석")
+        print("-" * 40)
+        
+        risk_analysis = analyze_price_limit_risk(stock_code)
+        if risk_analysis:
+            print(f"종목코드: {risk_analysis['stock_code']}")
+            print(f"현재가: {risk_analysis['current_price']:,}원")
+            print(f"기준가(전일종가): {risk_analysis['base_price']:,}원")
+            print(f"상한가: {risk_analysis['upper_limit']:,}원")
+            print(f"하한가: {risk_analysis['lower_limit']:,}원")
+            print(f"전일대비: {risk_analysis['price_change_rate']:+.2f}%")
+            print(f"가격범위: {risk_analysis['price_range']:,}원")
+            print()
+            print(f"상한가 근접률: {risk_analysis['upper_limit_approach']:.1f}%")
+            print(f"하한가 근접률: {risk_analysis['lower_limit_approach']:.1f}%")
+            print(f"위험도: {risk_analysis['risk_level']}")
+            print(f"매수신호: {risk_analysis['buy_signal']}")
+            print(f"추천사유: {risk_analysis['recommendation_reason']}")
+        else:
+            print("❌ 위험도 분석 실패")
+            return
+        
+        # 2. 스마트 매수 의사결정
+        print(f"\n💰 2. 스마트 매수 의사결정 (목표: {investment_amount:,}원)")
+        print("-" * 40)
+        
+        buy_decision = smart_buy_decision(stock_code, investment_amount)
+        if buy_decision:
+            print_buy_decision_summary(buy_decision)
+        else:
+            print("❌ 매수 의사결정 실패")
+        
+        print("\n🎯 분석 완료!")
+        print("=" * 70)
+        
+    except Exception as e:
+        logger.error(f"종목 분석 테스트 오류: {e}")
+        print(f"❌ 분석 중 오류 발생: {e}")
+
+
+# 테스트 실행을 위한 예시 함수
+if __name__ == "__main__":
+    # 예시 1: 전체 데모 실행
+    # demo_price_limit_analysis()
+    
+    # 예시 2: 특정 종목 분석
+    # test_specific_stock_analysis("005930", 2000000)  # 삼성전자 200만원 투자
+    
+    pass
+
+
+# =============================================================================
+# 🎯 호가단위 오류 해결 전용 함수들
+# =============================================================================
+
+def test_tick_unit_functions(stock_code: str = "000990"):
+    """
+    🎯 호가단위 관련 함수들 테스트
+    
+    Args:
+        stock_code: 테스트할 종목코드 (기본값: 000990)
+    """
+    try:
+        print("=" * 70)
+        print(f"🎯 호가단위 오류 해결 테스트: {stock_code}")
+        print("=" * 70)
+        
+        # 1. 호가단위 정보 조회
+        print("\n📊 1. 호가단위 정보 조회")
+        print("-" * 40)
+        
+        tick_info = get_stock_tick_info(stock_code)
+        if tick_info:
+            print(f"종목코드: {tick_info['stock_code']}")
+            print(f"현재가: {tick_info['current_price']:,}원")
+            print(f"API 호가단위: {tick_info['tick_unit']}원")
+            print(f"계산된 호가단위: {tick_info['calculated_tick']}원")
+            print(f"호가단위 일치: {'✅' if tick_info['tick_match'] else '❌'}")
+            print(f"가격 범위: {tick_info['price_range']}")
+        else:
+            print("❌ 호가단위 정보 조회 실패")
+            return
+        
+        # 2. 다양한 가격대 호가단위 테스트
+        print(f"\n📊 2. 가격대별 호가단위 테스트")
+        print("-" * 40)
+        
+        test_prices = [500, 1500, 7500, 25000, 75000, 250000, 750000]
+        for price in test_prices:
+            tick = get_tick_unit(price)
+            print(f"{price:,}원 → 호가단위: {tick}원")
+        
+        # 3. 안전한 주문가격 계산 테스트
+        print(f"\n💰 3. 안전한 주문가격 계산 테스트")
+        print("-" * 40)
+        
+        current_price = tick_info['current_price']
+        
+        # 매수 가격 테스트
+        test_buy_prices = [
+            current_price,
+            current_price + 10,  # 약간 높은 가격
+            int(current_price * 1.05),  # 5% 높은 가격
+        ]
+        
+        for test_price in test_buy_prices:
+            buy_safe = calculate_safe_order_prices(stock_code, test_price, is_buy=True)
+            if buy_safe:
+                print(f"매수 {test_price:,}원 → {buy_safe['adjusted_price']:,}원 "
+                      f"({buy_safe['adjustment_direction']}, 차이:{buy_safe['price_difference']:+,}원)")
+        
+        # 매도 가격 테스트
+        test_sell_prices = [
+            current_price,
+            current_price - 10,  # 약간 낮은 가격
+            int(current_price * 0.95),  # 5% 낮은 가격
+        ]
+        
+        for test_price in test_sell_prices:
+            sell_safe = calculate_safe_order_prices(stock_code, test_price, is_buy=False)
+            if sell_safe:
+                print(f"매도 {test_price:,}원 → {sell_safe['adjusted_price']:,}원 "
+                      f"({sell_safe['adjustment_direction']}, 차이:{sell_safe['price_difference']:+,}원)")
+        
+        # 4. 호가단위 적용된 스마트 매수 테스트
+        print(f"\n🎯 4. 호가단위 적용된 스마트 매수 테스트")
+        print("-" * 40)
+        
+        buy_decision = smart_buy_decision(stock_code, 1000000)
+        if buy_decision and buy_decision.get('buy_decision'):
+            print(f"✅ 매수 추천!")
+            print(f"현재가: {buy_decision['current_price']:,}원")
+            print(f"안전 매수가: {buy_decision['safe_buy_price']:,}원")
+            print(f"목표가: {buy_decision['target_price']:,}원")
+            print(f"손절가: {buy_decision['stop_loss_price']:,}원")
+            print(f"호가단위: {buy_decision['tick_info']['tick_unit']}원")
+            
+            # 가격 조정 내역
+            adjustments = buy_decision['price_adjustments']
+            print(f"\n📋 가격 조정 내역:")
+            print(f"  손절가: {adjustments['raw_stop_loss']:,}원 → {adjustments['adjusted_stop_loss']:,}원 "
+                  f"({adjustments['stop_loss_diff']:+,}원)")
+            print(f"  목표가: {adjustments['raw_target']:,}원 → {adjustments['adjusted_target']:,}원 "
+                  f"({adjustments['target_diff']:+,}원)")
+        else:
+            print(f"❌ 매수 비추천: {buy_decision.get('reason', '알 수 없음')}")
+        
+        print(f"\n🎯 테스트 완료!")
+        print("=" * 70)
+        
+    except Exception as e:
+        logger.error(f"호가단위 테스트 오류: {e}")
+        print(f"❌ 테스트 중 오류 발생: {e}")
+
+
+def fix_order_price_for_existing_position(stock_code: str, order_price: int, is_buy: bool = False) -> Dict:
+    """
+    🎯 기존 포지션의 주문가격 호가단위 오류 수정
+    
+    Args:
+        stock_code: 종목코드
+        order_price: 원래 주문가격
+        is_buy: True=매수, False=매도
+        
+    Returns:
+        수정된 주문가격 정보
+    """
+    try:
+        logger.info(f"🔧 호가단위 오류 수정: {stock_code} {order_price:,}원 ({'매수' if is_buy else '매도'})")
+        
+        # 안전한 주문가격 계산
+        safe_price_info = calculate_safe_order_prices(stock_code, order_price, is_buy)
+        
+        if safe_price_info:
+            result = {
+                'success': True,
+                'original_price': order_price,
+                'fixed_price': safe_price_info['adjusted_price'],
+                'price_difference': safe_price_info['price_difference'],
+                'tick_unit': safe_price_info['tick_unit'],
+                'adjustment_direction': safe_price_info['adjustment_direction'],
+                'suggestion': safe_price_info['order_type_suggestion']
+            }
+            
+            logger.info(f"✅ 가격 수정 완료: {order_price:,}원 → {result['fixed_price']:,}원 "
+                       f"({result['adjustment_direction']}, 차이:{result['price_difference']:+,}원)")
+            
+        else:
+            # 백업: 기본 호가단위 계산
+            tick_unit = get_tick_unit(order_price)
+            fixed_price = adjust_price_to_tick_unit(order_price, tick_unit, round_up=is_buy)
+            
+            result = {
+                'success': True,
+                'original_price': order_price,
+                'fixed_price': fixed_price,
+                'price_difference': fixed_price - order_price,
+                'tick_unit': tick_unit,
+                'adjustment_direction': "상향" if fixed_price > order_price else "하향" if fixed_price < order_price else "조정없음",
+                'suggestion': "기본 호가단위 적용"
+            }
+            
+            logger.warning(f"⚠️ 백업 방식으로 가격 수정: {order_price:,}원 → {fixed_price:,}원")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"주문가격 수정 오류 ({stock_code}): {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'original_price': order_price
+        }
+
+
+def get_safe_prices_for_trading_system(stock_code: str) -> Optional[Dict]:
+    """
+    🎯 트레이딩 시스템용 안전한 가격 세트 제공
+    
+    Args:
+        stock_code: 종목코드
+        
+    Returns:
+        트레이딩 시스템에서 사용할 안전한 가격들
+    """
+    try:
+        # 현재가 및 호가단위 정보
+        tick_info = get_stock_tick_info(stock_code)
+        if not tick_info:
+            logger.error(f"종목 {stock_code} 정보 조회 실패")
+            return None
+            
+        current_price = tick_info['current_price']
+        tick_unit = tick_info['tick_unit']
+        
+        # 다양한 상황의 안전한 가격 계산
+        prices = {
+            'current_price': current_price,
+            'tick_unit': tick_unit,
+            
+            # 매수 관련 가격 (올림)
+            'safe_buy_current': adjust_price_to_tick_unit(current_price, tick_unit, round_up=True),
+            'safe_buy_plus_1tick': current_price + tick_unit,
+            'safe_buy_plus_2tick': current_price + (tick_unit * 2),
+            
+            # 매도 관련 가격 (내림)
+            'safe_sell_current': adjust_price_to_tick_unit(current_price, tick_unit, round_up=False),
+            'safe_sell_minus_1tick': current_price - tick_unit,
+            'safe_sell_minus_2tick': current_price - (tick_unit * 2),
+            
+            # 일반적인 손절/익절 가격 (호가단위 적용)
+            'stop_loss_3pct': adjust_price_to_tick_unit(int(current_price * 0.97), tick_unit, round_up=False),
+            'stop_loss_5pct': adjust_price_to_tick_unit(int(current_price * 0.95), tick_unit, round_up=False),
+            'take_profit_5pct': adjust_price_to_tick_unit(int(current_price * 1.05), tick_unit, round_up=False),
+            'take_profit_10pct': adjust_price_to_tick_unit(int(current_price * 1.10), tick_unit, round_up=False),
+        }
+        
+        # 검증: 모든 가격이 호가단위에 맞는지 확인
+        for price_name, price_value in prices.items():
+            if price_name not in ['current_price', 'tick_unit']:
+                if price_value % tick_unit != 0:
+                    logger.warning(f"⚠️ {stock_code} {price_name}: {price_value:,}원이 호가단위에 맞지 않음")
+        
+        result = {
+            'stock_code': stock_code,
+            'prices': prices,
+            'tick_info': tick_info,
+            'generated_time': datetime.now().strftime('%H:%M:%S')
+        }
+        
+        logger.info(f"🎯 {stock_code} 안전가격 세트 생성 완료 (호가단위: {tick_unit}원)")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"안전 가격 세트 생성 오류 ({stock_code}): {e}")
+        return None

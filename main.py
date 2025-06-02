@@ -88,7 +88,7 @@ class StockBot:
         )
 
         # 6. 포지션 매니저
-        self.position_manager = PositionManager(self.trading_manager)
+        self.position_manager = PositionManager(self.trading_manager, self.data_collector)
 
         # 7. 거래 데이터베이스
         self.trade_db = TradeDatabase()
@@ -354,9 +354,13 @@ class StockBot:
 
     def _create_existing_holding_callback(self, stock_code: str):
         """🆕 기존 보유 종목용 콜백 함수 생성"""
-        def existing_holding_callback(stock_code: str, data: Dict, source: str = 'websocket') -> None:
-            """기존 보유 종목 데이터 콜백"""
+        def existing_holding_callback(data_type: str, stock_code: str, data: Dict, source: str = 'websocket') -> None:
+            """기존 보유 종목 데이터 콜백 - 🆕 data_type 파라미터 추가"""
             try:
+                # 🆕 데이터 타입 검증 (체결가 데이터만 처리)
+                if data_type not in ['stock_price', 'stock_execution']:
+                    return
+
                 # 기본 데이터 검증
                 if not data or data.get('status') != 'success':
                     return
@@ -455,14 +459,7 @@ class StockBot:
 
             # 🆕 텔레그램 시작 알림 전송
             if self.telegram_bot:
-                try:
-                    self.telegram_bot.send_startup_notification()
-                except AttributeError:
-                    logger.warning("⚠️ 텔레그램 봇 메서드 호출 실패 (메서드 없음)")
-                except Exception as e:
-                    logger.error(f"❌ 텔레그램 시작 알림 전송 실패: {e}")
-            else:
-                logger.debug("📱 텔레그램 봇이 비활성화되어 시작 알림을 보내지 않습니다")
+                self.telegram_bot.send_startup_notification()
 
             self._main_loop()
 

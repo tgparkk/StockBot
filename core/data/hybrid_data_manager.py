@@ -22,8 +22,8 @@ class SimpleHybridDataManager:
     def __init__(self, websocket_manager: KISWebSocketManager, rest_api_manager: KISRestAPIManager, data_collector: KISDataCollector):
         # 웹소켓 제한 상수
         self.WEBSOCKET_LIMIT = 41  # KIS 웹소켓 연결 제한
-        self.STREAMS_PER_STOCK = 3  # 종목당 스트림 수 (체결가, 호가, 체결강도)
-        self.MAX_REALTIME_STOCKS = self.WEBSOCKET_LIMIT // self.STREAMS_PER_STOCK  # 13개
+        self.STREAMS_PER_STOCK = 2  # 종목당 스트림 수 (체결가, 호가)
+        self.MAX_REALTIME_STOCKS = self.WEBSOCKET_LIMIT // self.STREAMS_PER_STOCK  # 20개
 
         self.websocket_manager = websocket_manager
         self.collector = data_collector
@@ -571,8 +571,8 @@ class SimpleHybridDataManager:
         """실시간 데이터 콜백 (폴링용)"""
         self._process_data_update(stock_code, data)
 
-    def _websocket_callback(self, stock_code: str, data: Dict) -> None:
-        """웹소켓 실시간 데이터 콜백"""
+    def _websocket_callback(self, data_type: str, stock_code: str, data: Dict) -> None:
+        """웹소켓 실시간 데이터 콜백 - 🆕 data_type 파라미터 추가"""
         try:
             logger.debug(f"웹소켓 데이터 수신: {stock_code} - {data.get('current_price', 0):,}원")
             self._process_data_update(stock_code, data)
@@ -795,10 +795,23 @@ class SimpleHybridDataManager:
 
             self.stats['data_updates'] += 1
 
-            # 사용자 콜백 실행
+            # 사용자 콜백 실행 - 🆕 새로운 시그니처 지원
             if subscription['callback']:
                 try:
-                    subscription['callback'](stock_code, data)
+                    import inspect
+                    callback = subscription['callback']
+                    
+                    # 콜백 함수의 파라미터 개수 확인
+                    sig = inspect.signature(callback)
+                    param_count = len(sig.parameters)
+                    
+                    if param_count >= 3:
+                        # 새로운 형식: callback(data_type, stock_code, data)
+                        callback('stock_price', stock_code, data)
+                    else:
+                        # 기존 형식: callback(stock_code, data)
+                        callback(stock_code, data)
+                        
                 except Exception as e:
                     logger.error(f"사용자 콜백 오류: {stock_code} - {e}")
 

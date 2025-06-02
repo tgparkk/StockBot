@@ -117,7 +117,7 @@ class AdvancedSignalGenerator:
                                 current_data: Dict) -> Optional[AdvancedSignal]:
         """고도화된 거래 신호 생성"""
         try:
-            logger.info(f"🔬 고도화된 신호 분석 시작: {stock_code} ({strategy_name})")
+            #logger.info(f"🔬 고도화된 신호 분석 시작: {stock_code} ({strategy_name})")
 
             # 1. 기본 데이터 검증
             if not self._validate_input_data(current_data):
@@ -864,7 +864,11 @@ class AdvancedSignalGenerator:
             # 1. 🎯 이격도 기반 과매도 분석 (가장 강력한 지표)
             try:
                 from ..api.kis_market_api import get_disparity_rank
-                disparity_data = get_disparity_rank("0000", "20", "5000")
+                disparity_data = get_disparity_rank(
+                    fid_input_iscd="0000",      # 전체 시장
+                    fid_hour_cls_code="20",     # 20일 이격도  
+                    fid_vol_cnt="5000"          # 거래량 5천주 이상
+                )
 
                 if disparity_data is not None and not disparity_data.empty:
                     stock_row = disparity_data[disparity_data['mksc_shrn_iscd'] == stock_code]

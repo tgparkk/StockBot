@@ -62,7 +62,7 @@ class KISWebSocketMessageHandler:
         """실시간 데이터 처리 - 🎯 KIS 공식 문서 기준 개선"""
         try:
             # 🔧 디버그: 실시간 데이터 수신 확인
-            logger.info(f"🔔 실시간 데이터 수신: {data[:100]}...")  # 첫 100자만 로그
+            #logger.info(f"🔔 실시간 데이터 수신: {data[:100]}...")  # 첫 100자만 로그
 
             parts = data.split('|')
             if len(parts) < 4:
@@ -75,11 +75,11 @@ class KISWebSocketMessageHandler:
             data_count = parts[2] if len(parts) > 2 else "001"  # 데이터 건수
             raw_data = parts[3]
 
-            logger.info(f"📋 TR_ID: {tr_id}, 암호화: {encryption_flag}, 데이터건수: {data_count}, 길이: {len(raw_data)}")
+            #logger.info(f"📋 TR_ID: {tr_id}, 암호화: {encryption_flag}, 데이터건수: {data_count}, 길이: {len(raw_data)}")
 
             if tr_id == KIS_WSReq.CONTRACT.value:
                 # 실시간 체결
-                logger.info(f"📈 실시간 체결 데이터 처리: {tr_id} ({data_count}건)")
+                #logger.info(f"📈 실시간 체결 데이터 처리: {tr_id} ({data_count}건)")
                 
                 # 🔍 암호화 여부 확인
                 is_encrypted = encryption_flag == '1'
@@ -89,7 +89,7 @@ class KISWebSocketMessageHandler:
                     decrypted_data = self.data_parser.decrypt_notice_data(raw_data)
                     if decrypted_data:
                         parsed_data = self.data_parser.parse_contract_data(decrypted_data)
-                        logger.debug(f"🔓 체결 데이터 복호화 성공: {len(decrypted_data)}자")
+                        #logger.debug(f"🔓 체결 데이터 복호화 성공: {len(decrypted_data)}자")
                     else:
                         logger.warning("❌ 체결 데이터 복호화 실패")
                         parsed_data = None
@@ -100,16 +100,16 @@ class KISWebSocketMessageHandler:
                 if parsed_data:
                     stock_code = parsed_data['stock_code']
                     total_records = parsed_data.get('total_data_count', 1)
-                    logger.info(f"✅ 체결 데이터 파싱 성공: {stock_code} "
-                               f"(암호화: {'예' if is_encrypted else '아니오'}, "
-                               f"처리건수: {total_records}건)")
+                    #logger.info(f"✅ 체결 데이터 파싱 성공: {stock_code} "
+                    #           f"(암호화: {'예' if is_encrypted else '아니오'}, "
+                    #           f"처리건수: {total_records}건)")
                     await self._execute_callbacks(DataType.STOCK_PRICE.value, parsed_data)
                 else:
                     logger.warning("❌ 체결 데이터 파싱 실패")
 
             elif tr_id == KIS_WSReq.BID_ASK.value:
                 # 실시간 호가
-                logger.info(f"📊 실시간 호가 데이터 처리: {tr_id} ({data_count}건)")
+                #logger.info(f"📊 실시간 호가 데이터 처리: {tr_id} ({data_count}건)")
                 
                 # 🔍 암호화 여부 확인
                 is_encrypted = encryption_flag == '1'
@@ -119,7 +119,7 @@ class KISWebSocketMessageHandler:
                     decrypted_data = self.data_parser.decrypt_notice_data(raw_data)
                     if decrypted_data:
                         parsed_data = self.data_parser.parse_bid_ask_data(decrypted_data)
-                        logger.debug(f"🔓 호가 데이터 복호화 성공: {len(decrypted_data)}자")
+                        #logger.debug(f"🔓 호가 데이터 복호화 성공: {len(decrypted_data)}자")
                     else:
                         logger.warning("❌ 호가 데이터 복호화 실패")
                         parsed_data = None
@@ -129,20 +129,20 @@ class KISWebSocketMessageHandler:
                 
                 if parsed_data:
                     stock_code = parsed_data['stock_code']
-                    logger.info(f"✅ 호가 데이터 파싱 성공: {stock_code} "
-                               f"(암호화: {'예' if is_encrypted else '아니오'})")
+                    #logger.info(f"✅ 호가 데이터 파싱 성공: {stock_code} "
+                    #           f"(암호화: {'예' if is_encrypted else '아니오'})")
                     await self._execute_callbacks(DataType.STOCK_ORDERBOOK.value, parsed_data)
                 else:
                     logger.warning("❌ 호가 데이터 파싱 실패")
 
             elif tr_id in [KIS_WSReq.NOTICE.value, KIS_WSReq.NOTICE_DEMO.value]:
                 # 체결통보 (실전투자는 NOTICE만 사용)
-                logger.info(f"📢 체결통보 처리: {tr_id} ({data_count}건)")
+                #logger.info(f"📢 체결통보 처리: {tr_id} ({data_count}건)")
                 if tr_id == KIS_WSReq.NOTICE.value:
                     # 🔍 체결통보는 항상 암호화됨
                     decrypted_data = self.data_parser.decrypt_notice_data(raw_data)
                     if decrypted_data:
-                        logger.info(f"✅ 체결통보 수신: {decrypted_data[:100]}...")
+                        #logger.info(f"✅ 체결통보 수신: {decrypted_data[:100]}...")
                         
                         # 🆕 직접 OrderExecutionManager 호출
                         await self._handle_execution_notice_direct(decrypted_data)
