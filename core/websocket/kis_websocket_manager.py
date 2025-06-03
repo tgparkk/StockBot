@@ -381,13 +381,24 @@ class KISWebSocketManager:
     # ==========================================
 
     async def subscribe_stock(self, stock_code: str, callback: Optional[Callable] = None) -> bool:
-        """종목 구독 (기존 인터페이스)"""
+        """종목 구독 (기존 인터페이스) - 🆕 중복 구독 방지 강화"""
         try:
-            # 구독 가능 여부 확인
+            # 🆕 이미 구독된 종목인지 먼저 확인
+            if self.subscription_manager.is_subscribed(stock_code):
+                logger.debug(f"📡 {stock_code} 이미 구독됨 - 콜백만 추가")
+                # 콜백 추가
+                if callback:
+                    self.subscription_manager.add_stock_callback(stock_code, callback)
+                return True
+
+            # 🆕 구독 가능 여부 확인 (구독 한계)
             if not self.subscription_manager.can_subscribe(stock_code):
-                logger.warning(f"구독 불가: {stock_code} (한계 도달)")
+                current_count = self.subscription_manager.get_subscription_count()
+                max_count = self.subscription_manager.MAX_STOCKS
+                logger.warning(f"❌ 구독 불가 - 한계 도달: {current_count}/{max_count} (종목: {stock_code})")
                 return False
 
+            # 새로운 구독 시도
             # 체결가 구독
             contract_msg = self.connection.build_message(
                 KIS_WSReq.CONTRACT.value, stock_code, '1'
@@ -401,18 +412,31 @@ class KISWebSocketManager:
             await self.connection.send_message(bid_ask_msg)
 
             # 구독 등록
-            self.subscription_manager.add_subscription(stock_code)
+            if self.subscription_manager.add_subscription(stock_code):
+                # 콜백 등록
+                if callback:
+                    self.subscription_manager.add_stock_callback(stock_code, callback)
 
-            # 콜백 등록
-            if callback:
-                self.subscription_manager.add_stock_callback(stock_code, callback)
-
-            logger.info(f"✅ 종목 구독 성공: {stock_code}")
-            return True
+                current_count = self.subscription_manager.get_subscription_count()
+                max_count = self.subscription_manager.MAX_STOCKS
+                logger.info(f"✅ 종목 구독 성공: {stock_code} ({current_count}/{max_count})")
+                return True
+            else:
+                logger.warning(f"❌ 구독 등록 실패: {stock_code}")
+                return False
 
         except Exception as e:
-            logger.error(f"종목 구독 실패 ({stock_code}): {e}")
-            return False
+            error_msg = str(e)
+            if "ALREADY IN SUBSCRIBE" in error_msg:
+                logger.debug(f"📡 {stock_code} 이미 구독됨 (웹소켓 레벨) - 매니저 동기화")
+                # 웹소켓 레벨에서 이미 구독되어 있으므로 매니저에 등록
+                self.subscription_manager.add_subscription(stock_code)
+                if callback:
+                    self.subscription_manager.add_stock_callback(stock_code, callback)
+                return True
+            else:
+                logger.error(f"❌ 종목 구독 실패 ({stock_code}): {e}")
+                return False
 
     def subscribe_stock_sync(self, stock_code: str, callback: Optional[Callable] = None) -> bool:
         """종목 구독 (동기 방식 - 기존 인터페이스 호환)"""

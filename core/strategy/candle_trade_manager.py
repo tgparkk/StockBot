@@ -54,6 +54,12 @@ class CandleTradeManager:
         self._scan_interval = 60  # 1분
         self.is_running = False
 
+        # 실행 상태
+        self.running = False
+        self.scan_interval = 30  # 🆕 스캔 간격 (초)
+
+        # 데이터 수집 및 분석 도구들
+
         # ========== 설정값 ==========
         self.config = {
             # 기본 스캔 설정
@@ -112,6 +118,71 @@ class CandleTradeManager:
         self.subscribed_stocks = set()  # 현재 구독 중인 종목 코드들
 
         logger.info("✅ CandleTradeManager 초기화 완료")
+
+    # ==========================================
+    # 🆕 구독 상태 관리 유틸리티
+    # ==========================================
+
+    def _check_subscription_status(self, stock_code: str) -> Dict[str, bool]:
+        """종목의 구독 상태를 종합적으로 체크"""
+        status = {
+            'candle_manager_subscribed': stock_code in self.subscribed_stocks,
+            'websocket_manager_subscribed': False,
+            'all_stocks_tracked': stock_code in self._all_stocks,
+            'subscription_capacity_available': True
+        }
+
+        try:
+            if self.websocket_manager and hasattr(self.websocket_manager, 'subscription_manager'):
+                ws_sub_mgr = self.websocket_manager.subscription_manager
+                status['websocket_manager_subscribed'] = ws_sub_mgr.is_subscribed(stock_code)
+                status['subscription_capacity_available'] = ws_sub_mgr.has_subscription_capacity()
+
+        except Exception as e:
+            logger.debug(f"구독 상태 체크 오류 ({stock_code}): {e}")
+
+        return status
+
+    def _synchronize_subscription_state(self, stock_code: str):
+        """구독 상태 동기화 (매니저 간 불일치 해결)"""
+        try:
+            status = self._check_subscription_status(stock_code)
+
+            # 웹소켓 매니저에서는 구독됨, 캔들 매니저에서는 안됨 → 동기화
+            if status['websocket_manager_subscribed'] and not status['candle_manager_subscribed']:
+                self.subscribed_stocks.add(stock_code)
+                logger.debug(f"🔄 {stock_code} 구독 상태 동기화: 캔들매니저에 추가")
+
+            # 둘 다 구독됨
+            elif status['websocket_manager_subscribed'] and status['candle_manager_subscribed']:
+                logger.debug(f"✅ {stock_code} 구독 상태 일치")
+
+            return status
+
+        except Exception as e:
+            logger.error(f"구독 상태 동기화 오류 ({stock_code}): {e}")
+            return None
+
+    def _log_subscription_summary(self):
+        """구독 현황 요약 로그"""
+        try:
+            candle_count = len(self.subscribed_stocks)
+            ws_count = 0
+            ws_max = 0
+
+            if self.websocket_manager and hasattr(self.websocket_manager, 'subscription_manager'):
+                ws_sub_mgr = self.websocket_manager.subscription_manager
+                ws_count = ws_sub_mgr.get_subscription_count()
+                ws_max = ws_sub_mgr.MAX_STOCKS
+
+            logger.info(f"📊 구독 현황: 캔들매니저={candle_count}개, 웹소켓매니저={ws_count}/{ws_max}개")
+
+            # 불일치 체크
+            if candle_count != ws_count:
+                logger.warning(f"⚠️ 구독 상태 불일치 감지 - 캔들:{candle_count} vs 웹소켓:{ws_count}")
+
+        except Exception as e:
+            logger.debug(f"구독 현황 로그 오류: {e}")
 
     # ==========================================
     # 🆕 기존 보유 종목 웹소켓 구독 관리
@@ -263,20 +334,52 @@ class CandleTradeManager:
             logger.error(f"기본 보유 정보 로그 오류 ({stock_code}): {e}")
 
     async def _subscribe_existing_holding(self, stock_code: str, callback) -> bool:
-        """기존 보유 종목 웹소켓 구독 (내부 메서드) - 🆕 중복 구독 방지"""
+        """기존 보유 종목 웹소켓 구독 (내부 메서드) - 🆕 중복 구독 방지 강화"""
         try:
-            # 🆕 중복 구독 체크
+            # 🆕 구독 상태 종합 체크
+            already_subscribed = False
+
+            # 1. CandleTradeManager 자체 subscribed_stocks 체크
             if stock_code in self.subscribed_stocks:
-                logger.debug(f"📡 {stock_code} 이미 구독 중 - 건너뛰기")
-                return True
+                already_subscribed = True
+                logger.debug(f"📡 {stock_code} 캔들매니저에서 이미 구독 중")
 
             if self.websocket_manager:
-                # 웹소켓 매니저를 통한 구독
-                success = await self.websocket_manager.subscribe_stock(stock_code, callback)
-                if success:
-                    self.subscribed_stocks.add(stock_code)  # 구독 성공시 추가
-                    logger.debug(f"📡 {stock_code} 웹소켓 구독 성공")
-                return success
+                # 2. 웹소켓 매니저 구독 상태 체크
+                if hasattr(self.websocket_manager, 'subscription_manager'):
+                    if self.websocket_manager.subscription_manager.is_subscribed(stock_code):
+                        already_subscribed = True
+                        logger.debug(f"📡 {stock_code} 웹소켓매니저에서 이미 구독 중")
+
+                # 3. 구독 가능 여부 체크 (구독 한계)
+                can_subscribe = True
+                if hasattr(self.websocket_manager, 'subscription_manager'):
+                    if not self.websocket_manager.subscription_manager.has_subscription_capacity():
+                        can_subscribe = False
+                        current_count = self.websocket_manager.subscription_manager.get_subscription_count()
+                        max_count = self.websocket_manager.subscription_manager.MAX_STOCKS
+                        logger.warning(f"⚠️ 보유종목 구독 한계 도달: {current_count}/{max_count} - {stock_code} 구독 불가")
+
+                # 구독 실행 결정
+                if already_subscribed:
+                    logger.debug(f"📡 {stock_code} 이미 구독됨 - 구독 건너뛰기")
+                    # 이미 구독된 종목이므로 subscribed_stocks에 추가만 (동기화)
+                    self.subscribed_stocks.add(stock_code)
+                    # 콜백은 추가 (중복 콜백도 처리할 수 있음)
+                    if callback:
+                        self.websocket_manager.add_stock_callback(stock_code, callback)
+                    return True
+                elif can_subscribe:
+                    # 새로운 구독 시도
+                    success = await self.websocket_manager.subscribe_stock(stock_code, callback)
+                    if success:
+                        self.subscribed_stocks.add(stock_code)  # 구독 성공시 추가
+                        logger.debug(f"📡 {stock_code} 보유종목 웹소켓 구독 성공")
+                    return success
+                else:
+                    #logger.info(f"📡 {stock_code} 구독 한계로 인해 보유종목 구독 건너뛰기")
+                    return False
+
             elif self.data_manager:
                 # 데이터 매니저를 통한 백업 구독
                 from core.data.data_priority import DataPriority
@@ -288,7 +391,7 @@ class CandleTradeManager:
                 )
                 if success:
                     self.subscribed_stocks.add(stock_code)  # 구독 성공시 추가
-                    logger.debug(f"📡 {stock_code} 데이터매니저 구독 성공")
+                    logger.debug(f"📡 {stock_code} 보유종목 데이터매니저 구독 성공")
                 return success
             else:
                 logger.warning("웹소켓 매니저와 데이터 매니저 모두 없음")
@@ -382,19 +485,31 @@ class CandleTradeManager:
             return False
 
     def cleanup_existing_holdings_monitoring(self):
-        """기존 보유 종목 모니터링 정리 - 🆕 구독 상태도 정리"""
+        """기존 보유 종목 웹소켓 모니터링 정리 - 🆕 구독 상태 로그 추가"""
         try:
-            logger.info("📊 기존 보유 종목 모니터링 정리 시작")
+            logger.info("🧹 기존 보유 종목 웹소켓 모니터링 정리 시작")
+
+            # 구독 정리 전 현황 로그
+            self._log_subscription_summary()
 
             # 콜백 정리
-            cleanup_count = len(self.existing_holdings_callbacks)
+            callback_count = len(self.existing_holdings_callbacks)
+            for stock_code, callback in self.existing_holdings_callbacks.items():
+                try:
+                    # 웹소켓 매니저에서 콜백 제거
+                    if self.websocket_manager:
+                        self.websocket_manager.remove_stock_callback(stock_code, callback)
+                    logger.debug(f"📡 {stock_code} 콜백 제거 완료")
+                except Exception as e:
+                    logger.warning(f"⚠️ {stock_code} 콜백 제거 오류: {e}")
+
+            # 콜백 딕셔너리 정리
             self.existing_holdings_callbacks.clear()
 
-            # 🆕 구독 상태 정리
-            subscribed_count = len(self.subscribed_stocks)
-            self.subscribed_stocks.clear()
+            logger.info(f"✅ 기존 보유 종목 모니터링 정리 완료: {callback_count}개 콜백 제거")
 
-            logger.info(f"📊 기존 보유 종목 모니터링 정리 완료: {cleanup_count}개 콜백, {subscribed_count}개 구독 정리")
+            # 정리 후 현황 로그
+            self._log_subscription_summary()
 
         except Exception as e:
             logger.error(f"기존 보유 종목 모니터링 정리 오류: {e}")
@@ -406,55 +521,62 @@ class CandleTradeManager:
     # ========== 메인 실행 루프 ==========
 
     async def start_trading(self):
-        """캔들 전략 거래 시작"""
+        """캔들 기반 매매 시작"""
         try:
-            if self.is_running:
-                logger.warning("캔들 전략이 이미 실행 중입니다")
-                return False
+            logger.info("🕯️ 캔들 기반 매매 시스템 시작")
 
-            self.is_running = True
-            logger.info("🎯 캔들 기반 매매 전략 시작")
+            # 🆕 구독 현황 로그
+            self._log_subscription_summary()
 
-            # 초기화
+            # 기존 보유 종목 웹소켓 모니터링 설정
+            await self.setup_existing_holdings_monitoring()
+
+            # 거래일 초기화
             await self._initialize_trading_day()
 
-            # 메인 루프 실행
-            while self.is_running:
-                try:
-                    # 1. 시장 시간 체크
-                    if not self._is_trading_time():
-                        await asyncio.sleep(60)  # 1분 대기
-                        continue
+            # 메인 트레이딩 루프 시작
+            self.running = True
 
-                    # 2. 종목 스캔 및 패턴 감지
+            # 상태 로그
+            self._log_status()
+
+            while self.running:
+                try:
+                    # 거래 시간 체크
+                    # if not self._is_trading_time():
+                    #     await asyncio.sleep(60)  # 1분 대기
+                    #     continue
+
+                    # 시장 스캔 및 패턴 감지
                     await self._scan_and_detect_patterns()
 
-                    # 3. 진입 기회 평가
+                    # 진입 기회 평가 = 매수 준비 종목 평가
                     await self._evaluate_entry_opportunities()
 
-                    # 4. 기존 포지션 관리
+                    # 기존 포지션 관리 - 매도 시그널 체크
                     await self._manage_existing_positions()
 
-                    # 5. 자동 정리
-                    self.stock_manager.auto_cleanup()
+                    # 🆕 주기적 구독 현황 체크 (10분마다)
+                    if hasattr(self, '_last_subscription_check'):
+                        if time.time() - self._last_subscription_check > 600:  # 10분
+                            self._log_subscription_summary()
+                            self._last_subscription_check = time.time()
+                    else:
+                        self._last_subscription_check = time.time()
 
-                    # 6. 상태 로깅
+                    # 상태 업데이트
                     self._log_status()
 
-                    # 다음 스캔까지 대기
-                    await asyncio.sleep(self.config['scan_interval_seconds'])
+                    # 스캔 간격 대기 (기본 30초)
+                    await asyncio.sleep(self.scan_interval)
 
                 except Exception as e:
-                    logger.error(f"거래 루프 오류: {e}")
-                    await asyncio.sleep(30)  # 오류 시 30초 대기
-
-            logger.info("🎯 캔들 전략 거래 종료")
-            return True
+                    logger.error(f"매매 루프 오류: {e}")
+                    await asyncio.sleep(10)  # 오류시 10초 대기 후 재시도
 
         except Exception as e:
-            logger.error(f"캔들 전략 시작 오류: {e}")
-            self.is_running = False
-            return False
+            logger.error(f"캔들 매매 시작 오류: {e}")
+            self.running = False
 
     def stop_trading(self):
         """캔들 전략 거래 중지"""
@@ -469,9 +591,9 @@ class CandleTradeManager:
             current_time = datetime.now()
 
             # 스캔 간격 체크
-            if (self._last_scan_time and
-                (current_time - self._last_scan_time).total_seconds() < self._scan_interval):
-                return
+            # if (self._last_scan_time and
+            #     (current_time - self._last_scan_time).total_seconds() < self._scan_interval):
+            #     return
 
             logger.info("🔍 매수 후보 종목 스캔 시작")
 
@@ -528,8 +650,8 @@ class CandleTradeManager:
             for i, stock_code in enumerate(unique_candidates):
                 try:
                     # API 제한 방지
-                    if i % 10 == 0 and i > 0:
-                        await asyncio.sleep(1)
+                    #if i % 10 == 0 and i > 0:
+                    #    await asyncio.sleep(1)
 
                     # 패턴 분석
                     candidate = await self._analyze_stock_for_patterns(stock_code, market_name)
@@ -603,6 +725,21 @@ class CandleTradeManager:
             for pattern in pattern_result:
                 candidate.add_pattern(pattern)
 
+            # 🆕 매매 신호 생성 및 설정
+            trade_signal, signal_strength = self._generate_trade_signal(candidate, pattern_result)
+            candidate.trade_signal = trade_signal
+            candidate.signal_strength = signal_strength
+            candidate.signal_updated_at = datetime.now()
+
+            # 🆕 진입 우선순위 계산
+            candidate.entry_priority = self._calculate_entry_priority(candidate)
+
+            # 🆕 리스크 관리 설정
+            candidate.risk_management = self._calculate_risk_management(candidate)
+
+            logger.info(f"✅ {stock_code}({stock_name}) 신호 생성: {trade_signal.value.upper()} "
+                       f"(강도:{signal_strength}) 패턴:{strongest_pattern.pattern_type.value}")
+
             # 🆕 7. 데이터베이스에 후보 저장
             try:
                 if self.trade_db:  # None 체크 추가
@@ -651,13 +788,60 @@ class CandleTradeManager:
                 logger.warning(f"⚠️ {stock_code} DB 저장 실패: {db_error}")
                 # DB 저장 실패해도 거래는 계속 진행
 
-            # 7. 웹소켓 구독 (새로운 후보인 경우)
+            # 7. 웹소켓 구독 (새로운 후보인 경우) - 🆕 중복 구독 방지 강화
             try:
-                if self.websocket_manager and stock_code not in self._all_stocks:
-                    await self.websocket_manager.subscribe_stock(stock_code)  # ✅ 메서드명 수정
-                    logger.info(f"📡 {stock_code} 웹소켓 구독 추가")
+                if self.websocket_manager:
+                    # 🆕 구독 상태 종합 체크
+                    already_subscribed = False
+
+                    # 1. CandleTradeManager 자체 subscribed_stocks 체크
+                    if stock_code in self.subscribed_stocks:
+                        already_subscribed = True
+                        logger.debug(f"📡 {stock_code} 캔들매니저에서 이미 구독 중")
+
+                    # 2. 웹소켓 매니저 구독 상태 체크
+                    if hasattr(self.websocket_manager, 'subscription_manager'):
+                        if self.websocket_manager.subscription_manager.is_subscribed(stock_code):
+                            already_subscribed = True
+                            logger.debug(f"📡 {stock_code} 웹소켓매니저에서 이미 구독 중")
+
+                    # 3. _all_stocks 체크 (기존 로직)
+                    if stock_code in self._all_stocks:
+                        already_subscribed = True
+                        logger.debug(f"📡 {stock_code} _all_stocks에서 이미 추적 중")
+
+                    # 4. 구독 가능 여부 체크 (구독 한계)
+                    can_subscribe = True
+                    if hasattr(self.websocket_manager, 'subscription_manager'):
+                        if not self.websocket_manager.subscription_manager.has_subscription_capacity():
+                            can_subscribe = False
+                            current_count = self.websocket_manager.subscription_manager.get_subscription_count()
+                            max_count = self.websocket_manager.subscription_manager.MAX_STOCKS
+                            logger.warning(f"⚠️ 웹소켓 구독 한계 도달: {current_count}/{max_count} - {stock_code} 구독 불가")
+
+                    # 구독 실행 결정
+                    if already_subscribed:
+                        logger.debug(f"📡 {stock_code} 이미 구독됨 - 구독 건너뛰기")
+                        # 이미 구독된 종목이므로 subscribed_stocks에 추가만 (동기화)
+                        self.subscribed_stocks.add(stock_code)
+                    elif can_subscribe:
+                        # 새로운 구독 시도
+                        success = await self.websocket_manager.subscribe_stock(stock_code)
+                        if success:
+                            self.subscribed_stocks.add(stock_code)
+                            logger.info(f"📡 {stock_code} 웹소켓 구독 추가 성공")
+                        else:
+                            logger.warning(f"⚠️ {stock_code} 웹소켓 구독 실패")
+                    else:
+                        #logger.info(f"📡 {stock_code} 구독 한계로 인해 구독 건너뛰기")
+                        pass
+
             except Exception as ws_error:
-                logger.warning(f"⚠️ {stock_code} 웹소켓 구독 실패: {ws_error}")
+                if "ALREADY IN SUBSCRIBE" in str(ws_error):
+                    logger.debug(f"📡 {stock_code} 이미 구독됨 (정상) - 구독 상태 동기화")
+                    self.subscribed_stocks.add(stock_code)  # 구독 상태 동기화
+                else:
+                    logger.warning(f"⚠️ {stock_code} 웹소켓 구독 오류: {ws_error}")
 
             logger.info(f"✅ {stock_code}({stock_name}) 패턴 감지: {strongest_pattern.pattern_type.value} "
                        f"신뢰도:{strongest_pattern.confidence:.2f} "
@@ -740,6 +924,21 @@ class CandleTradeManager:
         """후보 종목 상태 변화 체크"""
         try:
             old_status = candidate.status
+            old_signal = candidate.trade_signal
+
+            # 🆕 실시간 신호 재평가 (가격 변화시)
+            if candidate.detected_patterns:
+                trade_signal, signal_strength = self._generate_trade_signal(candidate, candidate.detected_patterns)
+
+                # 신호가 변경된 경우만 업데이트
+                if trade_signal != candidate.trade_signal:
+                    candidate.trade_signal = trade_signal
+                    candidate.signal_strength = signal_strength
+                    candidate.signal_updated_at = datetime.now()
+                    candidate.entry_priority = self._calculate_entry_priority(candidate)
+
+                    logger.info(f"🔄 {candidate.stock_code} 신호 변경: {old_signal.value} → {trade_signal.value} "
+                               f"(강도:{signal_strength})")
 
             # 진입 조건 재평가
             if candidate.status == CandleStatus.WATCHING:
@@ -754,7 +953,7 @@ class CandleTradeManager:
                     await self._execute_exit(candidate, candidate.current_price, "패턴변화")
 
             # 상태 변경시 stock_manager 업데이트
-            if old_status != candidate.status:
+            if old_status != candidate.status or old_signal != candidate.trade_signal:
                 self.stock_manager.update_candidate(candidate)
 
         except Exception as e:
@@ -1020,8 +1219,43 @@ class CandleTradeManager:
         except:
             return 50
 
-    # ========== 진입 기회 평가 ==========
+    def _calculate_entry_priority(self, candidate: CandleTradeCandidate) -> int:
+        """🆕 진입 우선순위 계산 (0~100)"""
+        try:
+            priority = 0
 
+            # 1. 신호 강도 (30%)
+            priority += candidate.signal_strength * 0.3
+
+            # 2. 패턴 점수 (30%)
+            priority += candidate.pattern_score * 0.3
+
+            # 3. 패턴 신뢰도 (20%)
+            if candidate.primary_pattern:
+                priority += candidate.primary_pattern.confidence * 100 * 0.2
+
+            # 4. 패턴별 가중치 (20%)
+            if candidate.primary_pattern:
+                pattern_weights = {
+                    PatternType.MORNING_STAR: 20,      # 최고 신뢰도
+                    PatternType.BULLISH_ENGULFING: 18,
+                    PatternType.HAMMER: 15,
+                    PatternType.INVERTED_HAMMER: 15,
+                    PatternType.RISING_THREE_METHODS: 12,
+                    PatternType.DOJI: 8,               # 가장 낮음
+                }
+                weight = pattern_weights.get(candidate.primary_pattern.pattern_type, 10)
+                priority += weight
+
+            # 정규화 (0~100)
+            return min(100, max(0, int(priority)))
+
+        except Exception as e:
+            logger.error(f"진입 우선순위 계산 오류: {e}")
+            return 50
+
+    # ========== 진입 기회 평가 ==========
+    # 진입 기회 평가 = 매수 준비 종목 평가
     async def _evaluate_entry_opportunities(self):
         """진입 기회 평가 및 매수 실행"""
         try:
