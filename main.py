@@ -291,64 +291,9 @@ class StockBot:
                         try:
                             logger.info("🚀 캔들 트레이딩 메인 루프 시작")
 
-                            # 🔄 기존 보유 종목 캔들 분석 (시작 시 1회)
-                            logger.info("🔍 시작 시 기존 보유 종목 캔들 분석")
-                            existing_analysis = await self.candle_trade_manager.analyze_existing_holdings()
-
-                            if existing_analysis['analyzed_count'] > 0:
-                                logger.info(f"📊 기존 보유종목 분석 결과: "
-                                           f"총 {existing_analysis['analyzed_count']}개 종목, "
-                                           f"총평가액 {existing_analysis.get('total_value', 0):,}원")
-
-                                # 매도 권장 종목 로깅
-                                sell_recommendations = [
-                                    r for r in existing_analysis['recommendations']
-                                    if r['recommendation'] in ['STRONG_SELL', 'SELL']
-                                ]
-
-                                if sell_recommendations:
-                                    logger.warning(f"⚠️ 매도 권장 종목 {len(sell_recommendations)}개:")
-                                    for rec in sell_recommendations[:3]:  # 상위 3개만 표시
-                                        logger.warning(f"   {rec['stock_code']}({rec['stock_name']}): "
-                                                     f"{rec['recommendation']} - {rec['reasons'][0]}")
-                            else:
-                                logger.info("📊 분석할 기존 보유 종목 없음")
-
-                            # 메인 캔들 트레이딩 루프
-                            while self.is_running:
-                                try:
-                                    # 1. 새로운 매수 후보 탐색 및 분석
-                                    await self.candle_trade_manager._scan_market_for_patterns("0000")
-
-                                    # 2. 기존 포지션 관리
-                                    await self.candle_trade_manager._manage_existing_positions()
-
-                                    # 3. 주기적 기존 보유 종목 재분석 (2분마다)
-                                    current_time = time.time()
-                                    if not hasattr(self, '_last_existing_analysis_time'):
-                                        setattr(self, '_last_existing_analysis_time', current_time)
-
-                                    if current_time - getattr(self, '_last_existing_analysis_time', 0) > 120:  # 2분
-                                        logger.info("🔄 주기적 기존 보유 종목 재분석")
-                                        existing_analysis = await self.candle_trade_manager.analyze_existing_holdings()
-                                        setattr(self, '_last_existing_analysis_time', current_time)
-
-                                        if existing_analysis['analyzed_count'] > 0:
-                                            urgent_sells = [
-                                                r for r in existing_analysis['recommendations']
-                                                if r['recommendation'] == 'STRONG_SELL'
-                                            ]
-                                            if urgent_sells:
-                                                logger.warning(f"🚨 긴급 매도 권장: {len(urgent_sells)}개 종목")
-                                                for rec in urgent_sells:
-                                                    logger.warning(f"   🚨 {rec['stock_code']}: {rec['reasons'][0]}")
-
-                                    # 4. 대기
-                                    await asyncio.sleep(30)  # 30초 주기
-
-                                except Exception as e:
-                                    logger.error(f"캔들 트레이딩 루프 오류: {e}")
-                                    await asyncio.sleep(10)
+                            # 🆕 CandleTradeManager의 start_trading() 메서드 호출
+                            logger.info("🕯️ CandleTradeManager.start_trading() 시작")
+                            await self.candle_trade_manager.start_trading()
 
                         except Exception as e:
                             logger.error(f"캔들 트레이딩 메인 루프 오류: {e}")

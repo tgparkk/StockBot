@@ -359,19 +359,83 @@ def _url_fetch(api_url: str, ptr_id: str, tr_cont: str, params: Dict,
                         else:
                             logger.error(f"API 오류: {res.status_code} - {ar.getErrorMessage()}")
                             return ar
+                    # 🆕 토큰 만료 오류 처리
+                    elif ar.getErrorCode() == 'EGW00123':  # 토큰 만료 오류
+                        logger.warning("🔑 토큰이 만료되었습니다. 자동 재발급을 시도합니다...")
+                        try:
+                            # 토큰 재발급 시도
+                            if _auto_reauth():
+                                logger.info("✅ 토큰 재발급 성공. API 호출을 재시도합니다.")
+                                # 헤더 업데이트 (새로운 토큰 적용)
+                                headers = _getBaseHeader()
+                                headers["tr_id"] = tr_id
+                                headers["custtype"] = "P"
+                                headers["tr_cont"] = tr_cont
+                                if appendHeaders:
+                                    headers.update(appendHeaders)
+
+                                # API 재호출
+                                if postFlag:
+                                    if hashFlag:
+                                        set_order_hash_key(headers, params)
+                                    res = requests.post(url, headers=headers, data=json.dumps(params))
+                                else:
+                                    res = requests.get(url, headers=headers, params=params)
+
+                                # 재호출 결과 처리
+                                if res.status_code == 200:
+                                    ar_retry = APIResp(res)
+                                    if ar_retry.isOK():
+                                        logger.info(f"✅ 토큰 재발급 후 API 호출 성공: {tr_id}")
+                                        return ar_retry
+                                    else:
+                                        logger.error(f"❌ 토큰 재발급 후 API 호출 실패: {ar_retry.getErrorMessage()}")
+                                        return ar_retry
+                                else:
+                                    logger.error(f"❌ 토큰 재발급 후 HTTP 오류: {res.status_code}")
+                                    return None
+                            else:
+                                logger.error("❌ 토큰 재발급 실패")
+                                return ar
+                        except Exception as e:
+                            logger.error(f"❌ 토큰 재발급 중 오류 발생: {e}")
+                            return ar
                     else:
                         # 다른 비즈니스 오류는 즉시 반환
                         logger.error(f"API 비즈니스 오류: {ar.getErrorCode()} - {ar.getErrorMessage()}")
                         return ar
             else:
                 # HTTP 오류
-                if res.status_code == 500 and _is_rate_limit_error(res.text):
-                    if attempt < _max_retries:
-                        wait_time = _retry_delay_base * (2 ** attempt)  # 지수 백오프
-                        logger.warning(f"HTTP 500 속도 제한 오류. {wait_time}초 후 재시도 ({attempt + 1}/{_max_retries + 1})")
-                        time.sleep(wait_time)
-                        continue
-                    else:
+                if res.status_code == 500:
+                    # 🆕 500 오류에서 토큰 만료 메시지 확인
+                    try:
+                        response_data = json.loads(res.text)
+                        if (response_data.get('msg_cd') == 'EGW00123' or
+                            '기간이 만료된 token' in response_data.get('msg1', '')):
+                            logger.warning("🔑 HTTP 500 토큰 만료 오류 감지. 자동 재발급을 시도합니다...")
+                            try:
+                                if _auto_reauth():
+                                    logger.info("✅ 토큰 재발급 성공. API 호출을 재시도합니다.")
+                                    continue  # 다음 루프에서 재시도
+                                else:
+                                    logger.error("❌ 토큰 재발급 실패")
+                                    return None
+                            except Exception as e:
+                                logger.error(f"❌ 토큰 재발급 중 오류 발생: {e}")
+                                return None
+                        elif _is_rate_limit_error(res.text):
+                            if attempt < _max_retries:
+                                wait_time = _retry_delay_base * (2 ** attempt)  # 지수 백오프
+                                logger.warning(f"HTTP 500 속도 제한 오류. {wait_time}초 후 재시도 ({attempt + 1}/{_max_retries + 1})")
+                                time.sleep(wait_time)
+                                continue
+                            else:
+                                logger.error(f"API 오류: {res.status_code} - {res.text}")
+                                return None
+                        else:
+                            logger.error(f"API 오류: {res.status_code} - {res.text}")
+                            return None
+                    except json.JSONDecodeError:
                         logger.error(f"API 오류: {res.status_code} - {res.text}")
                         return None
                 else:
@@ -500,3 +564,32 @@ def is_authenticated() -> bool:
     # Implementing it is not possible without additional information about the function's purpose
     # This function is left unchanged as it's not clear what it's supposed to do
     return False
+
+
+def _auto_reauth() -> bool:
+    """🆕 자동 토큰 재발급 함수"""
+    try:
+        logger.info("🔑 토큰 자동 재발급 시작...")
+
+        # 현재 환경 정보 저장
+        current_env = getTREnv()
+        if not current_env:
+            logger.error("❌ 현재 환경 정보가 없습니다")
+            return False
+
+        # 기존 auth() 함수 호출하여 토큰 재발급
+        # URL에서 서버 타입 판단
+        svr = 'demo' if 'openapivts' in current_env.my_url else 'prod'
+
+        success = auth(svr=svr, product=current_env.my_prod)
+
+        if success:
+            logger.info("✅ 토큰 자동 재발급 성공")
+            return True
+        else:
+            logger.error("❌ 토큰 자동 재발급 실패")
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ 토큰 자동 재발급 중 오류: {e}")
+        return False
