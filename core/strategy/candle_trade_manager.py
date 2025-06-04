@@ -113,7 +113,7 @@ class CandleTradeManager:
                 'min_cash_threshold': 500_000, # 현금 우선 사용 최소 기준 (50만원)
                 'max_portfolio_limit': 3_000_000, # 평가액 기준 최대 제한 (300만원)
                 'default_investment': 1_000_000,   # 기본 투자 금액 (100만원)
-                'min_investment': 200_000,     # 최소 투자 금액 (20만원)
+                'min_investment': 100_000,     # 최소 투자 금액 (10만원)
             },
         }
 
