@@ -18,7 +18,7 @@ logger = setup_logger(__name__)
 class CandleStockManager:
     """캔들 전략 종목 통합 관리자"""
 
-    def __init__(self, max_watch_stocks: int = 100, max_positions: int = 10):
+    def __init__(self, max_watch_stocks: int = 100, max_positions: int = 15):
         self.max_watch_stocks = max_watch_stocks
         self.max_positions = max_positions
 

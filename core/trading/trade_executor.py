@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from .async_data_logger import get_async_logger, log_signal_failed, log_buy_failed, log_buy_success
 from .order_execution_manager import OrderExecutionManager
+from ..trading.trading_manager import TradingManager
 
 logger = setup_logger(__name__)
 
@@ -94,7 +95,7 @@ class TradeResult:
 class TradeExecutor:
     """거래 실행 전담 클래스"""
 
-    def __init__(self, trading_manager, data_manager, trade_db, config: Optional[TradeConfig] = None):
+    def __init__(self, trading_manager : TradingManager, data_manager, trade_db, config: Optional[TradeConfig] = None):
         """초기화 (PositionManager 제거됨)"""
         self.trading_manager = trading_manager
         self.data_manager = data_manager
@@ -198,26 +199,14 @@ class TradeExecutor:
         try:
             logger.info(f"📈 캔들 매수 주문 실행: {stock_code}")
 
-            # 🎯 캔들 시스템에서 온 신호는 이미 검증 완료 (검증 생략)
-            if not is_pre_validated:
-                logger.warning(f"⚠️ 사전 검증되지 않은 신호: {stock_code} - 기본 검증 수행")
-                if not self._validate_buy_signal_basic(signal, stock_code):
-                    return TradeResult(
-                        success=False, stock_code=stock_code, order_type='BUY',
-                        quantity=0, price=signal.get('price', 0), total_amount=0,
-                        error_message="기본 검증 실패"
-                    )
-
-            # 💰 매수 가격 및 수량 계산
+            # 💰 매수 가격 검증 및 수량 계산
             target_price = signal.get('price', 0)
             if target_price <= 0:
-                target_price = self._get_current_price(stock_code)
-                if target_price <= 0:
-                    return TradeResult(
-                        success=False, stock_code=stock_code, order_type='BUY',
-                        quantity=0, price=0, total_amount=0,
-                        error_message="현재가 조회 실패"
-                    )
+                return TradeResult(
+                    success=False, stock_code=stock_code, order_type='BUY',
+                    quantity=0, price=0, total_amount=0,
+                    error_message="신호에 유효한 가격 정보 없음"
+                )
 
             # 매수가격 조정 (틱 단위 맞춤)
             buy_price = self._calculate_buy_price(target_price, strategy, stock_code)
@@ -246,17 +235,18 @@ class TradeExecutor:
             # 🚀 실제 매수 주문 실행
             logger.info(f"💰 매수 주문: {stock_code} {buy_quantity:,}주 @ {buy_price:,}원 (총 {total_amount:,}원)")
 
-            order_result = self.trading_manager.buy_order(
+            order_result = self.trading_manager.execute_order(
                 stock_code=stock_code,
-                quantity=str(buy_quantity),
-                price=str(buy_price)
+                order_type="BUY",
+                quantity=buy_quantity,
+                price=buy_price
             )
 
-            if order_result and order_result.get('rt_cd') == '0':
-                order_id = order_result.get('output', {}).get('ODNO', '')
+            if order_result:
+                order_id = order_result  # execute_order는 order_no 문자열을 직접 반환
 
                 # 📝 거래 기록 저장
-                self._record_buy_trade(stock_code, buy_quantity, buy_price, strategy, signal, order_result)
+                self._record_buy_trade(stock_code, buy_quantity, buy_price, strategy, signal, {'order_no': order_id})
 
                 # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록
                 if order_id:
@@ -272,12 +262,11 @@ class TradeExecutor:
                     order_no=order_id, is_pending=True
                 )
             else:
-                error_msg = order_result.get('msg1', '매수 주문 실패') if order_result else '주문 API 호출 실패'
-                logger.error(f"❌ 매수 주문 실패: {stock_code} - {error_msg}")
+                logger.error(f"❌ 매수 주문 실패: {stock_code} - 주문 실행 실패")
                 return TradeResult(
                     success=False, stock_code=stock_code, order_type='BUY',
                     quantity=buy_quantity, price=buy_price, total_amount=total_amount,
-                    error_message=error_msg
+                    error_message="주문 실행 실패"
                 )
 
         except Exception as e:

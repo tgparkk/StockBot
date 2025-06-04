@@ -175,63 +175,6 @@ class StockBot:
             logger.info("📱 텔레그램 알림 없이 계속 진행")
             return None
 
-    def _setup_existing_positions_sync(self):
-        """기존 보유 종목 설정 (캔들 시스템에 위임)"""
-        try:
-            logger.info("📊 기존 보유 종목 설정 시작 - 캔들 시스템에 위임")
-
-            # 🆕 캔들 트레이딩 매니저에 위임
-            if hasattr(self, 'candle_trade_manager'):
-                # 동기 방식으로 비동기 메서드 호출
-                try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        success = loop.run_until_complete(
-                            self.candle_trade_manager.setup_existing_holdings_monitoring()
-                        )
-                        if success:
-                            logger.info("✅ 캔들 시스템을 통한 기존 보유 종목 설정 완료")
-                        else:
-                            logger.warning("⚠️ 캔들 시스템을 통한 기존 보유 종목 설정 실패")
-                    finally:
-                        loop.close()
-                except Exception as e:
-                    logger.error(f"캔들 시스템 설정 오류: {e}")
-            else:
-                logger.warning("캔들 트레이딩 매니저 없음 - 기존 보유 종목 설정 건너뜀")
-
-        except Exception as e:
-            logger.error(f"기존 보유 종목 설정 오류: {e}")
-
-    def _setup_existing_positions_threaded(self):
-        """기존 보유 종목 설정을 별도 스레드에서 실행 (간소화)"""
-        try:
-            logger.info("📊 기존 보유 종목 설정 시작 (별도 스레드)")
-
-            def run_setup():
-                """별도 스레드에서 보유 종목 설정 실행"""
-                try:
-                    # 시스템 안정화 대기
-                    time.sleep(3)
-                    self._setup_existing_positions_sync()
-                except Exception as e:
-                    logger.error(f"보유 종목 설정 오류: {e}")
-
-            # 별도 스레드에서 실행
-            setup_thread = threading.Thread(
-                target=run_setup,
-                name="ExistingPositionsSetup",
-                daemon=True
-            )
-            setup_thread.start()
-
-            logger.info("✅ 기존 보유 종목 설정 스레드 시작")
-
-        except Exception as e:
-            logger.error(f"기존 보유 종목 설정 스레드 시작 실패: {e}")
-
     def start(self):
         """StockBot 시작"""
         if self.is_running:
@@ -256,10 +199,6 @@ class StockBot:
 
             # 🆕 웹소켓 연결 상태 확인 (이벤트 루프 충돌 방지)
             self._check_websocket_status()
-
-            # 🆕 보유한 종목 자동 모니터링 설정
-            # 보유한 position_manager 변수에 저장
-            self._setup_existing_positions_threaded()
 
             logger.info("✅ StockBot 완전 가동!")
 
