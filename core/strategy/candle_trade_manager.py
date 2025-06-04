@@ -105,6 +105,16 @@ class CandleTradeManager:
                 'market_close_exit_minutes': 30,  # 장 마감 30분 전 청산
                 'overnight_avoid': False,      # 오버나이트 포지션 허용 (갭 활용)
             },
+
+            # 🆕 투자금액 계산 설정
+            'investment_calculation': {
+                'cash_usage_ratio': 0.8,       # 현금잔고 사용 비율 (80%)
+                'portfolio_usage_ratio': 0.2,  # 총평가액 사용 비율 (20%)
+                'min_cash_threshold': 500_000, # 현금 우선 사용 최소 기준 (50만원)
+                'max_portfolio_limit': 3_000_000, # 평가액 기준 최대 제한 (300만원)
+                'default_investment': 1_000_000,   # 기본 투자 금액 (100만원)
+                'min_investment': 200_000,     # 최소 투자 금액 (20만원)
+            },
         }
 
         # ========== 상태 관리 ==========
@@ -839,16 +849,26 @@ class CandleTradeManager:
             current_price = candidate.current_price
             entry_price = candidate.performance.entry_price
 
-            # 손절 체크
-            if current_price <= candidate.risk_management.stop_loss_price:
+            # 🆕 패턴별 설정 가져오기
+            target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(candidate)
+
+            # 손절 체크 (패턴별)
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            if pnl_pct <= -stop_loss_pct:
                 return True
 
-            # 익절 체크
+            # 익절 체크 (패턴별)
+            if pnl_pct >= target_profit_pct:
+                return True
+
+            # 기존 목표가/손절가 도달
+            if current_price <= candidate.risk_management.stop_loss_price:
+                return True
             if current_price >= candidate.risk_management.target_price:
                 return True
 
-            # 시간 청산 체크
-            if self._should_time_exit(candidate):
+            # 시간 청산 체크 (패턴별)
+            if self._should_time_exit_pattern_based(candidate, max_hours):
                 return True
 
             return False
@@ -1268,33 +1288,62 @@ class CandleTradeManager:
                         # 가격 업데이트
                         candidate.update_price(current_price)
 
-                        # 투자 금액 계산
+                        # 💰 투자 금액 계산 (개선된 버전)
                         try:
                             from ..api.kis_market_api import get_account_balance
                             balance_info = get_account_balance()
+
+                            # 🆕 설정값 로드
+                            inv_config = self.config['investment_calculation']
+
                             if balance_info and balance_info.get('total_value', 0) > 0:
-                                # 계좌 평가액의 30%를 기본 투자 금액으로 설정
-                                total_available = int(balance_info['total_value'] * 0.3)
-                                logger.info(f"📊 계좌 평가액 기반 구매 금액: {total_available:,}원 (총 평가액의 30%)")
+                                # 📊 계좌 정보 분석
+                                cash_balance = balance_info.get('cash_balance', 0)  # 현금잔고 (dnca_tot_amt)
+                                total_evaluation = balance_info.get('total_value', 0)  # 총평가액 (tot_evlu_amt)
+
+                                # 🎯 투자 가능 금액 결정 (설정 기반)
+                                # 1순위: 현금잔고 * cash_usage_ratio (실제 매수 가능 현금)
+                                # 2순위: 총평가액 * portfolio_usage_ratio (전체 포트폴리오 규모 기준)
+                                cash_based_amount = int(cash_balance * inv_config['cash_usage_ratio']) if cash_balance > 0 else 0
+                                portfolio_based_amount = int(total_evaluation * inv_config['portfolio_usage_ratio'])
+
+                                # 더 안전한 금액 선택 (현금 우선, 없으면 평가액 기준)
+                                if cash_based_amount >= inv_config['min_cash_threshold']:  # 설정값 기준 현금이 있을 때
+                                    total_available = cash_based_amount
+                                    calculation_method = "현금잔고"
+                                else:
+                                    total_available = min(portfolio_based_amount, inv_config['max_portfolio_limit'])  # 설정값 기준 최대 제한
+                                    calculation_method = "총평가액"
                             else:
                                 # 백업: 기본 투자 금액
-                                total_available = 1_000_000  # 100만원 기본값
+                                total_available = inv_config['default_investment']  # 설정값 사용
+                                calculation_method = "기본값"
                                 logger.warning(f"📊 잔고 조회 실패 - 기본 투자 금액 사용: {total_available:,}원")
+
                         except Exception as e:
                             logger.warning(f"📊 잔고 조회 오류 - 기본 투자 금액 사용: {e}")
-                            total_available = 1_000_000  # 100만원 기본값
+                            inv_config = self.config['investment_calculation']
+                            total_available = inv_config['default_investment']  # 설정값 사용
+                            calculation_method = "오류시기본값"
 
-                        # 포지션 크기에 따른 실제 투자 금액 계산
+                        # 🎯 포지션별 실제 투자 금액 계산
+                        # position_size_pct: 패턴별 포지션 크기 (10~30%, 보통 20%)
                         position_amount = int(total_available * candidate.risk_management.position_size_pct / 100)
+
+                        # 📈 매수 수량 계산 (소수점 이하 버림)
+                        # current_price: 현재 주가 (원)
+                        # quantity: 실제 매수할 주식 수량 (주)
                         quantity = position_amount // current_price
 
-                        if quantity <= 0:
-                            logger.warning(f"❌ {candidate.stock_code}: 계산된 수량이 0 이하 (가용금액: {total_available:,}, 포지션크기: {candidate.risk_management.position_size_pct}%)")
+                        # ✅ 최소 투자 조건 체크
+                        min_investment = inv_config['min_investment']  # 설정값 사용
+                        if quantity <= 0 or position_amount < min_investment:
+                            logger.warning(f"❌ {candidate.stock_code}: 투자조건 미달 - "
+                                         f"가용금액:{total_available:,}원, "
+                                         f"포지션크기:{candidate.risk_management.position_size_pct}%, "
+                                         f"투자금액:{position_amount:,}원, "
+                                         f"수량:{quantity}주 (최소:{min_investment:,}원)")
                             continue
-
-                        logger.info(f"💰 매수 계산 완료: {candidate.stock_code} - 가용금액: {total_available:,}원, "
-                                   f"포지션크기: {candidate.risk_management.position_size_pct}%, "
-                                   f"투자금액: {position_amount:,}원, 수량: {quantity:,}주")
 
                         # 매수 신호 생성
                         signal = {
@@ -1473,40 +1522,42 @@ class CandleTradeManager:
 
             pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
-            # 🎯 3% 수익률 체크 (사용자 요구사항 - 최우선 처리)
-            if pnl_pct >= 3.0:
-                logger.info(f"🎯 {position.stock_code} 3% 수익 달성! 매도 실행 ({pnl_pct:+.2f}%)")
-                success = await self._execute_exit(position, current_price, "3% 수익 달성")
+            # 🆕 캔들 패턴별 설정 결정 (목표, 손절, 시간)
+            target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(position)
+
+            # 🎯 패턴별 수익률 체크 (최우선 처리)
+            if pnl_pct >= target_profit_pct:
+                pattern_info = f" (패턴: {position.metadata.get('original_pattern_type', 'Unknown')})" if pattern_based else " (수동매수)"
+                logger.info(f"🎯 {position.stock_code} {target_profit_pct}% 수익 달성! 매도 실행 ({pnl_pct:+.2f}%){pattern_info}")
+                success = await self._execute_exit(position, current_price, f"{target_profit_pct}% 수익 달성")
                 if success:
-                    logger.info(f"✅ {position.stock_code} 3% 수익 매도 완료")
+                    logger.info(f"✅ {position.stock_code} {target_profit_pct}% 수익 매도 완료")
                 return
 
             # 청산 조건 체크
             exit_reason = None
             should_exit = False
 
-            # 1. 손절 체크
-            if current_price <= position.risk_management.stop_loss_price:
-                exit_reason = "손절"
+            # 1. 🆕 패턴별 손절 체크 (하드코딩 제거)
+            if pnl_pct <= -stop_loss_pct:
+                exit_reason = f"{stop_loss_pct}% 손절"
                 should_exit = True
 
-            # 2. 익절 체크
+            # 2. 기존 목표가/손절가 도달 (RiskManagement 설정)
             elif current_price >= position.risk_management.target_price:
                 exit_reason = "목표가 도달"
                 should_exit = True
-
-            # 3. 기본 손절 조건 (-3% 하락)
-            elif pnl_pct <= -3.0:
-                exit_reason = "기본 손절"
+            elif current_price <= position.risk_management.stop_loss_price:
+                exit_reason = "손절가 도달"
                 should_exit = True
 
-            # 4. 시간 청산 체크
-            elif self._should_time_exit(position):
-                exit_reason = "시간 청산"
+            # 3. 🆕 패턴별 시간 청산 체크 (하드코딩 제거)
+            elif self._should_time_exit_pattern_based(position, max_hours):
+                exit_reason = f"{max_hours}시간 청산"
                 should_exit = True
 
-            # 5. 추적 손절 조정
-            elif pnl_pct > 5:  # 5% 이상 수익시 추적 손절 활성화
+            # 4. 추적 손절 조정 (수익시)
+            elif pnl_pct > 2:  # 2% 이상 수익시 추적 손절 활성화
                 self._update_trailing_stop(position, current_price)
 
             # 청산 실행
@@ -1521,6 +1572,107 @@ class CandleTradeManager:
 
         except Exception as e:
             logger.error(f"개별 포지션 관리 오류 ({position.stock_code}): {e}")
+
+    def _get_pattern_based_target(self, position: CandleTradeCandidate) -> Tuple[float, float, int, bool]:
+        """🎯 캔들 패턴별 수익률 목표, 손절, 시간 설정 결정"""
+        try:
+            # 1. 캔들 전략으로 매수한 종목인지 확인
+            is_candle_strategy = (
+                position.metadata.get('restored_from_db', False) or  # DB에서 복원됨
+                position.metadata.get('original_entry_source') == 'candle_strategy' or  # 캔들 전략 매수
+                len(position.detected_patterns) > 0  # 패턴 정보가 있음
+            )
+
+            if not is_candle_strategy:
+                # 수동/앱 매수 종목: 기본 3% 적용
+                logger.debug(f"📊 {position.stock_code} 수동 매수 종목 - 기본 설정 적용")
+                return 3.0, 3.0, 24, False
+
+            # 2. 원래 패턴 정보 조회
+            original_pattern = None
+
+            # DB에서 복원된 경우
+            if 'original_pattern_type' in position.metadata:
+                original_pattern = position.metadata['original_pattern_type']
+
+            # 현재 패턴 정보 활용
+            elif position.detected_patterns and len(position.detected_patterns) > 0:
+                strongest_pattern = max(position.detected_patterns, key=lambda p: p.strength)
+                original_pattern = strongest_pattern.pattern_type.value
+
+            # 3. 패턴별 목표, 손절, 시간 설정 적용
+            if original_pattern:
+                # 패턴명을 소문자로 변환하여 config에서 조회
+                pattern_key = original_pattern.lower().replace('_', '_')
+                pattern_config = self.config['pattern_targets'].get(pattern_key)
+
+                if pattern_config:
+                    target_pct = pattern_config['target']
+                    stop_pct = pattern_config['stop']
+                    max_hours = pattern_config['max_hours']
+
+                    logger.debug(f"📊 {position.stock_code} 패턴 '{original_pattern}' - "
+                                f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
+                    return target_pct, stop_pct, max_hours, True
+                else:
+                    # 패턴 config에 없으면 패턴 강도에 따라 결정
+                    if position.detected_patterns:
+                        strongest_pattern = max(position.detected_patterns, key=lambda p: p.strength)
+                        if strongest_pattern.strength >= 90:
+                            target_pct, stop_pct, max_hours = 2.5, 1.5, 8  # 매우 강한 패턴
+                        elif strongest_pattern.strength >= 80:
+                            target_pct, stop_pct, max_hours = 2.0, 1.5, 6  # 강한 패턴
+                        elif strongest_pattern.strength >= 70:
+                            target_pct, stop_pct, max_hours = 1.5, 1.5, 4  # 중간 패턴
+                        else:
+                            target_pct, stop_pct, max_hours = 1.0, 1.0, 2  # 약한 패턴
+
+                        logger.debug(f"📊 {position.stock_code} 패턴 강도 {strongest_pattern.strength} - "
+                                    f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
+                        return target_pct, stop_pct, max_hours, True
+
+            # 4. 기본값: 캔들 전략이지만 패턴 정보 없음
+            logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용")
+            return 2.0, 1.5, 6, True
+
+        except Exception as e:
+            logger.error(f"패턴별 설정 결정 오류 ({position.stock_code}): {e}")
+            # 오류시 안전하게 기본값 반환
+            return 3.0, 3.0, 24, False
+
+    def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
+        """🆕 패턴별 시간 청산 조건 체크"""
+        try:
+            if not position.performance.entry_time:
+                return False
+
+            # 보유 시간 계산
+            holding_time = datetime.now() - position.performance.entry_time
+            max_holding = timedelta(hours=max_hours)
+
+            # 패턴별 최대 보유시간 초과시 청산
+            if holding_time >= max_holding:
+                logger.info(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_time}")
+                return True
+
+            # 새로운 시간 기반 청산 규칙 적용 (선택적)
+            time_rules = self.config.get('time_exit_rules', {})
+
+            # 수익 중 시간 청산 (패턴별 시간의 절반 후)
+            profit_exit_hours = max_hours // 2  # 패턴별 시간의 절반
+            min_profit = time_rules.get('min_profit_for_time_exit', 0.5) / 100
+
+            if (holding_time >= timedelta(hours=profit_exit_hours) and
+                position.performance.pnl_pct and
+                position.performance.pnl_pct >= min_profit):
+                logger.info(f"⏰ {position.stock_code} 패턴별 시간 기반 수익 청산: {holding_time}")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"패턴별 시간 청산 체크 오류: {e}")
+            return False
 
     async def _execute_exit(self, position: CandleTradeCandidate, exit_price: float, reason: str) -> bool:
         """매도 청산 실행"""
@@ -2270,16 +2422,19 @@ class CandleTradeManager:
             should_exit = False
             exit_reasons = []
 
-            # 1. 수익률 기반 매도
+            # 🆕 패턴별 설정 가져오기
+            target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(candidate)
+
+            # 1. 수익률 기반 매도 (패턴별 설정 사용)
             if candidate.performance.entry_price:
                 pnl_pct = ((current_price - candidate.performance.entry_price) / candidate.performance.entry_price) * 100
 
-                if pnl_pct >= 3.0:
+                if pnl_pct >= target_profit_pct:
                     should_exit = True
-                    exit_reasons.append('3% 수익 달성')
-                elif pnl_pct <= -3.0:
+                    exit_reasons.append(f'{target_profit_pct}% 수익 달성')
+                elif pnl_pct <= -stop_loss_pct:
                     should_exit = True
-                    exit_reasons.append('3% 손절')
+                    exit_reasons.append(f'{stop_loss_pct}% 손절')
 
             # 2. 목표가/손절가 도달
             if current_price >= candidate.risk_management.target_price:
@@ -2289,10 +2444,10 @@ class CandleTradeManager:
                 should_exit = True
                 exit_reasons.append('손절가 도달')
 
-            # 3. 시간 청산
-            if self._should_time_exit(candidate):
+            # 3. 시간 청산 (패턴별)
+            if self._should_time_exit_pattern_based(candidate, max_hours):
                 should_exit = True
-                exit_reasons.append('시간 청산')
+                exit_reasons.append(f'{max_hours}시간 청산')
 
             signal = 'strong_sell' if should_exit else 'hold'
 
