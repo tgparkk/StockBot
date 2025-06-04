@@ -6,19 +6,19 @@ StockBot Core 모듈들
 기존 import 호환성을 100% 유지하면서 새로운 폴더 구조도 지원합니다.
 """
 
-# 🔄 새로운 폴더 구조에서 직접 import
-from .websocket.kis_websocket_manager import KISWebSocketManager
-from .trading.trading_manager import TradingManager
-from .trading.position_manager import PositionManager
-from .trading.trade_executor import TradeExecutor, TradeConfig
-from .trading.trade_database import TradeDatabase
-from .strategy.candle_trade_manager import CandleTradeManager
-from .strategy.candle_stock_manager import CandleStockManager
-from .strategy.candle_pattern_detector import CandlePatternDetector
+# 🔄 순환 import 방지를 위한 import 순서 조정 (의존성 순서대로)
 from .api.rest_api_manager import KISRestAPIManager
+from .data.data_priority import DataPriority
 from .data.kis_data_collector import KISDataCollector
 from .data.hybrid_data_manager import SimpleHybridDataManager
-from .data.data_priority import DataPriority
+from .trading.trade_database import TradeDatabase
+from .trading.trade_executor import TradeExecutor, TradeConfig
+from .strategy.candle_pattern_detector import CandlePatternDetector
+from .strategy.candle_stock_manager import CandleStockManager
+from .websocket.kis_websocket_manager import KISWebSocketManager
+from .trading.position_manager import PositionManager
+from .trading.trading_manager import TradingManager  # 의존성이 많으므로 나중에
+from .strategy.candle_trade_manager import CandleTradeManager  # TradingManager 이후
 from .system.worker_manager import WorkerManager
 
 # 🔄 기존 호환성을 위한 직접 export (main.py 등에서 사용)

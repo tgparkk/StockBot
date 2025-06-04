@@ -3,11 +3,14 @@
 """
 import time
 import threading
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from utils.logger import setup_logger
 from ..data.kis_data_collector import KISDataCollector
-from .trading_manager import TradingManager
 from ..api.kis_market_api import get_disparity_rank, get_multi_period_disparity, get_inquire_price
+
+# TYPE_CHECKING을 사용하여 순환 import 방지
+if TYPE_CHECKING:
+    from .trading_manager import TradingManager
 
 logger = setup_logger(__name__)
 
@@ -15,7 +18,7 @@ logger = setup_logger(__name__)
 class PositionManager:
     """간소화된 포지션 관리자"""
 
-    def __init__(self, trading_manager: TradingManager, data_collector: KISDataCollector):
+    def __init__(self, trading_manager: 'TradingManager', data_collector: KISDataCollector):
         """초기화"""
         self.trading_manager = trading_manager
         self.data_collector = trading_manager.data_collector
@@ -442,7 +445,7 @@ class PositionManager:
         if not force_rest_api:
             # 🔧 _check_websocket_connection 메서드 대신 직접 확인
             try:
-                if (hasattr(self.data_collector, 'websocket') and 
+                if (hasattr(self.data_collector, 'websocket') and
                     self.data_collector.websocket):
                     websocket_manager = self.data_collector.websocket
                     websocket_available = getattr(websocket_manager, 'is_connected', False)
@@ -489,12 +492,12 @@ class PositionManager:
         # 🔧 로그 빈도 제한 (15분마다 한번만)
         if not hasattr(self, '_last_rest_api_log'):
             self._last_rest_api_log = 0
-            
+
         if current_time - self._last_rest_api_log > 900:  # 15분마다
             reason = "강제 모드" if force_rest_api else "웹소켓 연결불가"
             logger.info(f"💾 REST API 백업 사용: {reason}")
             self._last_rest_api_log = current_time
-            
+
         self._update_prices_via_rest_api()
 
     def _update_prices_via_rest_api(self):
@@ -583,7 +586,7 @@ class PositionManager:
                             except Exception as e:
                                 logger.debug(f"웹소켓 간소화 재연결 실패: {e}")
                                 return False
-                        
+
                         return False
                     else:
                         logger.debug("웹소켓이 이미 연결되어 있음")
@@ -707,12 +710,12 @@ class PositionManager:
 
             # 2. 활성 포지션들의 매도 조건 확인
             active_positions = self.get_positions('active')
-            
+
             for stock_code, position in active_positions.items():
                 try:
                     # 🔧 통합된 매도 조건 확인 (기본 + 이격도 조건 모두 포함)
                     sell_signal = self._check_position_exit_conditions(position)
-                    
+
                     if sell_signal:
                         sell_signals.append(sell_signal)
                         logger.info(f"💡 매도 신호 생성: {stock_code} - {sell_signal['reason']}")
@@ -722,7 +725,7 @@ class PositionManager:
 
             if sell_signals:
                 logger.info(f"📊 총 {len(sell_signals)}개 매도 신호 생성됨")
-            
+
             return sell_signals
 
         except Exception as e:
@@ -750,7 +753,7 @@ class PositionManager:
         if disparity_signal:
             optimal_sell_price = disparity_signal.get('suggested_price', current_price)
             logger.info(f"🎯 이격도 매도 신호: {stock_code} - {disparity_signal['reason']}")
-            
+
             return {
                 'stock_code': stock_code,
                 'quantity': position['quantity'],
@@ -894,7 +897,7 @@ class PositionManager:
                 from ..api.kis_market_api import get_disparity_rank
                 disparity_data = get_disparity_rank(
                     fid_input_iscd="0000",      # 전체 시장
-                    fid_hour_cls_code="20",     # 20일 이격도  
+                    fid_hour_cls_code="20",     # 20일 이격도
                     fid_vol_cnt="5000"          # 거래량 5천주 이상
                 )
 
@@ -1247,7 +1250,7 @@ class PositionManager:
                 from ..api.kis_market_api import get_disparity_rank
                 disparity_data = get_disparity_rank(
                     fid_input_iscd="0000",      # 전체 시장
-                    fid_hour_cls_code="20",     # 20일 이격도  
+                    fid_hour_cls_code="20",     # 20일 이격도
                     fid_vol_cnt="5000"          # 거래량 5천주 이상
                 )
 
@@ -1546,17 +1549,17 @@ class PositionManager:
         """🔧 실제 계좌와 포지션 동기화"""
         try:
             logger.info("📊 계좌-포지션 동기화 시작...")
-            
+
             # 실제 계좌 잔고 조회
             balance = self.trading_manager.get_balance()
             if not balance or not balance.get('success'):
                 error_msg = f"계좌 조회 실패: {balance}"
                 logger.error(f"❌ {error_msg}")
                 return {'success': False, 'error': error_msg}
-            
+
             account_holdings = balance.get('holdings', [])
             logger.info(f"📊 계좌 보유 종목: {len(account_holdings)}개")
-            
+
             # 포지션과 계좌 비교
             sync_result = {
                 'success': True,
@@ -1567,15 +1570,15 @@ class PositionManager:
                 'missing_in_positions': [],
                 'errors': []
             }
-            
+
             # 🔍 1. 포지션 매니저의 종목들을 계좌와 비교
             with self.position_lock:
                 active_positions = self.get_positions('active')
-                
+
                 for stock_code, position in active_positions.items():
                     sync_result['total_checked'] += 1
                     position_quantity = position['quantity']
-                    
+
                     # 계좌에서 해당 종목 찾기
                     account_quantity = 0
                     for holding in account_holdings:
@@ -1593,11 +1596,11 @@ class PositionManager:
                                 break
                         if account_quantity > 0:
                             break
-                    
+
                     # 수량 비교 및 조정
                     if account_quantity != position_quantity:
                         logger.warning(f"⚠️ 수량 불일치 발견: {stock_code} - 포지션={position_quantity:,}주, 계좌={account_quantity:,}주")
-                        
+
                         if account_quantity == 0:
                             # 계좌에 없는 종목 - 포지션에서 제거
                             try:
@@ -1617,29 +1620,29 @@ class PositionManager:
                                 old_quantity = self.positions[stock_code]['quantity']
                                 self.positions[stock_code]['quantity'] = account_quantity
                                 self.positions[stock_code]['last_update'] = time.time()
-                                
+
                                 sync_result['quantity_adjustments'].append({
                                     'stock_code': stock_code,
                                     'old_quantity': old_quantity,
                                     'new_quantity': account_quantity,
                                     'adjustment': account_quantity - old_quantity
                                 })
-                                
+
                                 logger.info(f"🔧 수량 조정: {stock_code} {old_quantity:,}주 → {account_quantity:,}주")
                                 sync_result['synced_count'] += 1
-                                
+
                             except Exception as e:
                                 sync_result['errors'].append(f"수량 조정 실패: {stock_code} - {e}")
                     else:
                         # 수량 일치
                         logger.debug(f"✅ 수량 일치: {stock_code} = {position_quantity:,}주")
                         sync_result['synced_count'] += 1
-                
+
                 # 🔍 2. 계좌에만 있고 포지션에 없는 종목들 확인
                 for holding in account_holdings:
                     found_stock_code = None
                     holding_quantity = 0
-                    
+
                     # 종목코드 찾기
                     for field in ['pdno', 'stock_code', 'stck_shrn_iscd', 'mksc_shrn_iscd']:
                         if field in holding:
@@ -1647,7 +1650,7 @@ class PositionManager:
                             if code_value and len(code_value) == 6:  # 6자리 종목코드
                                 found_stock_code = code_value
                                 break
-                    
+
                     # 수량 찾기
                     if found_stock_code:
                         for qty_field in ['hldg_qty', 'quantity', 'ord_psbl_qty', 'available_quantity']:
@@ -1657,7 +1660,7 @@ class PositionManager:
                                     break
                                 except (ValueError, TypeError):
                                     continue
-                    
+
                     # 포지션에 없는 종목 확인
                     if found_stock_code and holding_quantity > 0:
                         if found_stock_code not in active_positions:
@@ -1667,10 +1670,10 @@ class PositionManager:
                                 'reason': '포지션 매니저에 없는 보유 종목'
                             })
                             logger.warning(f"⚠️ 포지션 누락 발견: {found_stock_code} {holding_quantity:,}주 (계좌에만 존재)")
-            
+
             # 통계 업데이트
             self.stats['active_positions'] = len([p for p in self.positions.values() if p['status'] == 'active'])
-            
+
             # 결과 로깅
             logger.info(f"✅ 계좌-포지션 동기화 완료:")
             logger.info(f"   - 확인된 종목: {sync_result['total_checked']}개")
@@ -1678,14 +1681,14 @@ class PositionManager:
             logger.info(f"   - 수량 조정: {len(sync_result['quantity_adjustments'])}개")
             logger.info(f"   - 제거된 포지션: {len(sync_result['removed_positions'])}개")
             logger.info(f"   - 누락된 포지션: {len(sync_result['missing_in_positions'])}개")
-            
+
             if sync_result['errors']:
                 logger.warning(f"   - 오류: {len(sync_result['errors'])}개")
                 for error in sync_result['errors']:
                     logger.warning(f"     {error}")
-            
+
             return sync_result
-            
+
         except Exception as e:
             error_msg = f"계좌-포지션 동기화 오류: {e}"
             logger.error(f"❌ {error_msg}")
