@@ -599,8 +599,8 @@ class SimpleHybridDataManager:
                 self._cleanup_websocket()
                 time.sleep(1)  # 잠시 대기
 
-            # 웹소켓 연결 시작 (최대 3회 재시도)
-            max_retries = 3
+            # 웹소켓 연결 시작 (최대 1회 재시도)
+            max_retries = 1
             for attempt in range(1, max_retries + 1):
                 try:
                     logger.info(f"🔄 웹소켓 연결 시도 {attempt}/{max_retries}...")
@@ -611,7 +611,7 @@ class SimpleHybridDataManager:
                         logger.info(f"✅ 웹소켓 연결 성공 (시도 {attempt}/{max_retries})")
 
                         # 연결 확인 대기
-                        time.sleep(2)
+                        time.sleep(1)
 
                         # 실제 연결 상태 재확인
                         if getattr(self.websocket_manager, 'is_connected', False):
@@ -620,18 +620,18 @@ class SimpleHybridDataManager:
                         else:
                             logger.warning(f"⚠️ 웹소켓 연결 확인 실패 (시도 {attempt}/{max_retries})")
                             if attempt < max_retries:
-                                time.sleep(2)  # 재시도 전 대기
+                                time.sleep(1)  # 재시도 전 대기
                                 continue
                     else:
                         logger.warning(f"⚠️ 웹소켓 연결 실패 (시도 {attempt}/{max_retries})")
                         if attempt < max_retries:
-                            time.sleep(3)  # 재시도 전 대기
+                            time.sleep(1)  # 재시도 전 대기
                             continue
 
                 except Exception as e:
                     logger.error(f"❌ 웹소켓 연결 시도 {attempt} 오류: {e}")
                     if attempt < max_retries:
-                        time.sleep(3)  # 재시도 전 대기
+                        time.sleep(1)  # 재시도 전 대기
                         continue
 
             # 모든 시도 실패
@@ -800,18 +800,18 @@ class SimpleHybridDataManager:
                 try:
                     import inspect
                     callback = subscription['callback']
-                    
+
                     # 콜백 함수의 파라미터 개수 확인
                     sig = inspect.signature(callback)
                     param_count = len(sig.parameters)
-                    
+
                     if param_count >= 3:
                         # 새로운 형식: callback(data_type, stock_code, data)
                         callback('stock_price', stock_code, data)
                     else:
                         # 기존 형식: callback(stock_code, data)
                         callback(stock_code, data)
-                        
+
                 except Exception as e:
                     logger.error(f"사용자 콜백 오류: {stock_code} - {e}")
 

@@ -387,7 +387,7 @@ class KISDataCollector:
                             import inspect
                             sig = inspect.signature(callback)
                             param_count = len(sig.parameters)
-                            
+
                             if param_count >= 3:
                                 # 새로운 형식: callback(data_type, stock_code, data)
                                 callback(data_type, stock_code, data)

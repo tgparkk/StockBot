@@ -1048,36 +1048,27 @@ class TradeExecutor:
         try:
             logger.debug(f"📊 상하한가 정보 조회 시작: {stock_code}")
 
-            # KIS API에서 현재가 정보 조회 (상하한가 포함)
-            current_data = self.data_manager.get_latest_data(stock_code)
+            from ..api.kis_market_api import get_inquire_price
+            price_data = get_inquire_price("J", stock_code)
 
-            if not current_data or current_data.get('status') != 'success':
-                logger.warning(f"⚠️ 가격 정보 조회 실패, 기본값 사용: {stock_code}")
-                return self._get_fallback_price_limits(current_price)
+            if price_data is not None and not price_data.empty:
+                stock_info = price_data.iloc[0]
+                # KIS API 응답에서 상하한가 정보 추출
+                base_price = int(stock_info.get('stck_sdpr', 0))      # 기준가(전일종가)
+                upper_limit = int(stock_info.get('stck_mxpr', 0))     # 상한가
+                lower_limit = int(stock_info.get('stck_llam', 0))     # 하한가
+            else:
+                logger.warning(f"⚠️ KIS API 상하한가 조회 실패: {stock_code}")
+                base_price = upper_limit = lower_limit = 0
 
-            # KIS API 응답에서 상하한가 정보 추출
-            data = current_data.get('data', {})
-
-            # 다양한 필드명 확인
-            base_price = self._extract_field(data, ['prdy_clpr', 'base_price', 'previous_close'])
-            upper_limit = self._extract_field(data, ['stck_hgpr', 'upper_limit', 'high_limit'])
-            lower_limit = self._extract_field(data, ['stck_lwpr', 'lower_limit', 'low_limit'])
-
-            # 값 검증 및 변환
-            try:
-                if base_price:
-                    base_price = int(base_price)
-                if upper_limit:
-                    upper_limit = int(upper_limit)
-                if lower_limit:
-                    lower_limit = int(lower_limit)
-            except (ValueError, TypeError):
-                logger.warning(f"⚠️ 상하한가 값 변환 실패: {stock_code}")
+            # 값 검증 (이미 int로 변환됨)
+            if not all([base_price > 0, upper_limit > 0, lower_limit > 0]):
+                logger.warning(f"⚠️ 상하한가 값 유효하지 않음: {stock_code} - base:{base_price}, upper:{upper_limit}, lower:{lower_limit}")
                 return self._get_fallback_price_limits(current_price)
 
             # 상하한가가 직접 제공되는 경우
             if upper_limit and lower_limit and upper_limit > 0 and lower_limit > 0:
-                logger.debug(f"✅ API에서 상하한가 직접 조회: {stock_code} - 상한가:{upper_limit:,}원, 하한가:{lower_limit:,}원")
+                #logger.debug(f"✅ API에서 상하한가 직접 조회: {stock_code} - 상한가:{upper_limit:,}원, 하한가:{lower_limit:,}원")
                 return {
                     'base_price': base_price or current_price,
                     'upper_limit': upper_limit,
@@ -1085,37 +1076,10 @@ class TradeExecutor:
                     'source': 'api_direct'
                 }
 
-            # 전일 종가만 제공되는 경우 계산
-            elif base_price and base_price > 0:
-                calculated_upper = int(base_price * 1.30)
-                calculated_lower = int(base_price * 0.70)
-
-                # 호가 단위로 조정
-                calculated_upper = self._adjust_to_tick_size(calculated_upper)
-                calculated_lower = self._adjust_to_tick_size(calculated_lower)
-
-                logger.debug(f"✅ 전일종가 기준 계산: {stock_code} - 기준가:{base_price:,}원, 상한가:{calculated_upper:,}원")
-                return {
-                    'base_price': base_price,
-                    'upper_limit': calculated_upper,
-                    'lower_limit': calculated_lower,
-                    'source': 'calculated'
-                }
-
-            else:
-                logger.warning(f"⚠️ 상하한가 정보 부족, 기본값 사용: {stock_code}")
-                return self._get_fallback_price_limits(current_price)
-
         except Exception as e:
             logger.error(f"❌ 상하한가 조회 오류: {stock_code} - {e}")
             return self._get_fallback_price_limits(current_price)
 
-    def _extract_field(self, data: Dict, field_names: List[str]) -> Any:
-        """딕셔너리에서 여러 필드명 중 하나를 찾아 반환"""
-        for field in field_names:
-            if field in data and data[field] is not None:
-                return data[field]
-        return None
 
     def _get_fallback_price_limits(self, current_price: int) -> Dict:
         """🔧 상하한가 조회 실패시 백업 계산"""
