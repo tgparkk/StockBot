@@ -1935,14 +1935,23 @@ class CandleTradeManager:
     def _update_trailing_stop(self, position: CandleTradeCandidate, current_price: float):
         """🔄 패턴 기반 동적 목표/손절 조정 시스템 (개선된 버전)"""
         try:
-            # 🆕 1단계: 실시간 캔들 패턴 재분석
-            pattern_update = self._analyze_realtime_pattern_changes(position.stock_code, current_price)
+            # 🆕 OHLCV 데이터 한 번만 조회하여 재사용
+            from ..api.kis_market_api import get_inquire_daily_itemchartprice
+            ohlcv_data = get_inquire_daily_itemchartprice(
+                output_dv="2",
+                itm_no=position.stock_code,
+                period_code="D",
+                adj_prc="1"
+            )
+
+            # 🆕 1단계: 실시간 캔들 패턴 재분석 (OHLCV 데이터 전달)
+            pattern_update = self._analyze_realtime_pattern_changes(position.stock_code, current_price, ohlcv_data)
 
             # 🆕 2단계: 수익률 기반 동적 조정
             profit_based_update = self._calculate_profit_based_adjustments(position, current_price)
 
-            # 🆕 3단계: 추세 강도 기반 조정
-            trend_based_update = self._calculate_trend_based_adjustments(position, current_price)
+            # 🆕 3단계: 추세 강도 기반 조정 (OHLCV 데이터 전달)
+            trend_based_update = self._calculate_trend_based_adjustments(position, current_price, ohlcv_data)
 
             # 🆕 4단계: 종합 판단 및 업데이트
             self._apply_dynamic_adjustments(position, current_price, pattern_update, profit_based_update, trend_based_update)
@@ -1952,18 +1961,18 @@ class CandleTradeManager:
             # 기존 방식으로 폴백
             self._fallback_trailing_stop(position, current_price)
 
-    def _analyze_realtime_pattern_changes(self, stock_code: str, current_price: float) -> Dict:
+    def _analyze_realtime_pattern_changes(self, stock_code: str, current_price: float, ohlcv_data: Optional[Any] = None) -> Dict:
         """🔄 실시간 캔들 패턴 변화 분석"""
         try:
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-
-            # 최신 OHLCV 데이터 조회 (최근 20일)
-            ohlcv_data = get_inquire_daily_itemchartprice(
-                output_dv="2",
-                itm_no=stock_code,
-                period_code="D",
-                adj_prc="1"
-            )
+            # OHLCV 데이터가 전달되지 않은 경우에만 새로 조회
+            if ohlcv_data is None:
+                from ..api.kis_market_api import get_inquire_daily_itemchartprice
+                ohlcv_data = get_inquire_daily_itemchartprice(
+                    output_dv="2",
+                    itm_no=stock_code,
+                    period_code="D",
+                    adj_prc="1"
+                )
 
             if ohlcv_data is None or ohlcv_data.empty:
                 return {'pattern_strength_changed': False, 'new_patterns': []}
@@ -2042,17 +2051,19 @@ class CandleTradeManager:
             logger.debug(f"수익률 기반 조정 계산 오류: {e}")
             return {'target_multiplier': 1.0, 'stop_tightening': 1.0}
 
-    def _calculate_trend_based_adjustments(self, position: CandleTradeCandidate, current_price: float) -> Dict:
+    def _calculate_trend_based_adjustments(self, position: CandleTradeCandidate, current_price: float, ohlcv_data: Optional[Any] = None) -> Dict:
         """📈 추세 강도 기반 조정 계산"""
         try:
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-
-            # 최근 5일 가격 추세 분석
-            daily_data = get_inquire_daily_itemchartprice(
-                output_dv="2",
-                itm_no=position.stock_code,
-                period_code="D"
-            )
+            # OHLCV 데이터가 전달되지 않은 경우에만 새로 조회
+            if ohlcv_data is None:
+                from ..api.kis_market_api import get_inquire_daily_itemchartprice
+                daily_data = get_inquire_daily_itemchartprice(
+                    output_dv="2",
+                    itm_no=position.stock_code,
+                    period_code="D"
+                )
+            else:
+                daily_data = ohlcv_data
 
             if daily_data is None or daily_data.empty or len(daily_data) < 5:
                 return {'trend_strength': 'NEUTRAL', 'trend_multiplier': 1.0}
@@ -2568,11 +2579,20 @@ class CandleTradeManager:
             old_price = candidate.current_price
             candidate.update_price(current_price)
 
-            # 2. 📊 최신 캔들 패턴 재분석
-            pattern_signals = await self._analyze_current_patterns(stock_code, current_price)
+            # 🆕 OHLCV 데이터 한 번만 조회 (하위 함수들에서 공유 사용)
+            from ..api.kis_market_api import get_inquire_daily_itemchartprice
+            ohlcv_data = get_inquire_daily_itemchartprice(
+                output_dv="2",
+                itm_no=stock_code,
+                period_code="D",
+                adj_prc="1"
+            )
 
-            # 3. 📈 기술적 지표 분석
-            technical_signals = await self._analyze_technical_indicators(stock_code, current_price)
+            # 2. 📊 최신 캔들 패턴 재분석 (OHLCV 데이터 전달)
+            pattern_signals = await self._analyze_current_patterns(stock_code, current_price, ohlcv_data)
+
+            # 3. 📈 기술적 지표 분석 (OHLCV 데이터 전달)
+            technical_signals = await self._analyze_technical_indicators(stock_code, current_price, ohlcv_data)
 
             # 4. ⏰ 시간 기반 조건 분석
             time_signals = self._analyze_time_conditions(candidate)
@@ -2582,7 +2602,7 @@ class CandleTradeManager:
 
             # 6. 🎯 포지션 상태별 특화 분석
             if focus_on_exit:
-                position_signals = self._analyze_exit_conditions(candidate, current_price)
+                position_signals = self._analyze_exit_conditions(candidate, current_price, ohlcv_data)
             else:
                 position_signals = self._analyze_entry_conditions_simple(candidate, current_price)
 
@@ -2608,18 +2628,10 @@ class CandleTradeManager:
             logger.debug(f"종합 신호 분석 오류 ({candidate.stock_code}): {e}")
             return None
 
-    async def _analyze_current_patterns(self, stock_code: str, current_price: float) -> Dict:
+    async def _analyze_current_patterns(self, stock_code: str, current_price: float, ohlcv_data: Optional[Any]) -> Dict:
         """📊 최신 캔들 패턴 분석"""
         try:
-            # 최신 OHLCV 데이터 조회
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            ohlcv_data = get_inquire_daily_itemchartprice(
-                output_dv="2",
-                itm_no=stock_code,
-                period_code="D",
-                adj_prc="1"
-            )
-
+            # 전달받은 OHLCV 데이터 사용
             if ohlcv_data is None or ohlcv_data.empty:
                 return {'signal': 'neutral', 'strength': 0, 'patterns': []}
 
@@ -2653,23 +2665,16 @@ class CandleTradeManager:
             logger.debug(f"패턴 분석 오류 ({stock_code}): {e}")
             return {'signal': 'neutral', 'strength': 0, 'patterns': []}
 
-    async def _analyze_technical_indicators(self, stock_code: str, current_price: float) -> Dict:
+    async def _analyze_technical_indicators(self, stock_code: str, current_price: float, ohlcv_data: Optional[Any]) -> Dict:
         """📈 기술적 지표 분석"""
         try:
-            # 일봉 데이터로 기술적 지표 계산
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            daily_data = get_inquire_daily_itemchartprice(
-                output_dv="2",
-                itm_no=stock_code,
-                period_code="D"
-            )
-
-            if daily_data is None or daily_data.empty or len(daily_data) < 20:
+            # 전달받은 OHLCV 데이터 사용
+            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 20:
                 return {'signal': 'neutral', 'rsi': 50.0, 'trend': 'neutral'}
 
             # 종가 데이터 추출
             close_prices = []
-            for _, row in daily_data.head(20).iterrows():  # 최근 20일
+            for _, row in ohlcv_data.head(20).iterrows():  # 최근 20일
                 try:
                     close_price = float(row.get('stck_clpr', 0))
                     if close_price > 0:
@@ -2817,7 +2822,7 @@ class CandleTradeManager:
             logger.debug(f"리스크 조건 분석 오류: {e}")
             return {'signal': 'neutral', 'risk_level': 'medium'}
 
-    def _analyze_exit_conditions(self, candidate: CandleTradeCandidate, current_price: float) -> Dict:
+    def _analyze_exit_conditions(self, candidate: CandleTradeCandidate, current_price: float, ohlcv_data: Optional[Any] = None) -> Dict:
         """🎯 매도 조건 분석 (진입한 종목용)"""
         try:
             # 기본 매도 조건들
