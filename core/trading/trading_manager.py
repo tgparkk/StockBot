@@ -182,9 +182,11 @@ class TradingManager:
 
                 # KIS API 응답 구조에 맞게 매핑
                 total_evaluation = int(summary.get('tot_evlu_amt', 0))        # 총평가금액
-                available_cash = int(summary.get('nxdy_excc_amt', 0))        # 익일정산금액(가용현금)
+                available_cash = int(summary.get('prvs_rcdl_excc_amt', 0))        # 익일정산금액(가용현금)
                 stock_evaluation = int(summary.get('scts_evlu_amt', 0))      # 유가증권평가금액
                 profit_loss = int(summary.get('evlu_pfls_smtl_amt', 0))      # 평가손익합계금액
+
+                #cash_balance = int(summary.get('dnca_tot_amt', 0))
 
                 logger.debug(f"잔고 조회 결과: 총평가={total_evaluation:,}원, 가용현금={available_cash:,}원, 주식평가={stock_evaluation:,}원")
 
