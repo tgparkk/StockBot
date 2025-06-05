@@ -6,7 +6,7 @@ import threading
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from utils.logger import setup_logger
 from ..data.kis_data_collector import KISDataCollector
-from ..api.kis_market_api import get_disparity_rank, get_multi_period_disparity, get_inquire_price
+from ..api.kis_market_api import get_disparity_rank, get_inquire_price
 
 # TYPE_CHECKING을 사용하여 순환 import 방지
 if TYPE_CHECKING:

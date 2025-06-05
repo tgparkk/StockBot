@@ -6,7 +6,7 @@ import time
 import threading
 from typing import Dict, List, Optional, Any
 from utils.logger import setup_logger
-from ..api.kis_market_api import get_disparity_rank, get_multi_period_disparity
+from ..api.kis_market_api import get_disparity_rank
 from dataclasses import dataclass, field
 from datetime import datetime
 from .async_data_logger import get_async_logger, log_signal_failed, log_buy_failed, log_buy_success
