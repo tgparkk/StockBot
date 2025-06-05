@@ -306,12 +306,9 @@ class StockBot:
 
         # 관리자들 정리
         try:
-            # 시스템 정리 (새로운 캔들 시스템만 정리)
-            if hasattr(self, 'candle_trade_manager'):
-                self.candle_trade_manager.stop_trading()
+            self.candle_trade_manager.stop_trading()
+            self.trading_manager.cleanup()
 
-            if hasattr(self, 'trading_manager') and hasattr(self.trading_manager, 'cleanup'):
-                self.trading_manager.cleanup()
             logger.info("✅ 모든 관리자 정리 완료")
         except Exception as e:
             logger.error(f"❌ 관리자 정리 오류: {e}")

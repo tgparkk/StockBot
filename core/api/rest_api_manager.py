@@ -15,8 +15,7 @@ from . import kis_order_api as order_api
 from . import kis_account_api as account_api
 from . import kis_market_api as market_api
 from .kis_market_api import (
-    get_gap_trading_candidates, get_volume_breakout_candidates, get_momentum_candidates,
-    get_fluctuation_rank, get_volume_rank, get_volume_power_rank
+    get_fluctuation_rank, get_volume_rank
 )
 
 # 데이터 모델은 필요할 때 지연 import (순환 import 방지)

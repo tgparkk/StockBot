@@ -3,7 +3,7 @@
 """
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from core.api.rest_api_manager import KISRestAPIManager
 from utils.logger import setup_logger
@@ -84,7 +84,7 @@ class CandleTradeManager:
 
             # 리스크 관리 설정
             'max_position_size_pct': 30,       # 최대 포지션 크기 (%)
-            'default_stop_loss_pct': 2,        # 기본 손절 비율 (%) - 2%로 조정
+            'default_stop_loss_pct': 1.8,      # 기본 손절 비율 (%) - 1.8%로 더 빠른 손절
             'default_target_profit_pct': 3,    # 기본 목표 수익률 (%) - 3%로 조정 (현실적)
             'max_holding_hours': 6,            # 최대 보유 시간 - 6시간으로 조정 (단기 트레이딩)
 
@@ -92,7 +92,7 @@ class CandleTradeManager:
             'pattern_targets': {
                 'hammer': {'target': 1.5, 'stop': 1.5, 'max_hours': 4},           # 망치형: 4시간
                 'inverted_hammer': {'target': 1.2, 'stop': 1.5, 'max_hours': 4},  # 역망치형: 4시간
-                'bullish_engulfing': {'target': 2.0, 'stop': 1.5, 'max_hours': 6}, # 장악형: 6시간
+                'bullish_engulfing': {'target': 1.8, 'stop': 1.2, 'max_hours': 4}, # 장악형: 더 보수적 기준
                 'morning_star': {'target': 2.5, 'stop': 1.5, 'max_hours': 8},     # 샛별형: 8시간 (최강, 조금 길게)
                 'rising_three': {'target': 3.0, 'stop': 2.0, 'max_hours': 12},    # 삼법형: 12시간 (지속성 패턴)
                 'doji': {'target': 1.0, 'stop': 1.0, 'max_hours': 2},             # 도지: 2시간 (신중, 빠른 결정)
@@ -130,6 +130,9 @@ class CandleTradeManager:
 
         # 🆕 웹소켓 구독 상태 관리
         self.subscribed_stocks = set()
+
+        # 한국 시간대 설정 추가
+        self.korea_tz = timezone(timedelta(hours=9))
 
         logger.info("✅ CandleTradeManager 초기화 완료")
 
@@ -257,9 +260,6 @@ class CandleTradeManager:
                             # 🆕 PerformanceTracking의 entry_price 명시적 설정
                             existing_candidate.performance.entry_price = float(buy_price)
 
-                            # 🆕 PerformanceTracking 정상 계산 확인을 위한 추가 update_price 호출
-                            existing_candidate.update_price(float(current_price))
-
                             # 🆕 RiskManagement 설정 - DB 데이터 우선, 없으면 기본값
                             from .candle_trade_candidate import RiskManagement
 
@@ -271,7 +271,7 @@ class CandleTradeManager:
                                 # 🎯 캔들 패턴 분석 성공: 패턴별 설정 사용
                                 patterns = candle_analysis_result['patterns']
                                 strongest_pattern = candle_analysis_result['strongest_pattern']
-                                
+
                                 logger.info(f"🔄 {stock_code} 실시간 캔들 패턴 감지: {strongest_pattern['type']} (강도: {strongest_pattern['strength']})")
 
                                 # 패턴별 목표/손절 설정 적용
@@ -301,7 +301,7 @@ class CandleTradeManager:
                                 existing_candidate.metadata['original_pattern_type'] = strongest_pattern['type']
                                 existing_candidate.metadata['original_pattern_strength'] = strongest_pattern['strength']
                                 existing_candidate.metadata['pattern_confidence'] = strongest_pattern['confidence']
-                                
+
                                 # 감지된 패턴 정보 추가
                                 for pattern in patterns:
                                     existing_candidate.add_pattern(pattern)
@@ -928,8 +928,8 @@ class CandleTradeManager:
                         rsi_values = TechnicalIndicators.calculate_rsi(close_prices)
                         current_rsi = rsi_values[-1] if rsi_values else 50.0
 
-                        # 과매수 구간(70 이상) 체크
-                        conditions.rsi_check = current_rsi < 70  # 70 미만일 때 진입 허용
+                        # 과매수 구간(65 이상) 체크 - 더 엄격한 기준
+                        conditions.rsi_check = current_rsi < 65  # 65 미만일 때 진입 허용
 
                         if not conditions.rsi_check:
                             conditions.fail_reasons.append(f"RSI 과매수 ({current_rsi:.1f})")
@@ -1252,7 +1252,7 @@ class CandleTradeManager:
                             if balance_info and balance_info.get('total_value', 0) > 0:
                                 # 📊 계좌 정보 분석 - 실제 매수가능금액을 TradingManager에서 가져오기
                                 total_evaluation = balance_info.get('total_value', 0)  # 총평가액 (tot_evlu_amt)
-                                
+
                                 # 🎯 실제 매수가능금액 조회 (TradingManager 활용)
                                 try:
                                     if hasattr(self, 'trade_executor') and self.trade_executor:
@@ -1261,10 +1261,16 @@ class CandleTradeManager:
                                             actual_cash = trading_balance.get('available_cash', 0)
                                             cash_balance = actual_cash
                                             calculation_method = "실제매수가능금액"
+                                        else:
+                                            cash_balance = 0
+                                            calculation_method = "매수가능금액조회실패"
+                                    else:
+                                        cash_balance = 0
+                                        calculation_method = "TradeExecutor없음"
 
                                 except Exception as e:
                                     logger.warning(f"⚠️ 매수가능금액 조회 오류: {e}")
-                                    # cash_balance = 1228868  # 사용자 확인 금액
+                                    cash_balance = 0
                                     calculation_method = "오류시백업"
 
                                 # 🎯 투자 가능 금액 결정 (설정 기반)
@@ -1276,10 +1282,10 @@ class CandleTradeManager:
                                 # 더 안전한 금액 선택 (현금 우선, 없으면 평가액 기준)
                                 if cash_based_amount >= inv_config['min_cash_threshold']:  # 설정값 기준 현금이 있을 때
                                     total_available = cash_based_amount
-                                    calculation_method += " → 현금잔고기준"
+                                    calculation_method = str(calculation_method) + " → 현금잔고기준"
                                 else:
                                     total_available = min(portfolio_based_amount, inv_config['max_portfolio_limit'])  # 설정값 기준 최대 제한
-                                    calculation_method += " → 총평가액기준"
+                                    calculation_method = str(calculation_method) + " → 총평가액기준"
                             else:
                                 # 백업: 기본 투자 금액
                                 total_available = inv_config['default_investment']  # 설정값 사용
@@ -1469,7 +1475,7 @@ class CandleTradeManager:
             current_time = datetime.now().time()
             trading_start = datetime.strptime(self.config['trading_start_time'], '%H:%M').time()
             trading_end = datetime.strptime(self.config['trading_end_time'], '%H:%M').time()
-            
+
             is_trading_time = trading_start <= current_time <= trading_end
             if not is_trading_time:
                 logger.debug(f"⏰ {position.stock_code} 거래 시간 외 - 매도 대기 중")
@@ -1569,7 +1575,7 @@ class CandleTradeManager:
 
             # 2. 🔄 실시간 캔들 패턴 재분석 (DB 의존 제거)
             original_pattern = None
-            
+
             # 🆕 실시간 캔들 패턴 분석 (가장 우선)
             try:
                 from ..api.kis_market_api import get_inquire_daily_itemchartprice
@@ -1579,7 +1585,7 @@ class CandleTradeManager:
                     period_code="D",
                     adj_prc="1"
                 )
-                
+
                 if ohlcv_data is not None and not ohlcv_data.empty:
                     pattern_result = self.pattern_detector.analyze_stock_patterns(position.stock_code, ohlcv_data)
                     if pattern_result and len(pattern_result) > 0:
@@ -1681,7 +1687,7 @@ class CandleTradeManager:
             current_time = datetime.now().time()
             trading_start = datetime.strptime(self.config['trading_start_time'], '%H:%M').time()
             trading_end = datetime.strptime(self.config['trading_end_time'], '%H:%M').time()
-            
+
             is_trading_time = trading_start <= current_time <= trading_end
             if not is_trading_time:
                 logger.warning(f"⏰ {position.stock_code} 거래 시간 외 매도 차단 - {reason}")
@@ -1692,7 +1698,7 @@ class CandleTradeManager:
             try:
                 from ..api.kis_market_api import get_account_balance
                 account_info = get_account_balance()
-                
+
                 if account_info and 'stocks' in account_info:
                     # 실제 보유 종목에서 해당 종목 찾기
                     actual_holding = None
@@ -1700,23 +1706,23 @@ class CandleTradeManager:
                         if stock.get('stock_code') == position.stock_code:
                             actual_holding = stock
                             break
-                    
+
                     if not actual_holding:
                         logger.warning(f"⚠️ {position.stock_code} 실제 보유하지 않는 종목 - 매도 취소")
                         return False
-                    
+
                     actual_quantity = actual_holding.get('quantity', 0)
                     if actual_quantity <= 0:
                         logger.warning(f"⚠️ {position.stock_code} 실제 보유 수량 없음 ({actual_quantity}주) - 매도 취소")
                         return False
-                    
+
                     # 매도할 수량을 실제 보유 수량으로 조정
                     quantity = min(position.performance.entry_quantity or 0, actual_quantity)
                     logger.info(f"✅ {position.stock_code} 보유 확인: 시스템{position.performance.entry_quantity}주 → 실제{actual_quantity}주 → 매도{quantity}주")
                 else:
                     logger.warning(f"⚠️ {position.stock_code} 계좌 정보 조회 실패 - 매도 진행")
                     quantity = position.performance.entry_quantity
-                    
+
             except Exception as e:
                 logger.warning(f"⚠️ {position.stock_code} 보유 확인 오류: {e} - 기존 수량으로 진행")
                 quantity = position.performance.entry_quantity
@@ -1931,13 +1937,13 @@ class CandleTradeManager:
         try:
             # 🆕 1단계: 실시간 캔들 패턴 재분석
             pattern_update = self._analyze_realtime_pattern_changes(position.stock_code, current_price)
-            
+
             # 🆕 2단계: 수익률 기반 동적 조정
             profit_based_update = self._calculate_profit_based_adjustments(position, current_price)
-            
+
             # 🆕 3단계: 추세 강도 기반 조정
             trend_based_update = self._calculate_trend_based_adjustments(position, current_price)
-            
+
             # 🆕 4단계: 종합 판단 및 업데이트
             self._apply_dynamic_adjustments(position, current_price, pattern_update, profit_based_update, trend_based_update)
 
@@ -1950,7 +1956,7 @@ class CandleTradeManager:
         """🔄 실시간 캔들 패턴 변화 분석"""
         try:
             from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            
+
             # 최신 OHLCV 데이터 조회 (최근 20일)
             ohlcv_data = get_inquire_daily_itemchartprice(
                 output_dv="2",
@@ -1958,22 +1964,22 @@ class CandleTradeManager:
                 period_code="D",
                 adj_prc="1"
             )
-            
+
             if ohlcv_data is None or ohlcv_data.empty:
                 return {'pattern_strength_changed': False, 'new_patterns': []}
 
             # 현재 패턴 분석
             current_patterns = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
-            
+
             if not current_patterns:
                 return {'pattern_strength_changed': False, 'new_patterns': []}
 
             # 가장 강한 패턴 선택
             strongest_pattern = max(current_patterns, key=lambda p: p.strength)
-            
+
             # 패턴 강도 변화 분석
             pattern_strength_tier = self._get_pattern_strength_tier(strongest_pattern.strength)
-            
+
             return {
                 'pattern_strength_changed': True,
                 'new_patterns': current_patterns,
@@ -2014,7 +2020,7 @@ class CandleTradeManager:
                 # 5% 이상 수익: 목표 1.5배 확장, 손절 50% 강화
                 return {'target_multiplier': 1.5, 'stop_tightening': 0.5, 'reason': '고수익구간'}
             elif pnl_pct >= 3.0:
-                # 3% 이상 수익: 목표 1.3배 확장, 손절 70% 강화  
+                # 3% 이상 수익: 목표 1.3배 확장, 손절 70% 강화
                 return {'target_multiplier': 1.3, 'stop_tightening': 0.7, 'reason': '수익구간'}
             elif pnl_pct >= 1.0:
                 # 1% 이상 수익: 목표 1.1배 확장, 손절 80% 강화
@@ -2040,14 +2046,14 @@ class CandleTradeManager:
         """📈 추세 강도 기반 조정 계산"""
         try:
             from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            
+
             # 최근 5일 가격 추세 분석
             daily_data = get_inquire_daily_itemchartprice(
                 output_dv="2",
                 itm_no=position.stock_code,
                 period_code="D"
             )
-            
+
             if daily_data is None or daily_data.empty or len(daily_data) < 5:
                 return {'trend_strength': 'NEUTRAL', 'trend_multiplier': 1.0}
 
@@ -2082,7 +2088,7 @@ class CandleTradeManager:
             logger.debug(f"추세 분석 오류: {e}")
             return {'trend_strength': 'NEUTRAL', 'trend_multiplier': 1.0}
 
-    def _apply_dynamic_adjustments(self, position: CandleTradeCandidate, current_price: float, 
+    def _apply_dynamic_adjustments(self, position: CandleTradeCandidate, current_price: float,
                                  pattern_update: Dict, profit_update: Dict, trend_update: Dict):
         """🎯 동적 조정 적용 (마이너스 상황 특수 로직 포함)"""
         try:
@@ -2104,7 +2110,7 @@ class CandleTradeManager:
 
             # 🆕 2단계: 수익률 기반 조정 적용 (마이너스 로직 추가)
             target_multiplier = profit_update.get('target_multiplier', 1.0)
-            
+
             # 마이너스 상황에서의 특수 처리
             if profit_update.get('stop_relaxation'):
                 # 손절 완화 적용 (마이너스 상황)
@@ -2132,11 +2138,11 @@ class CandleTradeManager:
             if pattern_update.get('pattern_strength_changed'):
                 strongest_pattern_obj = pattern_update.get('strongest_pattern')
                 pattern_tier = pattern_update.get('strength_tier', '')
-                
+
                 # CandlePatternInfo 객체에서 직접 속성 접근
                 if strongest_pattern_obj:
                     pattern_strength = strongest_pattern_obj.strength
-                    
+
                     # 강한 반전 패턴 감지 (STRONG 이상)
                     if pattern_tier in ['ULTRA_STRONG', 'STRONG'] and pattern_strength >= 80:
                         strong_reversal_pattern = True
@@ -2169,17 +2175,17 @@ class CandleTradeManager:
             # 🆕 6단계: 변경사항 로깅
             if target_updated or stop_updated:
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100
-                
+
                 logger.info(f"🔄 {position.stock_code} 동적 조정 적용 (수익률: {pnl_pct:+.1f}%):")
-                
+
                 if target_updated:
                     logger.info(f"   📈 목표가: {original_target:,.0f}원 → {new_target_price:,.0f}원 "
                                f"({((new_target_price - entry_price) / entry_price * 100):+.1f}%)")
-                
+
                 if stop_updated:
                     logger.info(f"   🛡️ 손절가: {original_stop:,.0f}원 → {new_stop_price:,.0f}원 "
                                f"({((entry_price - new_stop_price) / entry_price * 100):+.1f}%)")
-                
+
                 # 조정 사유 로깅
                 reasons = []
                 if pattern_update.get('pattern_strength_changed'):
@@ -2188,7 +2194,7 @@ class CandleTradeManager:
                     reasons.append(f"수익: {profit_update['reason']}")
                 if trend_update.get('reason'):
                     reasons.append(f"추세: {trend_update['reason']}")
-                
+
                 if reasons:
                     logger.info(f"   📋 조정사유: {', '.join(reasons)}")
 
@@ -2199,7 +2205,7 @@ class CandleTradeManager:
         """패턴 강도 티어별 목표/손절 퍼센트 반환"""
         tier_settings = {
             'ULTRA_STRONG': (15.0, 4.0),   # 15% 목표, 4% 손절
-            'STRONG': (12.0, 3.0),         # 12% 목표, 3% 손절  
+            'STRONG': (12.0, 3.0),         # 12% 목표, 3% 손절
             'MEDIUM': (8.0, 3.0),          # 8% 목표, 3% 손절
             'WEAK': (5.0, 2.0),            # 5% 목표, 2% 손절
             'VERY_WEAK': (3.0, 1.5)        # 3% 목표, 1.5% 손절
@@ -2338,7 +2344,7 @@ class CandleTradeManager:
         """🔄 기존 보유 종목의 실시간 캔들 패턴 분석"""
         try:
             logger.debug(f"🔄 {stock_code} 실시간 캔들 패턴 분석 시작")
-            
+
             # OHLCV 데이터 조회
             from ..api.kis_market_api import get_inquire_daily_itemchartprice
             ohlcv_data = get_inquire_daily_itemchartprice(
@@ -2354,17 +2360,17 @@ class CandleTradeManager:
 
             # 캔들 패턴 분석
             pattern_result = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
-            
+
             if not pattern_result or len(pattern_result) == 0:
                 logger.debug(f"❌ {stock_code} 캔들 패턴 감지 실패")
                 return None
 
             # 가장 강한 패턴 선택
             strongest_pattern = max(pattern_result, key=lambda p: p.strength)
-            
+
             # 매매 신호 생성
             trade_signal, signal_strength = self._generate_trade_signal_from_patterns(pattern_result)
-            
+
             result = {
                 'patterns_detected': True,
                 'patterns': pattern_result,
@@ -2378,10 +2384,10 @@ class CandleTradeManager:
                 'signal_strength': signal_strength,
                 'analysis_time': datetime.now().isoformat()
             }
-            
+
             logger.info(f"✅ {stock_code} 캔들 패턴 분석 완료: {strongest_pattern.pattern_type.value} "
                        f"(강도: {strongest_pattern.strength}, 신뢰도: {strongest_pattern.confidence:.2f})")
-            
+
             return result
 
         except Exception as e:
@@ -2396,20 +2402,21 @@ class CandleTradeManager:
 
             # 가장 강한 패턴 기준으로 신호 생성
             strongest_pattern = max(patterns, key=lambda p: p.strength)
-            
+
             from .candle_trade_candidate import PatternType, TradeSignal
-            
+
             # 강세 패턴들
             bullish_patterns = {
                 PatternType.HAMMER, PatternType.INVERTED_HAMMER,
                 PatternType.BULLISH_ENGULFING, PatternType.MORNING_STAR,
                 PatternType.RISING_THREE_METHODS
             }
-            
+
             if strongest_pattern.pattern_type in bullish_patterns:
-                if strongest_pattern.confidence >= 0.85 and strongest_pattern.strength >= 90:
+                # 더 엄격한 기준 적용
+                if strongest_pattern.confidence >= 0.9 and strongest_pattern.strength >= 95:
                     return TradeSignal.STRONG_BUY, strongest_pattern.strength
-                elif strongest_pattern.confidence >= 0.70:
+                elif strongest_pattern.confidence >= 0.8 and strongest_pattern.strength >= 85:
                     return TradeSignal.BUY, strongest_pattern.strength
                 else:
                     return TradeSignal.HOLD, strongest_pattern.strength
@@ -2477,7 +2484,7 @@ class CandleTradeManager:
                             old_signal = candidate.trade_signal
                             candidate.trade_signal = analysis_result['new_signal']
                             candidate.signal_strength = analysis_result['signal_strength']
-                            candidate.signal_updated_at = datetime.now()
+                            candidate.signal_updated_at = datetime.now(self.korea_tz)
 
                             # 우선순위 재계산
                             candidate.entry_priority = self._calculate_entry_priority(candidate)
@@ -2519,7 +2526,7 @@ class CandleTradeManager:
                         old_signal = candidate.trade_signal
                         candidate.trade_signal = analysis_result['new_signal']
                         candidate.signal_strength = analysis_result['signal_strength']
-                        candidate.signal_updated_at = datetime.now()
+                        candidate.signal_updated_at = datetime.now(self.korea_tz)
 
                         logger.info(f"🔄 {candidate.stock_code} 매도신호 업데이트: "
                                    f"{old_signal.value} → {candidate.trade_signal.value} "

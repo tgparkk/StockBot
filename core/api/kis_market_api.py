@@ -11,7 +11,6 @@ from . import kis_auth as kis
 
 logger = setup_logger(__name__)
 
-
 def get_inquire_price(div_code: str = "J", itm_no: str = "", tr_cont: str = "",
                       FK100: str = "", NK100: str = "") -> Optional[pd.DataFrame]:
     """주식현재가 시세"""
@@ -195,51 +194,51 @@ def get_inquire_daily_price_2(div_code: str = "J", itm_no: str = "", tr_cont: st
         return None
 
 
-# =============================================================================
-# 시장 스크리닝용 순위 조회 API들
-# =============================================================================
-
-def get_volume_power_rank(fid_cond_mrkt_div_code: str = "J",
-                         fid_cond_scr_div_code: str = "20168",
-                         fid_input_iscd: str = "0000",
-                         fid_div_cls_code: str = "1",
-                         fid_input_price_1: str = "",
-                         fid_input_price_2: str = "",
-                         fid_vol_cnt: str = "",
-                         fid_trgt_cls_code: str = "0",
-                         fid_trgt_exls_cls_code: str = "0",
-                         tr_cont: str = "") -> Optional[pd.DataFrame]:
+def get_inquire_time_itemchartprice(output_dv: str = "1", div_code: str = "J", itm_no: str = "",
+                                   input_hour: Optional[str] = None, past_data_yn: str = "N",
+                                   etc_cls_code: str = "", tr_cont: str = "",
+                                   FK100: str = "", NK100: str = "") -> Optional[pd.DataFrame]:
     """
-    체결강도 상위 조회 (TR: FHPST01680000)
+    주식당일분봉조회 API
+
+    당일 분봉 데이터를 조회합니다. (전일자 분봉 미제공)
+    실전계좌/모의계좌의 경우, 한 번의 호출에 최대 30건까지 확인 가능합니다.
 
     Args:
-        fid_cond_mrkt_div_code: 조건 시장 분류 코드 (J: 주식)
-        fid_cond_scr_div_code: 조건 화면 분류 코드 (20168)
-        fid_input_iscd: 입력 종목코드 (0000:전체, 0001:거래소, 1001:코스닥, 2001:코스피200)
-        fid_div_cls_code: 분류 구분 코드 (0:전체, 1:보통주, 2:우선주)
-        fid_input_price_1: 입력 가격1 (가격 ~)
-        fid_input_price_2: 입력 가격2 (~ 가격)
-        fid_vol_cnt: 거래량 수 (거래량 ~)
-        fid_trgt_cls_code: 대상 구분 코드 (0:전체)
-        fid_trgt_exls_cls_code: 대상 제외 구분 코드 (0:전체)
-        tr_cont: 연속 거래 여부
+        output_dv: 출력 구분 (1: output1, 2: output2 - 분봉 데이터 배열)
+        div_code: 조건 시장 분류 코드 (J:KRX, NX:NXT, UN:통합)
+        itm_no: 입력 종목코드 (6자리, ex: 005930)
+        input_hour: 입력 시간1 (HHMMSS 형식, 기본값: 현재시간)
+        past_data_yn: 과거 데이터 포함 여부 (Y/N, 기본값: N)
+        etc_cls_code: 기타 구분 코드 (기본값: "")
+        tr_cont: 연속 거래 여부 (공백: 초기 조회, N: 다음 데이터 조회)
+        FK100: 예약 파라미터
+        NK100: 예약 파라미터
 
     Returns:
-        체결강도 상위 종목 데이터 (최대 30건)
+        output1: 종목 기본 정보 (전일대비, 현재가 등)
+        output2: 분봉 데이터 배열 (시간별 OHLC + 거래량, 최대 30건)
+
+    Note:
+        - 당일 분봉 데이터만 제공됩니다
+        - 미래일시 입력 시에는 현재가로 조회됩니다
+        - output2의 첫번째 배열의 체결량은 첫체결 전까지 이전 분봉의 체결량이 표시됩니다
     """
-    url = '/uapi/domestic-stock/v1/ranking/volume-power'
-    tr_id = "FHPST01680000"  # 체결강도 상위
+    url = '/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice'
+    tr_id = "FHKST03010200"  # 주식당일분봉조회
+
+    # 입력 시간이 없으면 현재 시간 사용
+    if input_hour is None:
+        now = datetime.now()
+        input_hour = f"{now.hour:02d}{now.minute:02d}{now.second:02d}"
+        logger.debug(f"📊 입력 시간 자동 설정: {input_hour}")
 
     params = {
-        "fid_trgt_exls_cls_code": fid_trgt_exls_cls_code,
-        "fid_cond_mrkt_div_code": fid_cond_mrkt_div_code,
-        "fid_cond_scr_div_code": fid_cond_scr_div_code,
-        "fid_input_iscd": fid_input_iscd,
-        "fid_div_cls_code": fid_div_cls_code,
-        "fid_input_price_1": fid_input_price_1,
-        "fid_input_price_2": fid_input_price_2,
-        "fid_vol_cnt": fid_vol_cnt,
-        "fid_trgt_cls_code": fid_trgt_cls_code
+        "FID_COND_MRKT_DIV_CODE": div_code,          # 조건 시장 분류 코드
+        "FID_INPUT_ISCD": itm_no,                    # 종목코드
+        "FID_INPUT_HOUR_1": input_hour,              # 입력시간 (HHMMSS)
+        "FID_PW_DATA_INCU_YN": past_data_yn,         # 과거 데이터 포함 여부
+        "FID_ETC_CLS_CODE": etc_cls_code             # 기타 구분 코드
     }
 
     try:
@@ -247,21 +246,41 @@ def get_volume_power_rank(fid_cond_mrkt_div_code: str = "J",
 
         if res and res.isOK():
             body = res.getBody()
-            output_data = getattr(body, 'output', [])
-            if output_data:
-                current_data = pd.DataFrame(output_data)
-                logger.info(f"체결강도 상위 조회 성공: {len(current_data)}건")
-                return current_data
-            else:
-                logger.warning("체결강도 상위 조회: 데이터 없음")
-                return pd.DataFrame()
-        else:
-            logger.error("체결강도 상위 조회 실패")
-            return None
-    except Exception as e:
-        logger.error(f"체결강도 상위 조회 오류: {e}")
-        return None
 
+            if output_dv == "1":
+                # 종목 기본 정보 (output1)
+                output1_data = getattr(body, 'output1', {})
+                if output1_data:
+                    current_data = pd.DataFrame([output1_data])
+                    logger.info(f"📊 {itm_no} 분봉 기본정보 조회 성공")
+                    return current_data
+                else:
+                    logger.warning(f"📊 {itm_no} 분봉 기본정보 없음")
+                    return pd.DataFrame()
+            else:
+                # 분봉 데이터 배열 (output2)
+                output2_data = getattr(body, 'output2', [])
+                if output2_data:
+                    current_data = pd.DataFrame(output2_data)
+                    logger.info(f"📊 {itm_no} 분봉 데이터 조회 성공: {len(current_data)}건 (시간: {input_hour})")
+
+                    # 분봉 데이터 정보 로깅
+                    if len(current_data) > 0:
+                        first_time = current_data.iloc[0].get('stck_cntg_hour', 'N/A')
+                        last_time = current_data.iloc[-1].get('stck_cntg_hour', 'N/A')
+                        logger.debug(f"📊 분봉 시간 범위: {first_time} ~ {last_time}")
+
+                    return current_data
+                else:
+                    logger.warning(f"📊 {itm_no} 분봉 데이터 없음 (시간: {input_hour})")
+                    return pd.DataFrame()
+        else:
+            logger.error(f"📊 {itm_no} 주식당일분봉조회 실패")
+            return None
+
+    except Exception as e:
+        logger.error(f"📊 {itm_no} 주식당일분봉조회 오류: {e}")
+        return None
 
 def get_volume_rank(fid_cond_mrkt_div_code: str = "J",
                    fid_cond_scr_div_code: str = "20171",
@@ -473,400 +492,6 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
     except Exception as e:
         logger.error(f"❌ 등락률 순위 조회 예외: {e}")
         return None
-
-
-# =============================================================================
-# 통합된 전략별 후보 조회 함수들
-# =============================================================================
-
-def _get_adaptive_criteria():
-    """시간대별 적응형 기준 설정"""
-    from datetime import datetime
-
-    current_time = datetime.now()
-    is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
-
-    if is_pre_market:
-        # 프리마켓: 매우 관대한 기준
-        criteria = {
-            'min_gap_rate': 0.5,
-            'min_change_rate': 0.3,
-            'min_volume_ratio': 1.2,
-            'min_daily_volume': 40000,
-            'min_price': 1000,
-            'max_price': 1000000,
-            'fluctuation_threshold': "0.3",
-            'max_candidates': 30,
-            'description': "프리마켓 갭트레이딩 기준: 갭0.5% 변동0.3% 거래량1.2배 (매우 관대)"
-        }
-        logger.info("🌅 " + criteria['description'])
-    elif current_time.hour < 11:
-        # 장 초반: 관대한 기준
-        criteria = {
-            'min_gap_rate': 1.0,
-            'min_change_rate': 0.5,
-            'min_volume_ratio': 1.5,
-            'min_daily_volume': 60000,
-            'min_price': 1000,
-            'max_price': 1000000,
-            'fluctuation_threshold': "0.5",
-            'max_candidates': 20,
-            'description': "장초반 갭트레이딩 기준: 갭1.0% 변동0.5% 거래량1.5배 (관대)"
-        }
-        logger.info("🌄 " + criteria['description'])
-    else:
-        # 정규 시간: 기본 기준
-        criteria = {
-            'min_gap_rate': 1.5,
-            'min_change_rate': 0.8,
-            'min_volume_ratio': 1.8,
-            'min_daily_volume': 80000,
-            'min_price': 1000,
-            'max_price': 1000000,
-            'fluctuation_threshold': "0.8",
-            'max_candidates': 20,
-            'description': "정규시간 갭트레이딩 기준: 갭1.5% 변동0.8% 거래량1.8배 (완화)"
-        }
-        logger.info("🕐 " + criteria['description'])
-
-    return criteria, is_pre_market
-
-def _get_initial_candidates(market: str, criteria: dict):
-    """1차 필터링으로 초기 후보 획득 (백업 전략 포함)"""
-    logger.info("🎯 갭 트레이딩 후보 적응형 필터링 중...")
-
-    # 1차 시도: 적응형 상승률 기준
-    candidate_data = get_fluctuation_rank(
-        fid_input_iscd=market,
-        fid_rank_sort_cls_code="0",
-        fid_rsfl_rate1=criteria['fluctuation_threshold']
-    )
-
-    if candidate_data is not None and not candidate_data.empty:
-        logger.info(f"🎯 1차 필터링 성공: {len(candidate_data)}개 종목")
-        return candidate_data
-
-    # 백업 전략 1: 더 관대한 기준
-    fallback_threshold = str(float(criteria['fluctuation_threshold']) * 0.5)
-    logger.warning(f"🎯 1차 필터링 데이터 없음 - {fallback_threshold}% 이상으로 재시도")
-    candidate_data = get_fluctuation_rank(
-        fid_input_iscd=market,
-        fid_rank_sort_cls_code="0",
-        fid_rsfl_rate1=fallback_threshold
-    )
-
-    if candidate_data is not None and not candidate_data.empty:
-        logger.info(f"🎯 2차 시도 성공: {len(candidate_data)}개 종목")
-        return candidate_data
-
-    # 백업 전략 2: 조건 없이 전체 조회
-    logger.warning("🎯 2차 필터링도 데이터 없음 - 조건 제거하고 전체 조회")
-    candidate_data = get_fluctuation_rank(
-        fid_input_iscd=market,
-        fid_rank_sort_cls_code="0",
-        fid_rsfl_rate1="",
-        fid_vol_cnt=""
-    )
-
-    if candidate_data is not None and not candidate_data.empty:
-        logger.info(f"🎯 3차 시도 성공: {len(candidate_data)}개 종목")
-        return candidate_data
-
-    # 백업 전략 3: 다른 시장으로 시도
-    if market != "0000":
-        logger.warning("🎯 3차 백업: 전체 시장(0000)으로 재시도")
-        candidate_data = get_fluctuation_rank(
-            fid_input_iscd="0000",
-            fid_rank_sort_cls_code="0",
-            fid_rsfl_rate1="",
-            fid_vol_cnt=""
-        )
-
-        if candidate_data is not None and not candidate_data.empty:
-            logger.info(f"🎯 4차 시도 성공: {len(candidate_data)}개 종목")
-            return candidate_data
-
-    # 최종 백업: 하락률순으로도 시도
-    logger.warning("🎯 최종 백업: 하락률순 조회 (반대매매 후보)")
-    candidate_data = get_fluctuation_rank(
-        fid_input_iscd="0000",
-        fid_rank_sort_cls_code="1",
-        fid_rsfl_rate1="",
-        fid_vol_cnt=""
-    )
-
-    if candidate_data is not None and not candidate_data.empty:
-        logger.info(f"🎯 최종 시도 성공: {len(candidate_data)}개 종목")
-        return candidate_data
-
-    logger.error("🎯 갭 트레이딩: 모든 백업 전략에도 데이터 없음")
-    logger.info("💡 가능한 원인: 1) 장 운영시간 외 2) API 제한 3) 시장 참여자 부족 4) 네트워크 문제")
-    return pd.DataFrame()
-
-def _calculate_gap_metrics(stock_code: str, row, is_pre_market: bool):
-    """개별 종목의 갭 메트릭 계산"""
-    try:
-        # 현재가 정보 조회
-        current_data = get_inquire_price("J", stock_code)
-        if current_data is None or current_data.empty:
-            return None
-
-        current_info = current_data.iloc[0]
-
-        # 기본 가격 정보 추출
-        current_price = int(current_info.get('stck_prpr', 0))
-        open_price = int(current_info.get('stck_oprc', 0))
-        prev_close = int(current_info.get('stck_sdpr', 0))
-
-        # 프리마켓 시가 처리
-        if is_pre_market and open_price <= 0:
-            logger.debug(f"🌅 프리마켓 종목 {stock_code}: 시가 없음 - 현재가로 추정")
-            open_price = current_price
-        elif not is_pre_market and open_price <= 0:
-            logger.debug(f"🎯 종목 {stock_code}: 시가 없음 - 제외")
-            return None
-
-        if prev_close <= 0 or current_price <= 0:
-            logger.debug(f"🎯 종목 {stock_code}: 가격 정보 불완전 - 제외")
-            return None
-
-        # 갭 계산
-        gap_size = open_price - prev_close
-        gap_rate = (gap_size / prev_close) * 100
-
-        # 변동률 안전 변환
-        change_rate_raw = current_info.get('prdy_ctrt', '0')
-        try:
-            change_rate = float(str(change_rate_raw))
-        except (ValueError, TypeError):
-            logger.debug(f"🎯 종목 {stock_code}: 변동률 변환 오류 - 제외")
-            return None
-
-        return {
-            'stock_code': stock_code,
-            'stock_name': row.get('hts_kor_isnm', ''),
-            'current_price': current_price,
-            'open_price': open_price,
-            'prev_close': prev_close,
-            'gap_size': gap_size,
-            'gap_rate': round(gap_rate, 2),
-            'change_rate': change_rate,
-            'volume': int(current_info.get('acml_vol', 0)),
-            'avg_volume_raw': current_info.get('avrg_vol', 0)
-        }
-
-    except Exception as e:
-        logger.warning(f"🎯 종목 {stock_code} 갭 계산 오류: {e}")
-        return None
-
-def _calculate_volume_metrics(stock_code: str, volume: int, avg_volume_raw):
-    """거래량 비율 계산 (API 조회 포함)"""
-    try:
-        avg_volume = int(avg_volume_raw) if avg_volume_raw else 0
-    except (ValueError, TypeError):
-        avg_volume = 0
-
-    # 평균 거래량이 없거나 부족한 경우 API 조회
-    if avg_volume <= 0:
-        try:
-            logger.debug(f"🔍 {stock_code}: 평균 거래량 정보 없음 - API 조회 시작")
-            historical_data = get_inquire_daily_price("J", stock_code)
-            if historical_data is not None and not historical_data.empty and len(historical_data) >= 5:
-                # 최근 5일간 거래량 평균 계산
-                volumes = []
-                for _, row in historical_data.head(5).iterrows():
-                    vol = int(row.get('acml_vol', 0)) if row.get('acml_vol') else 0
-                    if vol > 0:
-                        volumes.append(vol)
-
-                if volumes:
-                    calculated_avg_volume = sum(volumes) // len(volumes)
-                    safe_avg_volume = max(calculated_avg_volume, 5000)
-                    logger.debug(f"📊 {stock_code}: 5일 평균 거래량 계산 완료 - {safe_avg_volume:,}주")
-                else:
-                    safe_avg_volume = max(volume // 5, 10000)
-                    logger.debug(f"📊 {stock_code}: 거래량 데이터 부족 - 추정치 사용: {safe_avg_volume:,}주")
-            else:
-                safe_avg_volume = max(volume // 5, 10000)
-                logger.debug(f"📊 {stock_code}: API 조회 실패 - 추정치 사용: {safe_avg_volume:,}주")
-        except Exception as e:
-            logger.warning(f"📊 {stock_code}: 평균 거래량 계산 오류 - {e}")
-            safe_avg_volume = max(volume // 5, 10000)
-    elif avg_volume < 5000:
-        safe_avg_volume = 5000
-        logger.debug(f"📊 {stock_code}: 평균 거래량 보정 - {avg_volume:,}주 → {safe_avg_volume:,}주")
-    else:
-        safe_avg_volume = avg_volume
-
-    # 거래량 비율 계산 및 상한 제한
-    volume_ratio = volume / safe_avg_volume
-    volume_ratio = min(volume_ratio, 100)  # 최대 100배로 제한
-
-    logger.debug(f"🔧 {stock_code} 거래량 계산: 현재={volume:,}주, 평균={safe_avg_volume:,}주, 비율={volume_ratio:.1f}배")
-
-    return volume_ratio
-
-def _apply_adaptive_filters(metrics: dict, criteria: dict):
-    """적응형 조건 필터 적용"""
-    stock_code = metrics['stock_code']
-
-    # 갭 크기 체크
-    if metrics['gap_rate'] < criteria['min_gap_rate']:
-        logger.debug(f"🎯 종목 {stock_code}: 갭 부족 - {metrics['gap_rate']:.2f}%")
-        return False
-
-    # 거래량 비율 계산
-    volume_ratio = _calculate_volume_metrics(
-        stock_code,
-        metrics['volume'],
-        metrics['avg_volume_raw']
-    )
-
-    # 조건 체크
-    if (volume_ratio < criteria['min_volume_ratio'] or
-        metrics['change_rate'] < criteria['min_change_rate'] or
-        metrics['volume'] < criteria['min_daily_volume']):
-        logger.debug(f"🎯 종목 {stock_code}: 조건 미달 - 거래량{volume_ratio:.1f}배 변동률{metrics['change_rate']:.1f}% 볼륨{metrics['volume']:,}주")
-        return False
-
-    # 가격대 필터
-    if (metrics['current_price'] < criteria['min_price'] or
-        metrics['current_price'] > criteria['max_price']):
-        logger.debug(f"🎯 종목 {stock_code}: 가격대 제외 ({metrics['current_price']}원)")
-        return False
-
-    # 통과한 경우 volume_ratio 추가
-    metrics['volume_ratio'] = round(volume_ratio, 2)
-    return True
-
-def _score_and_sort_candidates(gap_candidates: list):
-    """수익성 점수 계산 및 정렬"""
-    if not gap_candidates:
-        logger.info("🎯 적응형 갭 트레이딩 조건을 만족하는 종목 없음")
-        return pd.DataFrame()
-
-    # 수익성 점수 계산
-    for candidate in gap_candidates:
-        candidate['profit_score'] = (
-            candidate['gap_rate'] *
-            candidate['volume_ratio'] *
-            candidate['change_rate']
-        )
-        candidate['data_rank'] = len(gap_candidates)
-
-    # DataFrame 생성 및 정렬
-    gap_df = pd.DataFrame(gap_candidates)
-    gap_df = gap_df.sort_values('profit_score', ascending=False)
-
-    logger.info(f"🎯 적응형 갭 트레이딩 후보 {len(gap_df)}개 발견")
-    return gap_df
-
-def get_gap_trading_candidates(market: str = "0000",
-                               min_gap_rate: float = 2.0,
-                               min_change_rate: float = 1.0,
-                               min_volume_ratio: float = 2.0) -> Optional[pd.DataFrame]:
-    """갭 트레이딩 후보 조회 - 🎯 모듈화된 버전"""
-    try:
-        # 1단계: 시간대별 적응형 기준 설정
-        criteria, is_pre_market = _get_adaptive_criteria()
-
-        # 2단계: 초기 후보 획득 (백업 전략 포함)
-        candidate_data = _get_initial_candidates(market, criteria)
-        if candidate_data.empty:
-            return pd.DataFrame()
-
-        logger.info(f"🎯 적응형 필터링 완료: {len(candidate_data)}개 종목 확보")
-
-        # 3단계: 각 종목 분석 및 필터링
-        gap_candidates = []
-        for idx, row in candidate_data.head(criteria['max_candidates']).iterrows():
-            stock_code = row.get('stck_shrn_iscd', '')
-            if not stock_code:
-                continue
-
-            # 갭 메트릭 계산
-            metrics = _calculate_gap_metrics(stock_code, row, is_pre_market)
-            if metrics is None:
-                continue
-
-            # 적응형 필터 적용
-            if _apply_adaptive_filters(metrics, criteria):
-                # 최종 후보 데이터 구성
-                candidate = {
-                    'stck_shrn_iscd': stock_code,
-                    'hts_kor_isnm': metrics['stock_name'],
-                    'stck_prpr': metrics['current_price'],
-                    'stck_oprc': metrics['open_price'],
-                    'stck_sdpr': metrics['prev_close'],
-                    'gap_size': metrics['gap_size'],
-                    'gap_rate': metrics['gap_rate'],
-                    'change_rate': metrics['change_rate'],
-                    'acml_vol': metrics['volume'],
-                    'volume_ratio': metrics['volume_ratio']
-                }
-                gap_candidates.append(candidate)
-
-                logger.info(f"🎯 갭 후보: {stock_code}({metrics['stock_name']}) 갭{metrics['gap_rate']:.1f}% 거래량{metrics['volume_ratio']:.1f}배 변동률{metrics['change_rate']:.1f}%")
-
-        # 4단계: 점수 계산 및 정렬
-        return _score_and_sort_candidates(gap_candidates)
-
-    except Exception as e:
-        logger.error(f"🎯 갭 트레이딩 후보 조회 오류: {e}")
-        return None
-
-
-def get_volume_breakout_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """거래량 돌파 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
-    from datetime import datetime
-
-    current_time = datetime.now()
-    is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
-
-    if is_pre_market:
-        # 프리마켓: 매우 관대한 기준
-        volume_threshold = "5000"  # 5천주
-        logger.info("🌅 프리마켓 거래량 기준: 5천주 (관대)")
-    elif current_time.hour < 11:
-        # 장 초반: 관대한 기준
-        volume_threshold = "20000"  # 2만주
-        logger.info("🌄 장초반 거래량 기준: 2만주")
-    else:
-        # 정규 시간: 기본 기준
-        volume_threshold = "50000"  # 5만주
-        logger.info("🕐 정규시간 거래량 기준: 5만주")
-
-    return get_volume_rank(
-        fid_input_iscd=market,
-        fid_blng_cls_code="1",  # 거래증가율
-        fid_vol_cnt=volume_threshold
-    )
-
-
-def get_momentum_candidates(market: str = "0000") -> Optional[pd.DataFrame]:
-    """모멘텀 후보 조회 - 🎯 적응형 기준 (시간대별 조정)"""
-    from datetime import datetime
-
-    current_time = datetime.now()
-    is_pre_market = current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 30)
-
-    if is_pre_market:
-        # 프리마켓: 매우 관대한 기준
-        volume_threshold = "3000"  # 3천주
-        logger.info("🌅 프리마켓 체결강도 기준: 3천주 (관대)")
-    elif current_time.hour < 11:
-        # 장 초반: 관대한 기준
-        volume_threshold = "10000"  # 1만주
-        logger.info("🌄 장초반 체결강도 기준: 1만주")
-    else:
-        # 정규 시간: 기본 기준
-        volume_threshold = "30000"  # 3만주 (5만주에서 완화)
-        logger.info("🕐 정규시간 체결강도 기준: 3만주")
-
-    return get_volume_power_rank(
-        fid_input_iscd=market,
-        fid_vol_cnt=volume_threshold
-    )
 
 
 def get_bulk_trans_num_rank(fid_cond_mrkt_div_code: str = "J",
@@ -1964,405 +1589,10 @@ def print_buy_decision_summary(analysis_result: Dict):
     print("=" * 60)
 
 
-# =============================================================================
-# 🎯 데모 및 테스트 함수들
-# =============================================================================
-
-def demo_price_limit_analysis():
-    """🎯 상한가 기반 매수 판단 시스템 데모"""
-    try:
-        print("=" * 70)
-        print("🎯 상한가 기반 매수 판단 시스템 데모")
-        print("=" * 70)
-
-        # 샘플 종목들 (대형주)
-        sample_stocks = [
-            ("005930", "삼성전자"),
-            ("000660", "SK하이닉스"),
-            ("035420", "NAVER"),
-            ("005490", "POSCO홀딩스")
-        ]
-
-        print("\n📊 1. 개별 종목 상한가 위험도 분석")
-        print("-" * 50)
-
-        for stock_code, stock_name in sample_stocks[:2]:  # 처음 2개만 상세 분석
-            try:
-                print(f"\n🔍 {stock_code} ({stock_name}) 분석:")
-
-                # 상한가 위험도 분석
-                risk_analysis = analyze_price_limit_risk(stock_code)
-                if risk_analysis:
-                    print(f"   현재가: {risk_analysis['current_price']:,}원")
-                    print(f"   상한가: {risk_analysis['upper_limit']:,}원")
-                    print(f"   하한가: {risk_analysis['lower_limit']:,}원")
-                    print(f"   등락률: {risk_analysis['price_change_rate']:+.1f}%")
-                    print(f"   상한가 근접률: {risk_analysis['upper_limit_approach']:.1f}%")
-                    print(f"   하한가 근접률: {risk_analysis['lower_limit_approach']:.1f}%")
-                    print(f"   위험도: {risk_analysis['risk_level']}")
-                    print(f"   매수신호: {risk_analysis['buy_signal']}")
-                    print(f"   추천사유: {risk_analysis['recommendation_reason']}")
-                else:
-                    print("   ❌ 분석 실패")
-
-                time.sleep(1)  # API 제한 방지
-
-            except Exception as e:
-                print(f"   ❌ 분석 오류: {e}")
-
-        print(f"\n📊 2. 스마트 매수 의사결정 (목표: 1,000,000원)")
-        print("-" * 50)
-
-        for stock_code, stock_name in sample_stocks[2:3]:  # 1개 종목 매수 분석
-            try:
-                print(f"\n💰 {stock_code} ({stock_name}) 매수 의사결정:")
-
-                # 스마트 매수 분석
-                buy_decision = smart_buy_decision(stock_code, 1000000)
-                if buy_decision:
-                    if buy_decision.get('buy_decision'):
-                        print(f"   ✅ 매수 추천!")
-                        print(f"   매수 금액: {buy_decision['buy_amount']:,}원")
-                        print(f"   매수 수량: {buy_decision['buy_quantity']:,}주")
-                        print(f"   포지션 크기: {buy_decision['position_size']}")
-                        print(f"   진입 전략: {buy_decision['entry_strategy']}")
-                        print(f"   목표가: {buy_decision['target_price']:,}원 (+{buy_decision['expected_return']})")
-                        print(f"   손절가: {buy_decision['stop_loss_price']:,}원 ({buy_decision['max_loss']})")
-
-                        if buy_decision['risk_management']:
-                            print(f"   ⚠️ 위험관리: {', '.join(buy_decision['risk_management'])}")
-                    else:
-                        error_message = buy_decision.get('reason', '알 수 없음') if buy_decision else '분석 실패'
-                        print(f"   ❌ 매수 비추천: {error_message}")
-                else:
-                    print("   ❌ 분석 실패")
-
-                time.sleep(1)
-
-            except Exception as e:
-                print(f"   ❌ 분석 오류: {e}")
-
-        print(f"\n📊 3. 다중 종목 포트폴리오 분석 (예산: 5,000,000원)")
-        print("-" * 50)
-
-        stock_codes = [code for code, _ in sample_stocks]
-        portfolio_analysis = batch_buy_analysis(stock_codes, 5000000)
-
-        if portfolio_analysis is not None and not portfolio_analysis.empty:
-            print(f"\n🎯 매수 추천 종목 ({len(portfolio_analysis)}개):")
-            for idx, (_, row) in enumerate(portfolio_analysis.iterrows(), 1):
-                print(f"{idx}. {row['stock_code']} - {row['buy_signal']} (위험도: {row['risk_level']})")
-                print(f"   현재가: {row['current_price']:,}원 ({row['price_change_rate']:+.1f}%)")
-                print(f"   상한가 근접: {row['upper_limit_approach']:.1f}%")
-                print(f"   매수금액: {row['buy_amount']:,}원 ({row['buy_quantity']:,}주)")
-                print(f"   목표수익: {row['expected_return']}, 예산비중: {row['budget_ratio']:.1f}%")
-                print(f"   전략: {row['entry_strategy']}")
-                print()
-        else:
-            print("   ❌ 매수 추천 종목 없음")
-
-        print("🎯 데모 완료!")
-        print("=" * 70)
-
-    except Exception as e:
-        logger.error(f"데모 실행 오류: {e}")
-        print(f"❌ 데모 실행 중 오류 발생: {e}")
-
-
-def test_specific_stock_analysis(stock_code: str, investment_amount: int = 1000000):
-    """
-    🎯 특정 종목 상세 분석 테스트
-
-    Args:
-        stock_code: 종목코드
-        investment_amount: 투자 금액
-    """
-    try:
-        print("=" * 70)
-        print(f"🎯 {stock_code} 종목 상세 분석")
-        print("=" * 70)
-
-        # 1. 상한가 위험도 분석
-        print("\n📊 1. 상한가/하한가 위험도 분석")
-        print("-" * 40)
-
-        risk_analysis = analyze_price_limit_risk(stock_code)
-        if risk_analysis:
-            print(f"종목코드: {risk_analysis['stock_code']}")
-            print(f"현재가: {risk_analysis['current_price']:,}원")
-            print(f"기준가(전일종가): {risk_analysis['base_price']:,}원")
-            print(f"상한가: {risk_analysis['upper_limit']:,}원")
-            print(f"하한가: {risk_analysis['lower_limit']:,}원")
-            print(f"전일대비: {risk_analysis['price_change_rate']:+.2f}%")
-            print(f"가격범위: {risk_analysis['price_range']:,}원")
-            print()
-            print(f"상한가 근접률: {risk_analysis['upper_limit_approach']:.1f}%")
-            print(f"하한가 근접률: {risk_analysis['lower_limit_approach']:.1f}%")
-            print(f"위험도: {risk_analysis['risk_level']}")
-            print(f"매수신호: {risk_analysis['buy_signal']}")
-            print(f"추천사유: {risk_analysis['recommendation_reason']}")
-        else:
-            print("❌ 위험도 분석 실패")
-            return
-
-        # 2. 스마트 매수 의사결정
-        print(f"\n💰 2. 스마트 매수 의사결정 (목표: {investment_amount:,}원)")
-        print("-" * 40)
-
-        buy_decision = smart_buy_decision(stock_code, investment_amount)
-        if buy_decision:
-            print_buy_decision_summary(buy_decision)
-        else:
-            print("❌ 매수 의사결정 실패")
-
-        print("\n🎯 분석 완료!")
-        print("=" * 70)
-
-    except Exception as e:
-        logger.error(f"종목 분석 테스트 오류: {e}")
-        print(f"❌ 분석 중 오류 발생: {e}")
-
-
 # 테스트 실행을 위한 예시 함수
 if __name__ == "__main__":
-    # 예시 1: 전체 데모 실행
-    # demo_price_limit_analysis()
-
-    # 예시 2: 특정 종목 분석
-    # test_specific_stock_analysis("005930", 2000000)  # 삼성전자 200만원 투자
 
     pass
-
-
-# =============================================================================
-# 🎯 호가단위 오류 해결 전용 함수들
-# =============================================================================
-
-def test_tick_unit_functions(stock_code: str = "000990"):
-    """
-    🎯 호가단위 관련 함수들 테스트
-
-    Args:
-        stock_code: 테스트할 종목코드 (기본값: 000990)
-    """
-    try:
-        print("=" * 70)
-        print(f"🎯 호가단위 오류 해결 테스트: {stock_code}")
-        print("=" * 70)
-
-        # 1. 호가단위 정보 조회
-        print("\n📊 1. 호가단위 정보 조회")
-        print("-" * 40)
-
-        tick_info = get_stock_tick_info(stock_code)
-        if tick_info:
-            print(f"종목코드: {tick_info['stock_code']}")
-            print(f"현재가: {tick_info['current_price']:,}원")
-            print(f"API 호가단위: {tick_info['tick_unit']}원")
-            print(f"계산된 호가단위: {tick_info['calculated_tick']}원")
-            print(f"호가단위 일치: {'✅' if tick_info['tick_match'] else '❌'}")
-            print(f"가격 범위: {tick_info['price_range']}")
-        else:
-            print("❌ 호가단위 정보 조회 실패")
-            return
-
-        # 2. 다양한 가격대 호가단위 테스트
-        print(f"\n📊 2. 가격대별 호가단위 테스트")
-        print("-" * 40)
-
-        test_prices = [500, 1500, 7500, 25000, 75000, 250000, 750000]
-        for price in test_prices:
-            tick = get_tick_unit(price)
-            print(f"{price:,}원 → 호가단위: {tick}원")
-
-        # 3. 안전한 주문가격 계산 테스트
-        print(f"\n💰 3. 안전한 주문가격 계산 테스트")
-        print("-" * 40)
-
-        current_price = tick_info['current_price']
-
-        # 매수 가격 테스트
-        test_buy_prices = [
-            current_price,
-            current_price + 10,  # 약간 높은 가격
-            int(current_price * 1.05),  # 5% 높은 가격
-        ]
-
-        for test_price in test_buy_prices:
-            buy_safe = calculate_safe_order_prices(stock_code, test_price, is_buy=True)
-            if buy_safe:
-                print(f"매수 {test_price:,}원 → {buy_safe['adjusted_price']:,}원 "
-                      f"({buy_safe['adjustment_direction']}, 차이:{buy_safe['price_difference']:+,}원)")
-
-        # 매도 가격 테스트
-        test_sell_prices = [
-            current_price,
-            current_price - 10,  # 약간 낮은 가격
-            int(current_price * 0.95),  # 5% 낮은 가격
-        ]
-
-        for test_price in test_sell_prices:
-            sell_safe = calculate_safe_order_prices(stock_code, test_price, is_buy=False)
-            if sell_safe:
-                print(f"매도 {test_price:,}원 → {sell_safe['adjusted_price']:,}원 "
-                      f"({sell_safe['adjustment_direction']}, 차이:{sell_safe['price_difference']:+,}원)")
-
-        # 4. 호가단위 적용된 스마트 매수 테스트
-        print(f"\n🎯 4. 호가단위 적용된 스마트 매수 테스트")
-        print("-" * 40)
-
-        buy_decision = smart_buy_decision(stock_code, 1000000)
-        if buy_decision and buy_decision.get('buy_decision'):
-            print(f"✅ 매수 추천!")
-            print(f"현재가: {buy_decision['current_price']:,}원")
-            print(f"안전 매수가: {buy_decision['safe_buy_price']:,}원")
-            print(f"목표가: {buy_decision['target_price']:,}원")
-            print(f"손절가: {buy_decision['stop_loss_price']:,}원")
-            print(f"호가단위: {buy_decision['tick_info']['tick_unit']}원")
-
-            # 가격 조정 내역
-            adjustments = buy_decision['price_adjustments']
-            print(f"\n📋 가격 조정 내역:")
-            print(f"  손절가: {adjustments['raw_stop_loss']:,}원 → {adjustments['adjusted_stop_loss']:,}원 "
-                  f"({adjustments['stop_loss_diff']:+,}원)")
-            print(f"  목표가: {adjustments['raw_target']:,}원 → {adjustments['adjusted_target']:,}원 "
-                  f"({adjustments['target_diff']:+,}원)")
-        else:
-            reason = "알 수 없음"
-            if buy_decision is not None:
-                reason = buy_decision.get('reason', '알 수 없음')
-            print(f"❌ 매수 비추천: {reason}")
-
-        print(f"\n🎯 테스트 완료!")
-        print("=" * 70)
-
-    except Exception as e:
-        logger.error(f"호가단위 테스트 오류: {e}")
-        print(f"❌ 테스트 중 오류 발생: {e}")
-
-
-def fix_order_price_for_existing_position(stock_code: str, order_price: int, is_buy: bool = False) -> Dict:
-    """
-    🎯 기존 포지션의 주문가격 호가단위 오류 수정
-
-    Args:
-        stock_code: 종목코드
-        order_price: 원래 주문가격
-        is_buy: True=매수, False=매도
-
-    Returns:
-        수정된 주문가격 정보
-    """
-    try:
-        logger.info(f"🔧 호가단위 오류 수정: {stock_code} {order_price:,}원 ({'매수' if is_buy else '매도'})")
-
-        # 안전한 주문가격 계산
-        safe_price_info = calculate_safe_order_prices(stock_code, order_price, is_buy)
-
-        if safe_price_info:
-            result = {
-                'success': True,
-                'original_price': order_price,
-                'fixed_price': safe_price_info['adjusted_price'],
-                'price_difference': safe_price_info['price_difference'],
-                'tick_unit': safe_price_info['tick_unit'],
-                'adjustment_direction': safe_price_info['adjustment_direction'],
-                'suggestion': safe_price_info['order_type_suggestion']
-            }
-
-            logger.info(f"✅ 가격 수정 완료: {order_price:,}원 → {result['fixed_price']:,}원 "
-                       f"({result['adjustment_direction']}, 차이:{result['price_difference']:+,}원)")
-
-        else:
-            # 백업: 기본 호가단위 계산
-            tick_unit = get_tick_unit(order_price)
-            fixed_price = adjust_price_to_tick_unit(order_price, tick_unit, round_up=is_buy)
-
-            result = {
-                'success': True,
-                'original_price': order_price,
-                'fixed_price': fixed_price,
-                'price_difference': fixed_price - order_price,
-                'tick_unit': tick_unit,
-                'adjustment_direction': "상향" if fixed_price > order_price else "하향" if fixed_price < order_price else "조정없음",
-                'suggestion': "기본 호가단위 적용"
-            }
-
-            logger.warning(f"⚠️ 백업 방식으로 가격 수정: {order_price:,}원 → {fixed_price:,}원")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"주문가격 수정 오류 ({stock_code}): {e}")
-        return {
-            'success': False,
-            'error': str(e),
-            'original_price': order_price
-        }
-
-
-def get_safe_prices_for_trading_system(stock_code: str) -> Optional[Dict]:
-    """
-    🎯 트레이딩 시스템용 안전한 가격 세트 제공
-
-    Args:
-        stock_code: 종목코드
-
-    Returns:
-        트레이딩 시스템에서 사용할 안전한 가격들
-    """
-    try:
-        # 현재가 및 호가단위 정보
-        tick_info = get_stock_tick_info(stock_code)
-        if not tick_info:
-            logger.error(f"종목 {stock_code} 정보 조회 실패")
-            return None
-
-        current_price = tick_info['current_price']
-        tick_unit = tick_info['tick_unit']
-
-        # 다양한 상황의 안전한 가격 계산
-        prices = {
-            'current_price': current_price,
-            'tick_unit': tick_unit,
-
-            # 매수 관련 가격 (올림)
-            'safe_buy_current': adjust_price_to_tick_unit(current_price, tick_unit, round_up=True),
-            'safe_buy_plus_1tick': current_price + tick_unit,
-            'safe_buy_plus_2tick': current_price + (tick_unit * 2),
-
-            # 매도 관련 가격 (내림)
-            'safe_sell_current': adjust_price_to_tick_unit(current_price, tick_unit, round_up=False),
-            'safe_sell_minus_1tick': current_price - tick_unit,
-            'safe_sell_minus_2tick': current_price - (tick_unit * 2),
-
-            # 일반적인 손절/익절 가격 (호가단위 적용)
-            'stop_loss_3pct': adjust_price_to_tick_unit(int(current_price * 0.97), tick_unit, round_up=False),
-            'stop_loss_5pct': adjust_price_to_tick_unit(int(current_price * 0.95), tick_unit, round_up=False),
-            'take_profit_5pct': adjust_price_to_tick_unit(int(current_price * 1.05), tick_unit, round_up=False),
-            'take_profit_10pct': adjust_price_to_tick_unit(int(current_price * 1.10), tick_unit, round_up=False),
-        }
-
-        # 검증: 모든 가격이 호가단위에 맞는지 확인
-        for price_name, price_value in prices.items():
-            if price_name not in ['current_price', 'tick_unit']:
-                if price_value % tick_unit != 0:
-                    logger.warning(f"⚠️ {stock_code} {price_name}: {price_value:,}원이 호가단위에 맞지 않음")
-
-        result = {
-            'stock_code': stock_code,
-            'prices': prices,
-            'tick_info': tick_info,
-            'generated_time': datetime.now().strftime('%H:%M:%S')
-        }
-
-        logger.info(f"🎯 {stock_code} 안전가격 세트 생성 완료 (호가단위: {tick_unit}원)")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"안전 가격 세트 생성 오류 ({stock_code}): {e}")
-        return None
 
 
 # =============================================================================
