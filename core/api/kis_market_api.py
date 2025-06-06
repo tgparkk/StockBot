@@ -856,3 +856,23 @@ def get_account_balance() -> Optional[Dict]:
         logger.error(f"계좌잔고 요약 오류: {e}")
         return None
 
+
+def get_existing_holdings() -> List[Dict]:
+    """
+    기존 보유 종목 조회 (CandleTradeManager용)
+
+    Returns:
+        보유 종목 리스트
+    """
+    try:
+        account_balance = get_account_balance()
+
+        if not account_balance or account_balance['total_stocks'] == 0:
+            return []
+
+        return account_balance['stocks']
+
+    except Exception as e:
+        logger.error(f"기존 보유 종목 조회 오류: {e}")
+        return []
+
