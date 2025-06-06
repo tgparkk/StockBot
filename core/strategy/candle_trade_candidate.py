@@ -63,6 +63,7 @@ class EntryConditions:
     daily_volume_check: bool = False   # 일 거래대금 조건
     overall_passed: bool = False       # 전체 통과 여부
     fail_reasons: List[str] = field(default_factory=list)  # 실패 이유
+    technical_indicators: Dict[str, Any] = field(default_factory=dict)  # 기술적 지표 값들
 
 
 @dataclass
