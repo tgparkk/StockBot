@@ -126,7 +126,7 @@ class MarketScanner:
 
                 # 배치 간 간격 (API 부하 방지)
                 if batch_end < len(unique_candidates):
-                    await asyncio.sleep(0.5)  # 500ms 대기
+                    await asyncio.sleep(0.3)  # 300ms 대기
 
             logger.info(f"🎯 {market_name} 패턴 감지: {pattern_found_count}개 종목")
 
