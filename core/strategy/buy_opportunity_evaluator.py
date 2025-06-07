@@ -31,7 +31,7 @@ class BuyOpportunityEvaluator:
         try:
             # 🎯 매수 준비 상태인 종목들만 필터링
             buy_ready_candidates = [
-                candidate for candidate in self.manager._all_stocks.values()
+                candidate for candidate in self.manager.stock_manager._all_stocks.values()
                 if candidate.status == CandleStatus.BUY_READY and candidate.is_ready_for_entry()
             ]
 
@@ -77,7 +77,7 @@ class BuyOpportunityEvaluator:
             valid_candidates.sort(key=lambda x: x.entry_priority, reverse=True)
 
             # 현재 포지션 수 체크
-            current_positions = len([c for c in self.manager._all_stocks.values() if c.status == CandleStatus.ENTERED])
+            current_positions = len([c for c in self.manager.stock_manager._all_stocks.values() if c.status == CandleStatus.ENTERED])
             max_positions = self.manager.config['max_positions']
 
             if current_positions >= max_positions:
@@ -306,9 +306,9 @@ class BuyOpportunityEvaluator:
 
             # 🆕 _all_stocks 상태 업데이트 (BUY_READY → ENTERED)
             candidate.status = CandleStatus.ENTERED
-            if candidate.stock_code in self.manager._all_stocks:
-                self.manager._all_stocks[candidate.stock_code] = candidate
-                logger.debug(f"🔄 {candidate.stock_code} _all_stocks 상태 업데이트: → ENTERED")
+            if candidate.stock_code in self.manager.stock_manager._all_stocks:
+                self.manager.stock_manager._all_stocks[candidate.stock_code] = candidate
+                logger.debug(f"🔄 {candidate.stock_code} stock_manager._all_stocks 상태 업데이트: → ENTERED")
 
             # 일일 통계 업데이트
             self.manager.daily_stats['trades_count'] += 1
