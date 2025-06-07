@@ -9,7 +9,7 @@ import pandas as pd
 
 from .candle_trade_candidate import (
     CandleTradeCandidate, CandleStatus, TradeSignal, PatternType,
-    CandlePatternInfo, RiskManagement
+    CandlePatternInfo, EntryConditions, RiskManagement
 )
 from utils.logger import setup_logger
 
@@ -191,6 +191,12 @@ class MarketScanner:
                 hasattr(self.manager.stock_manager, '_all_stocks') and
                 stock_code in self.manager.stock_manager._all_stocks):
                 existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
+
+                # 🔧 PENDING_ORDER 상태인 종목은 스캔에서 제외 (중복 주문 방지)
+                if existing_candidate.status == CandleStatus.PENDING_ORDER:
+                    logger.debug(f"⏳ {stock_code} PENDING_ORDER 상태 - 스캔 제외")
+                    return None
+
                 ohlcv_data = existing_candidate.get_ohlcv_data()
                 if ohlcv_data is not None:
                     logger.debug(f"📄 {stock_code} 기존 _all_stocks에서 캐시된 일봉 데이터 사용")

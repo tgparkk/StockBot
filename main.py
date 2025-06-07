@@ -130,6 +130,9 @@ class StockBot:
             websocket_manager=self.websocket_manager  # 🆕 웹소켓 매니저 전달
         )
 
+        # 🎯 TradeExecutor에 CandleTradeManager 참조 설정 (체결 확인 연동용)
+        self.trade_executor.set_candle_trade_manager(self.candle_trade_manager)
+
         # 10. 워커 매니저 (스레드 관리 전담)
         self.worker_manager = WorkerManager(self.shutdown_event)
 

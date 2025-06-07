@@ -123,7 +123,7 @@ class SellPositionManager:
 
             if not is_candle_strategy:
                 # 수동/앱 매수 종목: 큰 수익/손실 허용 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
-                logger.debug(f"📊 {position.stock_code} 수동 매수 종목 - 기본 설정 적용")
+                logger.debug(f"📊 {position.stock_code} 패턴 미발견 매수 종목 - 기본 설정 적용")
                 return 3.0, 3.0, 24, False
 
             # 2. 🔄 실시간 캔들 패턴 재분석 (🆕 캐싱 활용)
@@ -325,9 +325,18 @@ class SellPositionManager:
                     if not result.success:
                         logger.error(f"❌ 매도 주문 실패: {position.stock_code} - {result.error_message}")
                         return False
-                    logger.info(f"✅ 실제 매도 주문 성공: {position.stock_code} "
+
+                    # 🔧 수정: 매도 주문 성공시 PENDING_ORDER 상태로 변경
+                    order_no = getattr(result, 'order_no', None)
+                    position.set_pending_order(order_no or f"sell_unknown_{datetime.now().strftime('%H%M%S')}", 'sell')
+
+                    logger.info(f"📉 매도 주문 제출 성공: {position.stock_code} "
                                f"현재가{exit_price:,.0f}원 → 주문가{safe_sell_price:,.0f}원 "
-                               f"(주문번호: {result.order_no})")
+                               f"(주문번호: {order_no})")
+
+                    # 🔧 매도 주문 성공시 상태 업데이트
+                    self.manager.stock_manager.update_candidate(position)
+
                 except Exception as e:
                     logger.error(f"❌ 매도 주문 실행 오류: {position.stock_code} - {e}")
                     return False
@@ -336,23 +345,18 @@ class SellPositionManager:
                 logger.info(f"📉 매도 주문 (테스트): {position.stock_code} {quantity}주 "
                            f"현재가{exit_price:,.0f}원 → 주문가{safe_sell_price:,.0f}원")
 
-            # 포지션 청산 기록 (원래 exit_price로 기록)
-            position.exit_position(exit_price, reason)
+                # 🔧 테스트 모드에서도 주문 추적
+                test_order_no = f"test_sell_{position.stock_code}_{datetime.now().strftime('%H%M%S')}"
+                position.set_pending_order(test_order_no, 'sell')
+                self.manager.stock_manager.update_candidate(position)
 
-            # 🆕 _all_stocks 상태 업데이트 (ENTERED → EXITED)
-            if position.stock_code in self.manager.stock_manager._all_stocks:
-                self.manager.stock_manager._all_stocks[position.stock_code].status = CandleStatus.EXITED
-                self.manager.stock_manager._all_stocks[position.stock_code].exit_position(exit_price, reason)
-                logger.debug(f"🔄 {position.stock_code} stock_manager._all_stocks 상태 업데이트: → EXITED")
+            # 🔧 포지션 청산 기록 제거 - 웹소켓 체결 확인 후 처리
+            # position.exit_position(exit_price, reason)  # 제거됨
 
-            # 일일 통계 업데이트
-            if position.performance.realized_pnl:
-                self.manager.daily_stats['total_profit_loss'] += position.performance.realized_pnl
-
-                if position.performance.realized_pnl > 0:
-                    self.manager.daily_stats['successful_trades'] += 1
-                else:
-                    self.manager.daily_stats['failed_trades'] += 1
+            # 🔧 stock_manager 상태 업데이트 제거 - 웹소켓 체결 확인 후 처리
+            # if position.stock_code in self.manager.stock_manager._all_stocks:
+            #     self.manager.stock_manager._all_stocks[position.stock_code].status = CandleStatus.EXITED
+            #     self.manager.stock_manager._all_stocks[position.stock_code].exit_position(exit_price, reason)
 
             return True
 

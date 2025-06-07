@@ -44,6 +44,9 @@ class KISWebSocketMessageHandler:
         # 🆕 체결통보 직접 처리를 위한 OrderExecutionManager
         self.execution_manager = None
 
+        # 🎯 CandleTradeManager 설정 - _all_stocks 상태 업데이트용
+        self.candle_trade_manager = None
+
         # 통계
         self.stats = {
             'messages_received': 0,
@@ -57,6 +60,11 @@ class KISWebSocketMessageHandler:
         """🎯 OrderExecutionManager 설정"""
         self.execution_manager = execution_manager
         logger.info("✅ OrderExecutionManager 설정 완료 - 직접 체결통보 처리 가능")
+
+    def set_candle_trade_manager(self, candle_trade_manager):
+        """🎯 CandleTradeManager 설정 - _all_stocks 상태 업데이트용"""
+        self.candle_trade_manager = candle_trade_manager
+        logger.info("✅ CandleTradeManager 설정 완료 - _all_stocks 상태 업데이트 처리 가능")
 
     async def handle_realtime_data(self, data: str):
         """실시간 데이터 처리 - 🎯 KIS 공식 문서 기준 개선"""
@@ -292,6 +300,13 @@ class KISWebSocketMessageHandler:
             # 🚀 OrderExecutionManager로 직접 전달
             logger.info(f"🎯 체결통보 직접 처리: {decrypted_data[:100]}...")
             await execution_manager.handle_execution_notice(notice_data)
+
+            # 🎯 CandleTradeManager의 _all_stocks 상태 업데이트도 처리
+            if self.candle_trade_manager:
+                logger.info("🔄 CandleTradeManager _all_stocks 상태 업데이트 처리")
+                await self.candle_trade_manager.handle_execution_confirmation(decrypted_data)
+            else:
+                logger.debug("💡 CandleTradeManager가 설정되지 않음 - _all_stocks 업데이트 생략")
 
         except Exception as e:
             logger.error(f"❌ 체결통보 직접 처리 오류: {e}")

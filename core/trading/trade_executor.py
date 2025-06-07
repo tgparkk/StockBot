@@ -135,13 +135,35 @@ class TradeExecutor:
                 # 🎯 WebSocketMessageHandler에 OrderExecutionManager 직접 설정
                 if hasattr(websocket_manager, 'message_handler'):
                     message_handler = websocket_manager.message_handler
+
+                    # 🎯 OrderExecutionManager 설정
                     if hasattr(message_handler, 'set_execution_manager'):
                         message_handler.set_execution_manager(self.execution_manager)
                         logger.info("✅ WebSocketMessageHandler에 OrderExecutionManager 설정 완료")
                         logger.info("📡 체결통보는 WebSocketMessageHandler에서 직접 처리됨")
-                        return
                     else:
                         logger.warning("⚠️ WebSocketMessageHandler에 set_execution_manager 메서드 없음")
+
+                    # 🎯 CandleTradeManager 설정 (main.py에서 설정할 예정이지만 백업)
+                    if hasattr(message_handler, 'set_candle_trade_manager'):
+                        # CandleTradeManager 인스턴스를 찾기 위해 여러 경로 시도
+                        candle_trade_manager = None
+
+                        # 경로 1: 전역 변수나 모듈에서 찾기 (나중에 main.py에서 설정)
+                        # 경로 2: self에서 직접 찾기
+                        if hasattr(self, 'candle_trade_manager'):
+                            candle_trade_manager = self.candle_trade_manager
+
+                        if candle_trade_manager:
+                            message_handler.set_candle_trade_manager(candle_trade_manager)
+                            logger.info("✅ WebSocketMessageHandler에 CandleTradeManager 설정 완료")
+                        else:
+                            logger.debug("💡 CandleTradeManager 아직 설정되지 않음 - main.py에서 설정 예정")
+                    else:
+                        logger.warning("⚠️ WebSocketMessageHandler에 set_candle_trade_manager 메서드 없음")
+
+                    if hasattr(message_handler, 'set_execution_manager') or hasattr(message_handler, 'set_candle_trade_manager'):
+                        return
                 else:
                     logger.warning("⚠️ WebSocketManager에 message_handler 속성 없음")
 
@@ -178,6 +200,24 @@ class TradeExecutor:
 
         except Exception as e:
             logger.error(f"❌ 웹소켓 콜백 등록 오류: {e}")
+
+    def set_candle_trade_manager(self, candle_trade_manager):
+        """🎯 CandleTradeManager 참조 설정 - main.py에서 호출"""
+        self.candle_trade_manager = candle_trade_manager
+        logger.info("✅ TradeExecutor에 CandleTradeManager 참조 설정 완료")
+
+        # 웹소켓 핸들러에도 설정
+        try:
+            if (hasattr(self.data_manager, 'websocket_manager') and
+                self.data_manager.websocket_manager and
+                hasattr(self.data_manager.websocket_manager, 'message_handler')):
+
+                message_handler = self.data_manager.websocket_manager.message_handler
+                if hasattr(message_handler, 'set_candle_trade_manager'):
+                    message_handler.set_candle_trade_manager(candle_trade_manager)
+                    logger.info("✅ WebSocketMessageHandler에 CandleTradeManager 연동 완료")
+        except Exception as e:
+            logger.error(f"❌ CandleTradeManager 웹소켓 연동 오류: {e}")
 
     def execute_buy_signal(self, signal: Dict) -> TradeResult:
         """
