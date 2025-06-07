@@ -123,30 +123,49 @@ class SellPositionManager:
 
             if not is_candle_strategy:
                 # 수동/앱 매수 종목: 큰 수익/손실 허용 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
-                logger.debug(f"📊 {position.stock_code} 패턴 미감지 - 기본 설정 적용")
+                logger.debug(f"📊 {position.stock_code} 수동 매수 종목 - 기본 설정 적용")
                 return 3.0, 3.0, 24, False
 
-            # 2. 🔄 실시간 캔들 패턴 재분석 (DB 의존 제거)
+            # 2. 🔄 실시간 캔들 패턴 재분석 (🆕 캐싱 활용)
             original_pattern = None
 
-            # 🆕 실시간 캔들 패턴 분석 (가장 우선)
-            try:
-                from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                ohlcv_data = get_inquire_daily_itemchartprice(
-                    output_dv="2",
-                    itm_no=position.stock_code,
-                    period_code="D",
-                    adj_prc="1"
-                )
+            # 🆕 캐시된 일봉 데이터 우선 사용
+            ohlcv_data = position.get_ohlcv_data()
 
-                if ohlcv_data is not None and not ohlcv_data.empty:
+            if ohlcv_data is None:
+                # 캐시에 없으면 API 호출
+                try:
+                    from ..api.kis_market_api import get_inquire_daily_itemchartprice
+                    ohlcv_data = get_inquire_daily_itemchartprice(
+                        output_dv="2",
+                        itm_no=position.stock_code,
+                        period_code="D",
+                        adj_prc="1"
+                    )
+
+                    # 🆕 조회 성공시 캐싱
+                    if ohlcv_data is not None and not ohlcv_data.empty:
+                        position.cache_ohlcv_data(ohlcv_data)
+                        logger.debug(f"📥 {position.stock_code} 일봉 데이터 조회 및 캐싱 완료")
+                    else:
+                        logger.debug(f"❌ {position.stock_code} 일봉 데이터 조회 실패")
+
+                except Exception as e:
+                    logger.debug(f"일봉 데이터 조회 오류 ({position.stock_code}): {e}")
+                    ohlcv_data = None
+            else:
+                logger.debug(f"📄 {position.stock_code} 캐시된 일봉 데이터 사용")
+
+            # 🆕 실시간 캔들 패턴 분석 (캐시된 데이터 활용)
+            if ohlcv_data is not None and not ohlcv_data.empty:
+                try:
                     pattern_result = self.manager.pattern_detector.analyze_stock_patterns(position.stock_code, ohlcv_data)
                     if pattern_result and len(pattern_result) > 0:
                         strongest_pattern = max(pattern_result, key=lambda p: p.strength)
                         original_pattern = strongest_pattern.pattern_type.value
                         logger.debug(f"🔄 {position.stock_code} 실시간 패턴 분석: {original_pattern} (강도: {strongest_pattern.strength})")
-            except Exception as e:
-                logger.debug(f"실시간 패턴 분석 오류 ({position.stock_code}): {e}")
+                except Exception as e:
+                    logger.debug(f"패턴 분석 오류 ({position.stock_code}): {e}")
 
             # DB에서 복원된 경우 (백업)
             if not original_pattern and 'original_pattern_type' in position.metadata:
@@ -398,14 +417,13 @@ class SellPositionManager:
     def _update_trailing_stop(self, position: CandleTradeCandidate, current_price: float):
         """🔄 패턴 기반 동적 목표/손절 조정 시스템 (개선된 버전)"""
         try:
-            # 🆕 OHLCV 데이터 한 번만 조회하여 재사용
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            ohlcv_data = get_inquire_daily_itemchartprice(
-                output_dv="2",
-                itm_no=position.stock_code,
-                period_code="D",
-                adj_prc="1"
-            )
+            # 🆕 캐시된 OHLCV 데이터 사용 (API 호출 제거)
+            ohlcv_data = position.get_ohlcv_data()
+            if ohlcv_data is None:
+                logger.debug(f"📄 {position.stock_code} 캐시된 일봉 데이터 없음 - 기본 trailing stop 적용")
+                # 캐시된 데이터가 없으면 기존 방식으로 폴백
+                self._fallback_trailing_stop(position, current_price)
+                return
 
             # 🆕 1단계: 실시간 캔들 패턴 재분석 (OHLCV 데이터 전달)
             pattern_update = self._analyze_realtime_pattern_changes(position.stock_code, current_price, ohlcv_data)
@@ -427,17 +445,9 @@ class SellPositionManager:
     def _analyze_realtime_pattern_changes(self, stock_code: str, current_price: float, ohlcv_data: Optional[Any] = None) -> Dict:
         """🔄 실시간 캔들 패턴 변화 분석"""
         try:
-            # OHLCV 데이터가 전달되지 않은 경우에만 새로 조회
-            if ohlcv_data is None:
-                from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                ohlcv_data = get_inquire_daily_itemchartprice(
-                    output_dv="2",
-                    itm_no=stock_code,
-                    period_code="D",
-                    adj_prc="1"
-                )
-
+            # 🆕 전달받은 OHLCV 데이터만 사용 (API 호출 제거)
             if ohlcv_data is None or ohlcv_data.empty:
+                logger.debug(f"📄 {stock_code} OHLCV 데이터 없음 - 패턴 분석 불가")
                 return {'pattern_strength_changed': False, 'new_patterns': []}
 
             # 현재 패턴 분석
@@ -517,23 +527,14 @@ class SellPositionManager:
     def _calculate_trend_based_adjustments(self, position: CandleTradeCandidate, current_price: float, ohlcv_data: Optional[Any] = None) -> Dict:
         """📈 추세 강도 기반 조정 계산"""
         try:
-            # OHLCV 데이터가 전달되지 않은 경우에만 새로 조회
-            if ohlcv_data is None:
-                from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                daily_data = get_inquire_daily_itemchartprice(
-                    output_dv="2",
-                    itm_no=position.stock_code,
-                    period_code="D"
-                )
-            else:
-                daily_data = ohlcv_data
-
-            if daily_data is None or daily_data.empty or len(daily_data) < 5:
+            # 🆕 전달받은 OHLCV 데이터만 사용 (API 호출 제거)
+            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 5:
+                logger.debug(f"📄 {position.stock_code} OHLCV 데이터 부족 - 추세 분석 불가")
                 return {'trend_strength': 'NEUTRAL', 'trend_multiplier': 1.0}
 
             # 최근 5일 종가 추출
             recent_closes = []
-            for _, row in daily_data.head(5).iterrows():
+            for _, row in ohlcv_data.head(5).iterrows():
                 try:
                     close_price = float(row.get('stck_clpr', 0))
                     if close_price > 0:

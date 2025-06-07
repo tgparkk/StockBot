@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from enum import Enum
+import pandas as pd
 
 
 class PatternType(Enum):
@@ -116,6 +117,11 @@ class CandleTradeCandidate:
     current_price: float
     market_type: str                    # "KOSPI", "KOSDAQ"
 
+    # ========== 🆕 일봉 데이터 캐싱 ==========
+    ohlcv_data: Optional[pd.DataFrame] = None       # 일봉 데이터 캐시
+    ohlcv_last_updated: Optional[datetime] = None   # 일봉 데이터 마지막 업데이트 시간
+    ohlcv_update_date: Optional[str] = None         # 일봉 데이터 업데이트 일자 (YYYYMMDD)
+
     # ========== 캔들 패턴 정보 ==========
     detected_patterns: List[CandlePatternInfo] = field(default_factory=list)
     primary_pattern: Optional[CandlePatternInfo] = None
@@ -152,6 +158,36 @@ class CandleTradeCandidate:
     # ========== 추가 메타데이터 ==========
     metadata: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+
+    # ========== 🆕 일봉 데이터 캐싱 메서드 ==========
+
+    def cache_ohlcv_data(self, ohlcv_data: pd.DataFrame):
+        """일봉 데이터 캐싱"""
+        self.ohlcv_data = ohlcv_data.copy() if ohlcv_data is not None else None
+        self.ohlcv_last_updated = datetime.now()
+        self.ohlcv_update_date = datetime.now().strftime('%Y%m%d')
+        self.last_updated = datetime.now()
+
+    def is_ohlcv_data_valid(self) -> bool:
+        """캐시된 일봉 데이터의 유효성 확인"""
+        if self.ohlcv_data is None or self.ohlcv_update_date is None:
+            return False
+
+        # 오늘 날짜와 비교
+        today = datetime.now().strftime('%Y%m%d')
+        return self.ohlcv_update_date == today
+
+    def get_ohlcv_data(self) -> Optional[pd.DataFrame]:
+        """캐시된 일봉 데이터 조회"""
+        if self.is_ohlcv_data_valid():
+            return self.ohlcv_data
+        return None
+
+    def invalidate_ohlcv_cache(self):
+        """일봉 데이터 캐시 무효화"""
+        self.ohlcv_data = None
+        self.ohlcv_last_updated = None
+        self.ohlcv_update_date = None
 
     def add_pattern(self, pattern_info: CandlePatternInfo):
         """패턴 정보 추가"""

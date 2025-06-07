@@ -248,14 +248,12 @@ class CandleAnalyzer:
             old_price = candidate.current_price
             candidate.update_price(current_price)
 
-            # 🆕 OHLCV 데이터 한 번만 조회 (하위 함수들에서 공유 사용)
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            ohlcv_data = get_inquire_daily_itemchartprice(
-                output_dv="2",
-                itm_no=stock_code,
-                period_code="D",
-                adj_prc="1"
-            )
+            # 🆕 캐시된 OHLCV 데이터 우선 사용 (API 호출 제거)
+            ohlcv_data = candidate.get_ohlcv_data()
+            if ohlcv_data is None:
+                logger.debug(f"📄 {stock_code} 캐시된 일봉 데이터 없음 - 분석 제한")
+                # 캐시된 데이터가 없어도 기본 분석은 진행
+                ohlcv_data = None
 
             # 2. 📊 최신 캔들 패턴 재분석 (OHLCV 데이터 전달)
             pattern_signals = await self.analyze_current_patterns(stock_code, current_price, ohlcv_data)
@@ -486,27 +484,23 @@ class CandleAnalyzer:
                 logger.debug(f"📊 {position.stock_code} 수동 매수 종목 - 기본 설정 적용")
                 return 2.0, 3.0, 24, False
 
-            # 2. 🔄 실시간 캔들 패턴 재분석 (DB 의존 제거)
+            # 2. 🔄 실시간 캔들 패턴 재분석 (🆕 캐시된 데이터 활용)
             original_pattern = None
 
-            # 🆕 실시간 캔들 패턴 분석 (가장 우선)
-            try:
-                from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                ohlcv_data = get_inquire_daily_itemchartprice(
-                    output_dv="2",
-                    itm_no=position.stock_code,
-                    period_code="D",
-                    adj_prc="1"
-                )
+            # 🆕 캐시된 OHLCV 데이터 사용 (API 호출 제거)
+            ohlcv_data = position.get_ohlcv_data()
 
-                if ohlcv_data is not None and not ohlcv_data.empty:
+            if ohlcv_data is not None and not ohlcv_data.empty:
+                try:
                     pattern_result = self.pattern_detector.analyze_stock_patterns(position.stock_code, ohlcv_data)
                     if pattern_result and len(pattern_result) > 0:
                         strongest_pattern = max(pattern_result, key=lambda p: p.strength)
                         original_pattern = strongest_pattern.pattern_type.value
-                        logger.debug(f"🔄 {position.stock_code} 실시간 패턴 분석: {original_pattern} (강도: {strongest_pattern.strength})")
-            except Exception as e:
-                logger.debug(f"실시간 패턴 분석 오류 ({position.stock_code}): {e}")
+                        logger.debug(f"🔄 {position.stock_code} 캐시된 데이터로 패턴 분석: {original_pattern} (강도: {strongest_pattern.strength})")
+                except Exception as e:
+                    logger.debug(f"캐시된 데이터 패턴 분석 오류 ({position.stock_code}): {e}")
+            else:
+                logger.debug(f"📄 {position.stock_code} 캐시된 일봉 데이터 없음")
 
             # DB에서 복원된 경우 (백업)
             if not original_pattern and 'original_pattern_type' in position.metadata:
