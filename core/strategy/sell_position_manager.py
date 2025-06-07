@@ -31,7 +31,7 @@ class SellPositionManager:
         try:
             # 🆕 _all_stocks에서 ENTERED 상태인 모든 종목 관리 (기존 보유 + 새로 매수)
             entered_positions = [
-                stock for stock in self.manager._all_stocks.values()
+                stock for stock in self.manager.stock_manager._all_stocks.values()
                 if stock.status == CandleStatus.ENTERED
             ]
 
@@ -321,10 +321,10 @@ class SellPositionManager:
             position.exit_position(exit_price, reason)
 
             # 🆕 _all_stocks 상태 업데이트 (ENTERED → EXITED)
-            if position.stock_code in self.manager._all_stocks:
-                self.manager._all_stocks[position.stock_code].status = CandleStatus.EXITED
-                self.manager._all_stocks[position.stock_code].exit_position(exit_price, reason)
-                logger.debug(f"🔄 {position.stock_code} _all_stocks 상태 업데이트: → EXITED")
+            if position.stock_code in self.manager.stock_manager._all_stocks:
+                self.manager.stock_manager._all_stocks[position.stock_code].status = CandleStatus.EXITED
+                self.manager.stock_manager._all_stocks[position.stock_code].exit_position(exit_price, reason)
+                logger.debug(f"🔄 {position.stock_code} stock_manager._all_stocks 상태 업데이트: → EXITED")
 
             # 일일 통계 업데이트
             if position.performance.realized_pnl:

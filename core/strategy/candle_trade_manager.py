@@ -51,12 +51,10 @@ class CandleTradeManager:
             logger.info("🗄️ 캔들 트레이딩 데이터베이스 연결 완료")
 
                 # 캔들 관련 매니저들 (중복 제거)
-        self.stock_manager = CandleStockManager(max_watch_stocks=100, max_positions=15)
+        self.stock_manager = CandleStockManager(max_watch_stocks=100, max_positions=20)
         self.pattern_detector = CandlePatternDetector()
 
         # 내부 상태
-        self._all_stocks: Dict[str, CandleTradeCandidate] = {}
-        self._existing_holdings: Dict[str, Dict] = {}
         self._last_scan_time: Optional[datetime] = None  # datetime 타입으로 명시
         self._scan_interval = 60  # 1분
         self.is_running = False
@@ -251,8 +249,8 @@ class CandleTradeManager:
         """보유 종목 CandleTradeCandidate 생성 및 설정"""
         try:
             # 이미 _all_stocks에 있는지 확인
-            if stock_code in self._all_stocks:
-                logger.debug(f"✅ {stock_code} 이미 _all_stocks에 존재")
+            if stock_code in self.stock_manager._all_stocks:
+                logger.debug(f"✅ {stock_code} 이미 stock_manager._all_stocks에 존재")
                 return False
 
             # CandleTradeCandidate 객체 생성
@@ -271,8 +269,8 @@ class CandleTradeManager:
                 self._setup_holding_metadata(existing_candidate, candle_analysis_result)
 
                 # _all_stocks에 추가
-                self._all_stocks[stock_code] = existing_candidate
-                logger.debug(f"✅ {stock_code} _all_stocks에 기존 보유 종목으로 추가")
+                self.stock_manager._all_stocks[stock_code] = existing_candidate
+                logger.debug(f"✅ {stock_code} stock_manager._all_stocks에 기존 보유 종목으로 추가")
 
                 # 설정 완료 로그
                 self._log_holding_setup_completion(existing_candidate)
@@ -1260,16 +1258,16 @@ class CandleTradeManager:
     async def _periodic_signal_evaluation(self):
         """🔄 모든 _all_stocks 종목에 대한 주기적 신호 재평가"""
         try:
-            if not self._all_stocks:
+            if not self.stock_manager._all_stocks:
                 return
 
-            logger.debug(f"🔄 주기적 신호 재평가 시작: {len(self._all_stocks)}개 종목")
+            logger.debug(f"🔄 주기적 신호 재평가 시작: {len(self.stock_manager._all_stocks)}개 종목")
 
             # 종목들을 상태별로 분류하여 처리
             watching_stocks = []
             entered_stocks = []
 
-            for stock_code, candidate in self._all_stocks.items():
+            for stock_code, candidate in self.stock_manager._all_stocks.items():
                 if candidate.status == CandleStatus.WATCHING or candidate.status == CandleStatus.BUY_READY:
                     watching_stocks.append(candidate)
                 elif candidate.status == CandleStatus.ENTERED or candidate.status == CandleStatus.SELL_READY:
