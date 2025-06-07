@@ -334,29 +334,14 @@ class SellPositionManager:
                                f"현재가{exit_price:,.0f}원 → 주문가{safe_sell_price:,.0f}원 "
                                f"(주문번호: {order_no})")
 
-                    # 🔧 매도 주문 성공시 상태 업데이트
-                    self.manager.stock_manager.update_candidate(position)
+                    # 🎯 중요: 매도 주문 제출시에는 update_candidate() 호출하지 않음
+                    # 실제 체결은 웹소켓에서 확인 후 handle_execution_confirmation에서 처리됨
+
+                    return True
 
                 except Exception as e:
                     logger.error(f"❌ 매도 주문 실행 오류: {position.stock_code} - {e}")
                     return False
-            else:
-                # TradeExecutor가 없는 경우 로그만 출력 (테스트 모드)
-                logger.info(f"📉 매도 주문 (테스트): {position.stock_code} {quantity}주 "
-                           f"현재가{exit_price:,.0f}원 → 주문가{safe_sell_price:,.0f}원")
-
-                # 🔧 테스트 모드에서도 주문 추적
-                test_order_no = f"test_sell_{position.stock_code}_{datetime.now().strftime('%H%M%S')}"
-                position.set_pending_order(test_order_no, 'sell')
-                self.manager.stock_manager.update_candidate(position)
-
-            # 🔧 포지션 청산 기록 제거 - 웹소켓 체결 확인 후 처리
-            # position.exit_position(exit_price, reason)  # 제거됨
-
-            # 🔧 stock_manager 상태 업데이트 제거 - 웹소켓 체결 확인 후 처리
-            # if position.stock_code in self.manager.stock_manager._all_stocks:
-            #     self.manager.stock_manager._all_stocks[position.stock_code].status = CandleStatus.EXITED
-            #     self.manager.stock_manager._all_stocks[position.stock_code].exit_position(exit_price, reason)
 
             return True
 

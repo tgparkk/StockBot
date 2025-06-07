@@ -331,13 +331,6 @@ class BuyOpportunityEvaluator:
                 except Exception as e:
                     logger.error(f"❌ 매수 주문 실행 오류: {candidate.stock_code} - {e}")
                     return False
-            else:
-                # TradeExecutor가 없는 경우 로그만 출력 (테스트 모드)
-                logger.info(f"📈 매수 주문 (테스트): {candidate.stock_code} {quantity}주 {current_price:,.0f}원")
-
-                # 🔧 테스트 모드에서도 주문 추적
-                test_order_no = f"test_buy_{candidate.stock_code}_{datetime.now().strftime('%H%M%S')}"
-                candidate.set_pending_order(test_order_no, 'buy')
 
             # 일일 통계는 주문 제출 시점에 카운트 (나중에 체결 실패시 조정 가능)
             self.manager.daily_stats['trades_count'] += 1
