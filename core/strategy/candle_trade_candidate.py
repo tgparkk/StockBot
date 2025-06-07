@@ -36,6 +36,7 @@ class CandleStatus(Enum):
     SCANNING = "scanning"        # 스캐닝 중
     WATCHING = "watching"        # 관찰 중
     BUY_READY = "buy_ready"     # 매수 준비
+    PENDING_ORDER = "pending_order"  # 주문 대기 중 (매수/매도 주문 제출됨)
     SELL_READY = "sell_ready"   # 매도 준비
     ENTERED = "entered"          # 진입 완료
     EXITED = "exited"           # 청산 완료
@@ -147,6 +148,16 @@ class CandleTradeCandidate:
     status: CandleStatus = CandleStatus.SCANNING
     created_at: datetime = field(default_factory=datetime.now)
     last_updated: datetime = field(default_factory=datetime.now)
+
+    # ========== 🆕 주문 추적 정보 ==========
+    pending_buy_order_no: Optional[str] = None      # 대기 중인 매수 주문번호
+    pending_sell_order_no: Optional[str] = None     # 대기 중인 매도 주문번호
+    pending_order_time: Optional[datetime] = None   # 주문 제출 시간
+    pending_order_type: Optional[str] = None        # 'buy' 또는 'sell'
+
+    # 완료된 주문 이력
+    completed_buy_orders: List[str] = field(default_factory=list)   # 체결된 매수 주문번호들
+    completed_sell_orders: List[str] = field(default_factory=list)  # 체결된 매도 주문번호들
 
     # ========== 실시간 데이터 ==========
     last_price_update: datetime = field(default_factory=datetime.now)
@@ -291,7 +302,8 @@ class CandleTradeCandidate:
         """진입 준비 상태 확인"""
         return (self.entry_conditions.overall_passed and
                 self.trade_signal in [TradeSignal.STRONG_BUY, TradeSignal.BUY] and
-                self.status in [CandleStatus.WATCHING, CandleStatus.BUY_READY])
+                self.status in [CandleStatus.WATCHING, CandleStatus.BUY_READY] and
+                self.status != CandleStatus.PENDING_ORDER)  # PENDING_ORDER 제외
 
     def get_risk_level(self) -> str:
         """위험도 레벨 문자열"""
@@ -323,3 +335,72 @@ class CandleTradeCandidate:
             'stop_loss_price': self.risk_management.stop_loss_price,
             'last_updated': self.last_updated.strftime('%Y-%m-%d %H:%M:%S')
         }
+
+    # ========== 🆕 주문 추적 메서드 ==========
+
+    def set_pending_order(self, order_no: str, order_type: str):
+        """대기 중인 주문 정보 설정"""
+        if order_type.lower() == 'buy':
+            self.pending_buy_order_no = order_no
+        elif order_type.lower() == 'sell':
+            self.pending_sell_order_no = order_no
+
+        self.pending_order_time = datetime.now()
+        self.pending_order_type = order_type.lower()
+        self.status = CandleStatus.PENDING_ORDER
+        self.last_updated = datetime.now()
+
+    def clear_pending_order(self, order_type: Optional[str] = None):
+        """대기 중인 주문 정보 해제"""
+        if order_type is None or order_type.lower() == 'buy':
+            self.pending_buy_order_no = None
+        if order_type is None or order_type.lower() == 'sell':
+            self.pending_sell_order_no = None
+
+        if not self.pending_buy_order_no and not self.pending_sell_order_no:
+            self.pending_order_time = None
+            self.pending_order_type = None
+
+        self.last_updated = datetime.now()
+
+    def complete_order(self, order_no: Optional[str], order_type: str):
+        """주문 체결 완료 처리"""
+        if order_type.lower() == 'buy':
+            if order_no:
+                self.completed_buy_orders.append(order_no)
+            self.pending_buy_order_no = None
+        elif order_type.lower() == 'sell':
+            if order_no:
+                self.completed_sell_orders.append(order_no)
+            self.pending_sell_order_no = None
+
+        # 모든 대기 주문이 완료되면 pending 정보 해제
+        if not self.pending_buy_order_no and not self.pending_sell_order_no:
+            self.pending_order_time = None
+            self.pending_order_type = None
+
+        self.last_updated = datetime.now()
+
+    def get_pending_order_age_seconds(self) -> Optional[float]:
+        """대기 중인 주문의 경과 시간(초) 반환"""
+        if self.pending_order_time:
+            return (datetime.now() - self.pending_order_time).total_seconds()
+        return None
+
+    def has_pending_order(self, order_type: Optional[str] = None) -> bool:
+        """대기 중인 주문 존재 여부 확인"""
+        if order_type is None:
+            return bool(self.pending_buy_order_no or self.pending_sell_order_no)
+        elif order_type.lower() == 'buy':
+            return bool(self.pending_buy_order_no)
+        elif order_type.lower() == 'sell':
+            return bool(self.pending_sell_order_no)
+        return False
+
+    def get_pending_order_no(self, order_type: str) -> Optional[str]:
+        """대기 중인 주문번호 조회"""
+        if order_type.lower() == 'buy':
+            return self.pending_buy_order_no
+        elif order_type.lower() == 'sell':
+            return self.pending_sell_order_no
+        return None

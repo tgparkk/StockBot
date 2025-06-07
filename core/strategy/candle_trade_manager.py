@@ -380,6 +380,14 @@ class CandleTradeManager:
                     # 기존 포지션 관리 - 매도 시그널 체크
                     await self._manage_existing_positions()
 
+                    # 🆕 미체결 주문 관리 (1분마다)
+                    if hasattr(self, '_last_stale_check_time'):
+                        if (datetime.now() - self._last_stale_check_time).total_seconds() >= 60:
+                            await self.check_and_cancel_stale_orders()
+                            self._last_stale_check_time = datetime.now()
+                    else:
+                        self._last_stale_check_time = datetime.now()
+
                     # 상태 업데이트
                     self._log_status()
 
@@ -493,7 +501,7 @@ class CandleTradeManager:
             if not conditions.volume_check:
                 conditions.fail_reasons.append(f"거래량 부족 ({volume_ratio:.1f}배)")
 
-                        # 2. 기술적 지표 조건 (RSI, MACD, 볼린저밴드 등) - 전달받은 daily_data 사용
+            # 2. 기술적 지표 조건 (RSI, MACD, 볼린저밴드 등) - 전달받은 daily_data 사용
             try:
                 conditions.rsi_check = True  # 기본값
                 conditions.technical_indicators = {}  # 🆕 기술적 지표 저장
@@ -1164,55 +1172,184 @@ class CandleTradeManager:
 
     def cleanup_existing_holdings_monitoring(self):
         """기존 보유 종목 웹소켓 모니터링 정리"""
+        logger.info("🧹 기존 보유 종목 웹소켓 모니터링 정리")
+        self.existing_holdings_callbacks.clear()
+
+    # ========== 🆕 체결 확인 처리 ==========
+
+    async def handle_execution_confirmation(self, execution_data: Dict):
+        """🎯 웹소켓 체결 통보 처리 - 매수/매도 체결 확인 후 상태 업데이트"""
         try:
-            logger.info("🧹 기존 보유 종목 웹소켓 모니터링 정리 시작")
+            # 체결 데이터에서 주요 정보 추출
+            stock_code = execution_data.get('stock_code', '')
+            order_type = execution_data.get('order_type', '')  # 매수/매도 구분
+            executed_quantity = int(execution_data.get('executed_quantity', 0))
+            executed_price = float(execution_data.get('executed_price', 0))
+            order_no = execution_data.get('order_no', '')
 
-            for stock_code, callback in self.existing_holdings_callbacks.items():
-                try:
-                    if self.websocket_manager:
-                        self.websocket_manager.remove_stock_callback(stock_code, callback)
-                except Exception as e:
-                    logger.warning(f"⚠️ {stock_code} 콜백 제거 오류: {e}")
+            if not stock_code or not order_type:
+                logger.warning(f"⚠️ 체결 통보 데이터 부족: {execution_data}")
+                return
 
-            self.existing_holdings_callbacks.clear()
-            logger.info("✅ 기존 보유 종목 모니터링 정리 완료")
+            logger.info(f"🎯 체결 확인: {stock_code} {order_type} {executed_quantity}주 {executed_price:,.0f}원 (주문번호: {order_no})")
+
+            # _all_stocks에서 해당 종목 찾기
+            candidate = self.stock_manager._all_stocks.get(stock_code)
+            if not candidate:
+                logger.debug(f"📋 {stock_code} _all_stocks에 없음 - 다른 전략의 거래일 수 있음")
+                return
+
+            # 매수 체결 처리
+            if order_type.lower() in ['buy', '매수', '01']:
+                await self._handle_buy_execution(candidate, executed_price, executed_quantity, order_no, execution_data)
+
+            # 매도 체결 처리
+            elif order_type.lower() in ['sell', '매도', '02']:
+                await self._handle_sell_execution(candidate, executed_price, executed_quantity, order_no, execution_data)
+
+            else:
+                logger.warning(f"⚠️ 알 수 없는 주문 타입: {order_type}")
 
         except Exception as e:
-            logger.error(f"기존 보유 종목 모니터링 정리 오류: {e}")
+            logger.error(f"❌ 체결 확인 처리 오류: {e}")
+
+    async def _handle_buy_execution(self, candidate: CandleTradeCandidate, executed_price: float,
+                                  executed_quantity: int, order_no: str, execution_data: Dict):
+        """💰 매수 체결 처리"""
+        try:
+            # 1. PENDING_ORDER 상태 확인
+            if candidate.status != CandleStatus.PENDING_ORDER:
+                logger.warning(f"⚠️ {candidate.stock_code} PENDING_ORDER 상태가 아님: {candidate.status.value}")
+
+            # 2. 대기 중인 매수 주문 확인
+            pending_buy_order = candidate.get_pending_order_no('buy')
+            if not pending_buy_order:
+                logger.debug(f"📋 {candidate.stock_code} 대기 중인 매수 주문 없음 - 다른 시스템 주문일 수 있음")
+
+            # 3. 주문번호 일치 확인 (가능한 경우)
+            if order_no and pending_buy_order and pending_buy_order != order_no:
+                logger.debug(f"📋 {candidate.stock_code} 주문번호 불일치: 대기({pending_buy_order}) vs 체결({order_no})")
+
+            # 4. 포지션 진입 처리
+            candidate.enter_position(executed_price, executed_quantity)
+
+            # 5. 주문 완료 처리 및 상태 업데이트
+            candidate.complete_order(order_no, 'buy')
+            candidate.status = CandleStatus.ENTERED
+
+            # 6. 메타데이터 업데이트
+            candidate.metadata['execution_confirmed'] = {
+                'executed_price': executed_price,
+                'executed_quantity': executed_quantity,
+                'execution_time': datetime.now(self.korea_tz).isoformat(),
+                'order_no': order_no,
+                'execution_data': execution_data
+            }
+
+            # 7. stock_manager 업데이트
+            self.stock_manager.update_candidate(candidate)
+
+            # 8. 통계 업데이트
+            self.daily_stats['successful_trades'] = self.daily_stats.get('successful_trades', 0) + 1
+
+            logger.info(f"✅ {candidate.stock_code} 매수 체결 완료: "
+                       f"PENDING_ORDER → ENTERED "
+                       f"{executed_quantity}주 {executed_price:,.0f}원")
+
+        except Exception as e:
+            logger.error(f"❌ 매수 체결 처리 오류 ({candidate.stock_code}): {e}")
+
+    async def _handle_sell_execution(self, candidate: CandleTradeCandidate, executed_price: float,
+                                   executed_quantity: int, order_no: str, execution_data: Dict):
+        """💸 매도 체결 처리"""
+        try:
+            # 1. PENDING_ORDER 상태 확인
+            if candidate.status != CandleStatus.PENDING_ORDER:
+                logger.warning(f"⚠️ {candidate.stock_code} PENDING_ORDER 상태가 아님: {candidate.status.value}")
+
+            # 2. 대기 중인 매도 주문 확인
+            pending_sell_order = candidate.get_pending_order_no('sell')
+            if not pending_sell_order:
+                logger.debug(f"📋 {candidate.stock_code} 대기 중인 매도 주문 없음 - 다른 시스템 주문일 수 있음")
+
+            # 3. 주문번호 일치 확인
+            if order_no and pending_sell_order and pending_sell_order != order_no:
+                logger.debug(f"📋 {candidate.stock_code} 주문번호 불일치: 대기({pending_sell_order}) vs 체결({order_no})")
+
+            # 4. 수익률 계산
+            if candidate.performance.entry_price:
+                profit_pct = ((executed_price - candidate.performance.entry_price) / candidate.performance.entry_price) * 100
+            else:
+                profit_pct = 0.0
+
+            # 5. 포지션 종료 처리
+            candidate.exit_position(executed_price, "체결 확인")
+
+            # 6. 주문 완료 처리 및 상태 업데이트
+            candidate.complete_order(order_no, 'sell')
+            candidate.status = CandleStatus.EXITED
+
+            # 7. 메타데이터 업데이트
+            candidate.metadata['sell_execution'] = {
+                'executed_price': executed_price,
+                'executed_quantity': executed_quantity,
+                'execution_time': datetime.now(self.korea_tz).isoformat(),
+                'order_no': order_no,
+                'profit_pct': profit_pct,
+                'execution_data': execution_data
+            }
+
+            # 8. stock_manager 업데이트
+            self.stock_manager.update_candidate(candidate)
+
+            # 9. 통계 업데이트
+            if profit_pct > 0:
+                self.daily_stats['successful_trades'] = self.daily_stats.get('successful_trades', 0) + 1
+            else:
+                self.daily_stats['failed_trades'] = self.daily_stats.get('failed_trades', 0) + 1
+
+            self.daily_stats['total_profit_loss'] = self.daily_stats.get('total_profit_loss', 0.0) + profit_pct
+
+            logger.info(f"✅ {candidate.stock_code} 매도 체결 완료: "
+                       f"PENDING_ORDER → EXITED "
+                       f"{executed_quantity}주 {executed_price:,.0f}원 (수익률: {profit_pct:.2f}%)")
+
+        except Exception as e:
+            logger.error(f"❌ 매도 체결 처리 오류 ({candidate.stock_code}): {e}")
 
     # ========== 🆕 주기적 신호 재평가 시스템 ==========
 
     async def _periodic_signal_evaluation(self):
-        """🔄 모든 _all_stocks 종목에 대한 주기적 신호 재평가"""
+        """🔄 주기적 신호 재평가 - 30초마다 실행"""
         try:
-            if not self.stock_manager._all_stocks:
+            # 🎯 현재 모든 종목 상태별 분류 (PENDING_ORDER 제외)
+            all_candidates = [
+                candidate for candidate in self.stock_manager._all_stocks.values()
+                if candidate.status != CandleStatus.PENDING_ORDER  # 주문 대기 중인 종목 제외
+            ]
+
+            if not all_candidates:
+                logger.debug("📊 평가할 종목이 없습니다")
                 return
 
-            logger.debug(f"🔄 주기적 신호 재평가 시작: {len(self.stock_manager._all_stocks)}개 종목")
+            # 상태별 분류
+            watching_candidates = [c for c in all_candidates if c.status == CandleStatus.WATCHING]
+            entered_candidates = [c for c in all_candidates if c.status == CandleStatus.ENTERED]
 
-            # 종목들을 상태별로 분류하여 처리
-            watching_stocks = []
-            entered_stocks = []
+            logger.info(f"🔄 신호 재평가: 관찰{len(watching_candidates)}개, 진입{len(entered_candidates)}개 "
+                       f"(PENDING_ORDER 제외)")
 
-            for stock_code, candidate in self.stock_manager._all_stocks.items():
-                if candidate.status == CandleStatus.WATCHING or candidate.status == CandleStatus.BUY_READY:
-                    watching_stocks.append(candidate)
-                elif candidate.status == CandleStatus.ENTERED or candidate.status == CandleStatus.SELL_READY:
-                    entered_stocks.append(candidate)
+            # 🎯 1. 관찰 중인 종목들 재평가 (우선순위 높음)
+            if watching_candidates:
+                logger.debug(f"📊 관찰 중인 종목 재평가: {len(watching_candidates)}개")
+                watch_updated = await self._batch_evaluate_watching_stocks(watching_candidates)
+                logger.debug(f"✅ 관찰 종목 신호 업데이트: {watch_updated}개")
 
-            # 배치 처리로 API 호출 최적화
-            updated_count = 0
-
-            # 1. 관찰 중인 종목들 재평가 (우선순위 높음)
-            if watching_stocks:
-                updated_count += await self._batch_evaluate_watching_stocks(watching_stocks)
-
-            # 2. 진입한 종목들 재평가 (매도 신호 중심)
-            if entered_stocks:
-                updated_count += await self._batch_evaluate_entered_stocks(entered_stocks)
-
-            if updated_count > 0:
-                logger.info(f"🔄 신호 재평가 완료: {updated_count}개 종목 업데이트")
+            # 🎯 2. 진입한 종목들 재평가 (매도 신호 중심)
+            if entered_candidates:
+                logger.debug(f"💰 진입 종목 재평가: {len(entered_candidates)}개")
+                enter_updated = await self._batch_evaluate_entered_stocks(entered_candidates)
+                logger.debug(f"✅ 진입 종목 신호 업데이트: {enter_updated}개")
 
         except Exception as e:
             logger.error(f"주기적 신호 재평가 오류: {e}")
@@ -1258,6 +1395,14 @@ class CandleTradeManager:
                 if i + batch_size < len(candidates):
                     await asyncio.sleep(0.5)  # 0.5초 대기
 
+            # 🆕 신호가 업데이트된 종목들 중 BUY_READY 전환 검토 (BuyOpportunityEvaluator 위임)
+            watching_candidates = [c for c in candidates if c.status == CandleStatus.WATCHING]
+            if watching_candidates:
+                buy_ready_count = await self.buy_evaluator.evaluate_watching_stocks_for_entry(watching_candidates)
+                if buy_ready_count > 0:
+                    logger.info(f"🎯 BUY_READY 전환: {buy_ready_count}개 종목")
+                    updated_count += buy_ready_count
+
             return updated_count
 
         except Exception as e:
@@ -1283,7 +1428,7 @@ class CandleTradeManager:
                 # 병렬로 실행하고 결과 받기
                 analysis_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
 
-                                # 결과 처리
+                # 결과 처리
                 for candidate, analysis_result in zip(batch, analysis_results):
                     try:
                         # 예외 처리
@@ -1324,20 +1469,55 @@ class CandleTradeManager:
             return 0
 
     def _should_update_signal(self, candidate: CandleTradeCandidate, analysis_result: Dict) -> bool:
-        """신호 업데이트 필요 여부 판단"""
+        """신호 업데이트 필요 여부 판단 (개선된 버전)"""
         try:
             new_signal = analysis_result['new_signal']
             new_strength = analysis_result['signal_strength']
 
-            # 신호가 변경되었거나 강도가 크게 변했을 때만 업데이트
+            # 1. 신호 종류가 변경된 경우 (가장 중요)
             signal_changed = new_signal != candidate.trade_signal
-            strength_changed = abs(new_strength - candidate.signal_strength) >= 20  # 20점 이상 차이
+            if signal_changed:
+                logger.debug(f"🔄 {candidate.stock_code} 신호 변경: {candidate.trade_signal.value} → {new_signal.value}")
+                return True
 
-            return signal_changed or strength_changed
+            # 2. 강도 변화 체크 (더 민감하게)
+            strength_diff = abs(new_strength - candidate.signal_strength)
+
+            # 강한 신호일수록 더 민감하게 반응
+            if new_signal in [TradeSignal.STRONG_BUY, TradeSignal.STRONG_SELL]:
+                threshold = 10  # 강한 신호는 10점 차이
+            elif new_signal in [TradeSignal.BUY, TradeSignal.SELL]:
+                threshold = 15  # 일반 신호는 15점 차이
+            else:
+                threshold = 20  # HOLD 신호는 20점 차이
+
+            strength_changed = strength_diff >= threshold
+
+            if strength_changed:
+                logger.debug(f"🔄 {candidate.stock_code} 강도 변화: {candidate.signal_strength} → {new_strength} (차이:{strength_diff:.1f})")
+                return True
+
+            # 3. 중요한 임계점 통과 체크
+            critical_thresholds = [30, 50, 70, 80]  # 중요한 강도 구간
+            old_range = self._get_strength_range(candidate.signal_strength, critical_thresholds)
+            new_range = self._get_strength_range(new_strength, critical_thresholds)
+
+            if old_range != new_range:
+                logger.debug(f"🔄 {candidate.stock_code} 강도 구간 변화: {old_range} → {new_range}")
+                return True
+
+            return False
 
         except Exception as e:
             logger.debug(f"신호 업데이트 판단 오류: {e}")
             return False
+
+    def _get_strength_range(self, strength: float, thresholds: List[int]) -> str:
+        """강도 구간 계산"""
+        for i, threshold in enumerate(sorted(thresholds)):
+            if strength <= threshold:
+                return f"range_{i}"
+        return f"range_{len(thresholds)}"
 
     def _should_update_exit_signal(self, candidate: CandleTradeCandidate, analysis_result: Dict) -> bool:
         """매도 신호 업데이트 필요 여부 판단"""
@@ -1423,3 +1603,83 @@ class CandleTradeManager:
         except Exception as e:
             logger.error(f"활성 포지션 조회 오류: {e}")
             return []
+
+    # ========== 🆕 미체결 주문 관리 ==========
+
+    async def check_and_cancel_stale_orders(self):
+        """🕐 미체결 주문 자동 취소 체크 (5분 이상 미체결)"""
+        try:
+            stale_order_timeout = 300  # 5분 (300초)
+            current_time = datetime.now()
+
+            # PENDING_ORDER 상태인 종목들 확인
+            pending_candidates = [
+                candidate for candidate in self.stock_manager._all_stocks.values()
+                if candidate.status == CandleStatus.PENDING_ORDER
+            ]
+
+            if not pending_candidates:
+                return
+
+            logger.debug(f"🕐 미체결 주문 체크: {len(pending_candidates)}개 종목")
+
+            for candidate in pending_candidates:
+                try:
+                    # 주문 경과 시간 확인
+                    order_age = candidate.get_pending_order_age_seconds()
+                    if order_age is None or order_age < stale_order_timeout:
+                        continue
+
+                    # 5분 이상 미체결 주문 취소 처리
+                    await self._cancel_stale_order(candidate, order_age)
+
+                except Exception as e:
+                    logger.error(f"❌ {candidate.stock_code} 미체결 주문 처리 오류: {e}")
+
+        except Exception as e:
+            logger.error(f"❌ 미체결 주문 체크 오류: {e}")
+
+    async def _cancel_stale_order(self, candidate: CandleTradeCandidate, order_age: float):
+        """개별 미체결 주문 취소 처리"""
+        try:
+            minutes_elapsed = order_age / 60
+
+            # 매수 주문 취소
+            if candidate.has_pending_order('buy'):
+                buy_order_no = candidate.get_pending_order_no('buy')
+                logger.warning(f"⏰ {candidate.stock_code} 매수 주문 {minutes_elapsed:.1f}분 미체결 - 취소 필요")
+
+                # 주문 취소 시도 (TradeExecutor 있는 경우)
+                if hasattr(self, 'trade_executor') and self.trade_executor:
+                    # TODO: TradeExecutor에 주문 취소 기능이 있다면 호출
+                    # cancel_result = await self.trade_executor.cancel_order(buy_order_no)
+                    pass
+
+                # 주문 정보 해제 및 상태 복원
+                candidate.clear_pending_order('buy')
+                candidate.status = CandleStatus.BUY_READY  # 매수 준비 상태로 복원
+
+                logger.info(f"🔄 {candidate.stock_code} 매수 주문 취소 - BUY_READY 상태 복원")
+
+            # 매도 주문 취소
+            elif candidate.has_pending_order('sell'):
+                sell_order_no = candidate.get_pending_order_no('sell')
+                logger.warning(f"⏰ {candidate.stock_code} 매도 주문 {minutes_elapsed:.1f}분 미체결 - 취소 필요")
+
+                # 주문 취소 시도 (TradeExecutor 있는 경우)
+                if hasattr(self, 'trade_executor') and self.trade_executor:
+                    # TODO: TradeExecutor에 주문 취소 기능이 있다면 호출
+                    # cancel_result = await self.trade_executor.cancel_order(sell_order_no)
+                    pass
+
+                # 주문 정보 해제 및 상태 복원
+                candidate.clear_pending_order('sell')
+                candidate.status = CandleStatus.ENTERED  # 진입 상태로 복원
+
+                logger.info(f"🔄 {candidate.stock_code} 매도 주문 취소 - ENTERED 상태 복원")
+
+            # stock_manager 업데이트
+            self.stock_manager.update_candidate(candidate)
+
+        except Exception as e:
+            logger.error(f"❌ {candidate.stock_code} 주문 취소 처리 오류: {e}")
