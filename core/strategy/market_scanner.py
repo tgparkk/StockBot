@@ -183,14 +183,33 @@ class MarketScanner:
             if not self._passes_basic_filters(current_price, current_info.iloc[0].to_dict()):
                 return None
 
-            # 🆕 3. OHLCV 데이터 준비 (캔들 차트 데이터)
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            ohlcv_data = get_inquire_daily_itemchartprice(
-                output_dv="2",  # ✅ output2 데이터 (일자별 차트 데이터 배열) 조회
-                itm_no=stock_code,
-                period_code="D",  # 일봉
-                adj_prc="1"
-            )
+            # 🆕 3. OHLCV 데이터 준비 (캐시 우선 활용)
+            ohlcv_data = None
+
+            # 🚀 candle_trade_manager의 stock_manager._all_stocks에서 캐시된 데이터 우선 확인
+            if (hasattr(self.manager, 'stock_manager') and
+                hasattr(self.manager.stock_manager, '_all_stocks') and
+                stock_code in self.manager.stock_manager._all_stocks):
+                existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
+                ohlcv_data = existing_candidate.get_ohlcv_data()
+                if ohlcv_data is not None:
+                    logger.debug(f"📄 {stock_code} 기존 _all_stocks에서 캐시된 일봉 데이터 사용")
+
+            # 캐시에 없으면 API 호출
+            if ohlcv_data is None:
+                from ..api.kis_market_api import get_inquire_daily_itemchartprice
+                ohlcv_data = get_inquire_daily_itemchartprice(
+                    output_dv="2",  # ✅ output2 데이터 (일자별 차트 데이터 배열) 조회
+                    itm_no=stock_code,
+                    period_code="D",  # 일봉
+                    adj_prc="1"
+                )
+
+                # 🆕 API 조회 성공시 로그
+                if ohlcv_data is not None and not ohlcv_data.empty:
+                    logger.debug(f"📥 {stock_code} API로 일봉 데이터 조회 완료")
+                else:
+                    logger.debug(f"❌ {stock_code} 일봉 데이터 조회 실패")
 
             # ✅ DataFrame ambiguous 오류 해결
             if ohlcv_data is None or ohlcv_data.empty:
@@ -212,6 +231,10 @@ class MarketScanner:
                 current_price=int(current_price),
                 market_type=market_name  # 시장 타입 추가
             )
+
+            # 🆕 조회한 일봉 데이터를 새로운 candidate에 캐싱
+            if ohlcv_data is not None:
+                candidate.cache_ohlcv_data(ohlcv_data)
 
             # 패턴 정보 추가
             for pattern in pattern_result:
