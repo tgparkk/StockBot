@@ -189,14 +189,15 @@ class CandleTradeManager:
             # 3. 결과 보고
             logger.info(f"📊 기존 보유 종목 웹소켓 구독 완료: {subscription_success_count}/{len(existing_stocks)}개")
             logger.info(f"🔄 _all_stocks에 기존 보유 종목 추가: {added_to_all_stocks_count}개")
+
             return subscription_success_count > 0
 
         except Exception as e:
             logger.error(f"기존 보유 종목 모니터링 설정 오류: {e}")
             return False
 
-    async def _fetch_existing_holdings(self) -> List[Dict]:
         """기존 보유 종목 조회"""
+    async def _fetch_existing_holdings(self) -> List[Dict]:
         try:
             from ..api.kis_market_api import get_existing_holdings
             return get_existing_holdings()
@@ -219,15 +220,12 @@ class CandleTradeManager:
             # 기본 정보 로깅
             logger.info(f"📈 {stock_code}({stock_name}): {current_price:,}원, 수익률: {profit_rate:+.1f}%")
 
-            # 1. 캔들 패턴 분석
-            candle_analysis_result = await self._analyze_holding_patterns(stock_code, stock_name, current_price)
-
-            # 2. CandleTradeCandidate 생성 및 설정
-            success_add = await self._create_and_setup_holding_candidate(
-                stock_code, stock_name, current_price, buy_price, quantity, candle_analysis_result
+            # CandleTradeCandidate 생성 및 설정 (패턴 분석 포함)
+            success_add = await self._create_and_analyze_holding_candidate(
+                stock_code, stock_name, current_price, buy_price, quantity
             )
 
-            # 3. 웹소켓 구독
+            # 웹소켓 구독
             success_sub = await self._subscribe_holding_websocket(stock_code, stock_name)
 
             return success_sub, success_add
@@ -236,13 +234,49 @@ class CandleTradeManager:
             logger.error(f"개별 종목 처리 오류 ({stock_info.get('stock_code', 'unknown')}): {e}")
             return False, False
 
-    async def _analyze_holding_patterns(self, stock_code: str, stock_name: str, current_price: float) -> Optional[Dict]:
-        """보유 종목 캔들 패턴 분석"""
+
+
+    async def _create_and_analyze_holding_candidate(self, stock_code: str, stock_name: str, current_price: float,
+                                                  buy_price: float, quantity: int) -> bool:
+        """보유 종목 CandleTradeCandidate 생성, 패턴 분석, 설정 통합 처리"""
         try:
-            return await self._analyze_existing_holding_patterns(stock_code, stock_name, current_price)
+            # 이미 _all_stocks에 있는지 확인
+            if stock_code in self.stock_manager._all_stocks:
+                logger.debug(f"✅ {stock_code} 이미 _all_stocks에 존재")
+                return False
+
+            # 1. CandleTradeCandidate 객체 생성
+            existing_candidate = self._create_holding_candidate_object(stock_code, stock_name, current_price)
+
+            # 2. 진입 정보 설정
+            if buy_price > 0 and quantity > 0:
+                existing_candidate.enter_position(float(buy_price), int(quantity))
+                existing_candidate.update_price(float(current_price))
+                existing_candidate.performance.entry_price = float(buy_price)
+
+                # 3. _all_stocks에 먼저 추가 (패턴 분석에서 캐싱 가능하도록)
+                self.stock_manager._all_stocks[stock_code] = existing_candidate
+                logger.debug(f"✅ {stock_code} _all_stocks에 기존 보유 종목으로 추가")
+
+                # 4. 캔들 패턴 분석
+                candle_analysis_result = await self._analyze_existing_holding_patterns(stock_code, stock_name, current_price)
+
+                # 5. 리스크 관리 설정 (패턴 분석 결과 반영)
+                self._setup_holding_risk_management(existing_candidate, buy_price, current_price, candle_analysis_result)
+
+                # 6. 메타데이터 설정
+                self._setup_holding_metadata(existing_candidate, candle_analysis_result)
+
+                # 7. 설정 완료 로그
+                self._log_holding_setup_completion(existing_candidate)
+
+                return True
+
+            return False
+
         except Exception as e:
-            logger.debug(f"패턴 분석 오류 ({stock_code}): {e}")
-            return None
+            logger.error(f"보유 종목 후보 생성 및 분석 오류 ({stock_code}): {e}")
+            return False
 
     async def _analyze_existing_holding_patterns(self, stock_code: str, stock_name: str, current_price: float) -> Optional[Dict]:
         """🔄 기존 보유 종목의 실시간 캔들 패턴 분석 (🆕 캐싱 활용)"""
@@ -902,6 +936,8 @@ class CandleTradeManager:
                 self.stock_manager._all_stocks[stock_code] = existing_candidate
                 logger.debug(f"✅ {stock_code} _all_stocks에 기존 보유 종목으로 추가")
 
+
+
                 # 설정 완료 로그
                 self._log_holding_setup_completion(existing_candidate)
 
@@ -941,6 +977,10 @@ class CandleTradeManager:
 
                 # 패턴 정보 저장
                 self._save_pattern_info_to_candidate(candidate, candle_analysis_result)
+
+                logger.info(f"✅ {candidate.stock_code} 패턴 분석 성공: {candle_analysis_result['strongest_pattern']['type']} "
+                           f"(강도: {candle_analysis_result['strongest_pattern']['strength']}, "
+                           f"신뢰도: {candle_analysis_result['strongest_pattern']['confidence']:.2f})")
             else:
                 # 패턴 감지 실패 시 기본 설정
                 target_price, stop_loss_price, trailing_stop_pct, max_holding_hours, position_size_pct, risk_score, source_info = \
