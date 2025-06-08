@@ -1647,36 +1647,74 @@ class CandleTradeManager:
             # 매수 주문 취소
             if candidate.has_pending_order('buy'):
                 buy_order_no = candidate.get_pending_order_no('buy')
-                logger.warning(f"⏰ {candidate.stock_code} 매수 주문 {minutes_elapsed:.1f}분 미체결 - 취소 필요")
+                if not buy_order_no:
+                    logger.warning(f"⚠️ {candidate.stock_code} 매수 주문번호가 없음 - 상태만 복원")
+                    candidate.clear_pending_order('buy')
+                    candidate.status = CandleStatus.BUY_READY
+                    return
 
-                # 주문 취소 시도 (TradeExecutor 있는 경우)
-                if hasattr(self, 'trade_executor') and self.trade_executor:
-                    # TODO: TradeExecutor에 주문 취소 기능이 있다면 호출
-                    # cancel_result = await self.trade_executor.cancel_order(buy_order_no)
-                    pass
+                logger.warning(f"⏰ {candidate.stock_code} 매수 주문 {minutes_elapsed:.1f}분 미체결 - 취소 시도")
 
-                # 주문 정보 해제 및 상태 복원
-                candidate.clear_pending_order('buy')
-                candidate.status = CandleStatus.BUY_READY  # 매수 준비 상태로 복원
+                # KIS API를 통한 주문 취소 실행
+                cancel_result = self.kis_api_manager.cancel_order(
+                    order_no=buy_order_no,
+                    ord_orgno="",           # 주문조직번호 (공백)
+                    ord_dvsn="01",          # 주문구분 (기본값: 지정가)
+                    qty_all_ord_yn="Y"      # 전량 취소
+                )
 
-                logger.info(f"🔄 {candidate.stock_code} 매수 주문 취소 - BUY_READY 상태 복원")
+                if cancel_result and cancel_result.get('status') == 'success':
+                    logger.info(f"✅ {candidate.stock_code} 매수 주문 취소 성공 (주문번호: {buy_order_no})")
+
+                    # 주문 정보 해제 및 상태 복원
+                    candidate.clear_pending_order('buy')
+                    candidate.status = CandleStatus.BUY_READY  # 매수 준비 상태로 복원
+
+                    logger.info(f"🔄 {candidate.stock_code} BUY_READY 상태 복원")
+                else:
+                    error_msg = cancel_result.get('message', 'Unknown error') if cancel_result else 'API call failed'
+                    logger.error(f"❌ {candidate.stock_code} 매수 주문 취소 실패: {error_msg}")
+
+                    # 취소 실패해도 상태는 복원 (수동 처리 필요)
+                    candidate.clear_pending_order('buy')
+                    candidate.status = CandleStatus.BUY_READY
+                    logger.warning(f"⚠️ {candidate.stock_code} 취소 실패했지만 상태 복원 - 수동 확인 필요")
 
             # 매도 주문 취소
             elif candidate.has_pending_order('sell'):
                 sell_order_no = candidate.get_pending_order_no('sell')
-                logger.warning(f"⏰ {candidate.stock_code} 매도 주문 {minutes_elapsed:.1f}분 미체결 - 취소 필요")
+                if not sell_order_no:
+                    logger.warning(f"⚠️ {candidate.stock_code} 매도 주문번호가 없음 - 상태만 복원")
+                    candidate.clear_pending_order('sell')
+                    candidate.status = CandleStatus.ENTERED
+                    return
 
-                # 주문 취소 시도 (TradeExecutor 있는 경우)
-                if hasattr(self, 'trade_executor') and self.trade_executor:
-                    # TODO: TradeExecutor에 주문 취소 기능이 있다면 호출
-                    # cancel_result = await self.trade_executor.cancel_order(sell_order_no)
-                    pass
+                logger.warning(f"⏰ {candidate.stock_code} 매도 주문 {minutes_elapsed:.1f}분 미체결 - 취소 시도")
 
-                # 주문 정보 해제 및 상태 복원
-                candidate.clear_pending_order('sell')
-                candidate.status = CandleStatus.ENTERED  # 진입 상태로 복원
+                # KIS API를 통한 주문 취소 실행
+                cancel_result = self.kis_api_manager.cancel_order(
+                    order_no=sell_order_no,
+                    ord_orgno="",           # 주문조직번호 (공백)
+                    ord_dvsn="01",          # 주문구분 (기본값: 지정가)
+                    qty_all_ord_yn="Y"      # 전량 취소
+                )
 
-                logger.info(f"🔄 {candidate.stock_code} 매도 주문 취소 - ENTERED 상태 복원")
+                if cancel_result and cancel_result.get('status') == 'success':
+                    logger.info(f"✅ {candidate.stock_code} 매도 주문 취소 성공 (주문번호: {sell_order_no})")
+
+                    # 주문 정보 해제 및 상태 복원
+                    candidate.clear_pending_order('sell')
+                    candidate.status = CandleStatus.ENTERED  # 진입 상태로 복원
+
+                    logger.info(f"🔄 {candidate.stock_code} ENTERED 상태 복원")
+                else:
+                    error_msg = cancel_result.get('message', 'Unknown error') if cancel_result else 'API call failed'
+                    logger.error(f"❌ {candidate.stock_code} 매도 주문 취소 실패: {error_msg}")
+
+                    # 취소 실패해도 상태는 복원 (수동 처리 필요)
+                    candidate.clear_pending_order('sell')
+                    candidate.status = CandleStatus.ENTERED
+                    logger.warning(f"⚠️ {candidate.stock_code} 취소 실패했지만 상태 복원 - 수동 확인 필요")
 
             # stock_manager 업데이트
             self.stock_manager.update_candidate(candidate)
