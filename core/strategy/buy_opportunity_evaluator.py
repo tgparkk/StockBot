@@ -29,14 +29,36 @@ class BuyOpportunityEvaluator:
     async def evaluate_entry_opportunities(self):
         """💰 매수 실행 전용 - 모든 분석은 _periodic_signal_evaluation에서 완료됨"""
         try:
+            # 🔍 전체 종목 상태 분석
+            all_stocks = self.manager.stock_manager._all_stocks.values()
+            status_summary = {}
+            ready_status_summary = {}
+
+            for candidate in all_stocks:
+                status = candidate.status.value
+                status_summary[status] = status_summary.get(status, 0) + 1
+
+                # is_ready_for_entry() 결과 분석
+                is_ready = candidate.is_ready_for_entry()
+                ready_key = f"{status}_ready={is_ready}"
+                ready_status_summary[ready_key] = ready_status_summary.get(ready_key, 0) + 1
+
+                # BUY_READY 상태인 종목 상세 정보
+                if status == "BUY_READY":
+                    logger.info(f"🔍 {candidate.stock_code} BUY_READY 상태: is_ready={is_ready}, "
+                               f"신호={candidate.trade_signal.value}, 강도={candidate.signal_strength}")
+
+            logger.info(f"📊 전체 종목 상태: {status_summary}")
+            logger.info(f"📊 준비 상태 분석: {ready_status_summary}")
+
             # 🎯 매수 준비 상태인 종목들만 필터링 (이미 모든 검증 완료됨)
             buy_ready_candidates = [
-                candidate for candidate in self.manager.stock_manager._all_stocks.values()
-                if candidate.status == CandleStatus.BUY_READY and candidate.is_ready_for_entry()
+                candidate for candidate in all_stocks
+                if candidate.is_ready_for_entry()
             ]
 
             if not buy_ready_candidates:
-                logger.debug("📊 매수 준비된 종목이 없습니다")
+                logger.info("📊 매수 준비된 종목이 없습니다")
                 return
 
             logger.info(f"💰 매수 실행: {len(buy_ready_candidates)}개 준비된 종목")
@@ -102,10 +124,26 @@ class BuyOpportunityEvaluator:
         try:
             converted_count = 0
 
+            # 🔍 디버깅: 입력 종목 현황 파악
+            logger.info(f"🔍 BUY_READY 전환 검토: {len(watching_candidates)}개 관찰 종목")
+
+            # 신호별 분류
+            signal_counts = {}
+            for candidate in watching_candidates:
+                signal = candidate.trade_signal.value
+                signal_counts[signal] = signal_counts.get(signal, 0) + 1
+
+            logger.info(f"📊 신호별 현황: {signal_counts}")
+
             for candidate in watching_candidates:
                 try:
+                    logger.debug(f"🔍 {candidate.stock_code} 진입 검토 시작: "
+                                f"신호={candidate.trade_signal.value}, 강도={candidate.signal_strength}, "
+                                f"상태={candidate.status.value}")
+
                     # 강한 매수 신호인 경우에만 세부 검증 실행
                     if candidate.trade_signal in [TradeSignal.STRONG_BUY, TradeSignal.BUY]:
+                        logger.info(f"🎯 {candidate.stock_code} 매수 신호 감지 - 세부 검증 시작")
 
                         # 세부 진입 조건 검증 수행
                         entry_validation_passed = await self._validate_detailed_entry_conditions(candidate)
@@ -116,17 +154,33 @@ class BuyOpportunityEvaluator:
                             candidate.status = CandleStatus.BUY_READY
                             candidate.metadata['buy_ready_time'] = datetime.now(self.manager.korea_tz).isoformat()
 
-                            logger.info(f"🎯 {candidate.stock_code} 매수 준비 완료: "
-                                       f"{old_status.value} → {candidate.status.value} "
-                                       f"(신호:{candidate.trade_signal.value}, 강도:{candidate.signal_strength})")
+                            # 🔧 stock_manager 업데이트 (중요!)
+                            self.manager.stock_manager.update_candidate(candidate)
+
+                            # 🔍 상태 변경 확인
+                            actual_status = self.manager.stock_manager._all_stocks.get(candidate.stock_code)
+                            if actual_status:
+                                logger.info(f"✅ {candidate.stock_code} 매수 준비 완료: "
+                                           f"{old_status.value} → {actual_status.status.value} "
+                                           f"(신호:{candidate.trade_signal.value}, 강도:{candidate.signal_strength})")
+
+                                # 🔍 is_ready_for_entry() 체크
+                                ready_check = actual_status.is_ready_for_entry()
+                                logger.info(f"🔍 {candidate.stock_code} is_ready_for_entry(): {ready_check}")
+                            else:
+                                logger.error(f"❌ {candidate.stock_code} stock_manager 업데이트 실패!")
+
                             converted_count += 1
                         else:
-                            logger.debug(f"📋 {candidate.stock_code} 세부 진입 조건 미충족 - WATCHING 유지")
+                            logger.info(f"❌ {candidate.stock_code} 세부 진입 조건 미충족 - WATCHING 유지")
+                    else:
+                        logger.debug(f"📋 {candidate.stock_code} 매수 신호 아님 ({candidate.trade_signal.value}) - 스킵")
 
                 except Exception as e:
-                    logger.debug(f"관찰 종목 진입 평가 오류 ({candidate.stock_code}): {e}")
+                    logger.error(f"❌ 관찰 종목 진입 평가 오류 ({candidate.stock_code}): {e}")
                     continue
 
+            logger.info(f"✅ BUY_READY 전환 완료: {converted_count}/{len(watching_candidates)}개")
             return converted_count
 
         except Exception as e:
@@ -136,18 +190,22 @@ class BuyOpportunityEvaluator:
     async def _validate_detailed_entry_conditions(self, candidate: CandleTradeCandidate) -> bool:
         """🔍 세부 진입 조건 검증 (candle_trade_manager에서 이관)"""
         try:
+            logger.info(f"🔍 {candidate.stock_code} 세부 진입 조건 검증 시작")
+
             # 1. 최신 가격 정보 조회 (이미 comprehensive_signal_analysis에서 수행했지만 최신성 확보)
             from ..api.kis_market_api import get_inquire_price
             current_data = get_inquire_price("J", candidate.stock_code)
 
             if current_data is None or current_data.empty:
-                logger.debug(f"❌ {candidate.stock_code} 가격 정보 조회 실패")
+                logger.info(f"❌ {candidate.stock_code} 1단계 실패: 가격 정보 조회 실패")
                 return False
 
             current_price = float(current_data.iloc[0].get('stck_prpr', 0))
             if current_price <= 0:
-                logger.debug(f"❌ {candidate.stock_code} 유효하지 않은 가격: {current_price}")
+                logger.info(f"❌ {candidate.stock_code} 1단계 실패: 유효하지 않은 가격 {current_price}")
                 return False
+
+            logger.debug(f"✅ {candidate.stock_code} 1단계 통과: 가격 정보 ({current_price:,}원)")
 
             # 가격 업데이트
             candidate.update_price(current_price)
@@ -155,28 +213,37 @@ class BuyOpportunityEvaluator:
 
             # 2. 🔍 기본 필터 체크
             if not self.manager._passes_basic_filters(current_price, stock_info_dict):
-                logger.debug(f"❌ {candidate.stock_code} 기본 필터 미통과")
+                logger.info(f"❌ {candidate.stock_code} 2단계 실패: 기본 필터 미통과")
                 return False
+
+            logger.debug(f"✅ {candidate.stock_code} 2단계 통과: 기본 필터")
 
             # 3. 🔍 상세 진입 조건 체크
             entry_conditions = await self.manager._check_entry_conditions(candidate, stock_info_dict)
 
             if not entry_conditions.overall_passed:
-                logger.debug(f"❌ {candidate.stock_code} 상세 진입 조건 미통과: {', '.join(entry_conditions.fail_reasons)}")
+                logger.info(f"❌ {candidate.stock_code} 3단계 실패: 상세 진입 조건 미통과 - {', '.join(entry_conditions.fail_reasons)}")
                 return False
+
+            logger.debug(f"✅ {candidate.stock_code} 3단계 통과: 상세 진입 조건")
 
             # 4. 🔍 추가 안전성 검증
             safety_check = self._perform_additional_safety_checks(candidate, current_price, stock_info_dict)
 
             if not safety_check:
-                logger.debug(f"❌ {candidate.stock_code} 안전성 검증 미통과")
+                logger.info(f"❌ {candidate.stock_code} 4단계 실패: 안전성 검증 미통과")
                 return False
 
-            logger.info(f"✅ {candidate.stock_code} 세부 진입 조건 모두 통과 - 매수 준비 완료")
+            logger.debug(f"✅ {candidate.stock_code} 4단계 통과: 안전성 검증")
+
+            # 🔧 중요! entry_conditions 업데이트 (is_ready_for_entry() 체크용)
+            candidate.entry_conditions = entry_conditions
+
+            logger.info(f"✅ {candidate.stock_code} 모든 세부 진입 조건 통과 - entry_conditions 업데이트 완료")
             return True
 
         except Exception as e:
-            logger.debug(f"세부 진입 조건 검증 오류 ({candidate.stock_code}): {e}")
+            logger.info(f"❌ {candidate.stock_code} 세부 진입 조건 검증 오류: {e}")
             return False
 
     def _perform_additional_safety_checks(self, candidate: CandleTradeCandidate, current_price: float, stock_info: Dict) -> bool:

@@ -192,11 +192,12 @@ class MarketScanner:
                 stock_code in self.manager.stock_manager._all_stocks):
                 existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
 
-                # 🔧 PENDING_ORDER 상태인 종목은 스캔에서 제외 (중복 주문 방지)
-                if existing_candidate.status == CandleStatus.PENDING_ORDER:
-                    logger.debug(f"⏳ {stock_code} PENDING_ORDER 상태 - 스캔 제외")
+                # 🔧 중요한 상태(ENTERED, PENDING_ORDER)는 스캔에서 제외
+                if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                    logger.debug(f"🔒 {stock_code} 중요 상태 보호 ({existing_candidate.status.value}) - 스캔 제외")
                     return None
 
+                # 🔄 다른 상태는 캐시된 데이터 사용해서 패턴 업데이트 진행
                 ohlcv_data = existing_candidate.get_ohlcv_data()
                 if ohlcv_data is not None:
                     logger.debug(f"📄 {stock_code} 기존 _all_stocks에서 캐시된 일봉 데이터 사용")
