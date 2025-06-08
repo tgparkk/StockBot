@@ -111,14 +111,56 @@ class KISRestAPIManager:
                 "message": "매도 주문 실패"
             }
 
-    def cancel_order(self, order_no: str, stock_code: str, quantity: int) -> Dict:
-        """주문 취소"""
-        # 실제 주문 취소는 정정취소 API를 사용해야 하며 추가 정보가 필요
-        logger.warning("주문 취소는 정정취소 API를 직접 사용하세요")
-        return {
-            "status": "error",
-            "message": "주문 취소는 kis_order_api.get_order_rvsecncl() 사용 권장"
-        }
+    def cancel_order(self, order_no: str, ord_orgno: str = "", ord_dvsn: str = "01",
+                     qty_all_ord_yn: str = "Y") -> Dict:
+        """주문 취소
+
+        Args:
+            order_no: 원주문번호 (orgn_odno)
+            ord_orgno: 주문조직번호 (보통 공백으로 처리)
+            ord_dvsn: 주문구분 (01:지정가, 05:시장가 등, 기본값 01)
+            qty_all_ord_yn: 잔량전부주문여부 (Y:전량취소, N:일부취소, 기본값 Y)
+        """
+        try:
+            # 주문조직번호가 없으면 공백으로 처리 (KIS API 요구사항)
+            if not ord_orgno:
+                ord_orgno = ""
+
+            # get_order_rvsecncl 함수 호출
+            result = order_api.get_order_rvsecncl(
+                ord_orgno=ord_orgno,               # 주문조직번호
+                orgn_odno=order_no,                # 원주문번호
+                ord_dvsn=ord_dvsn,                 # 주문구분
+                rvse_cncl_dvsn_cd="02",           # 취소:02 (정정:01)
+                ord_qty=0,                         # 전량취소시 0
+                ord_unpr=0,                        # 취소시 0
+                qty_all_ord_yn=qty_all_ord_yn      # 잔량전부주문여부
+            )
+
+            if result is not None and not result.empty:
+                # 취소 성공
+                cancel_data = result.iloc[0].to_dict()
+                return {
+                    "status": "success",
+                    "order_no": order_no,
+                    "cancel_order_no": cancel_data.get('odno', ''),
+                    "message": "주문 취소 완료",
+                    "details": cancel_data
+                }
+            else:
+                return {
+                    "status": "error",
+                    "order_no": order_no,
+                    "message": "주문 취소 실패 - API 응답 없음"
+                }
+
+        except Exception as e:
+            logger.error(f"주문 취소 오류: {e}")
+            return {
+                "status": "error",
+                "order_no": order_no,
+                "message": f"주문 취소 오류: {str(e)}"
+            }
 
     def get_today_orders(self) -> List[Dict]:
         """당일 주문 내역"""
