@@ -73,9 +73,17 @@ class CandleStockManager:
         try:
             stock_code = candidate.stock_code
 
-            # 중복 체크
+            # 🔧 중복 체크 강화 (상태별 처리)
             if stock_code in self._all_stocks:
-                logger.debug(f"종목 {stock_code} 이미 존재 - 업데이트")
+                existing = self._all_stocks[stock_code]
+
+                # ENTERED나 PENDING_ORDER 상태는 덮어쓰기 방지
+                if existing.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                    logger.warning(f"⚠️ {stock_code} 중요 상태 보호 ({existing.status.value}) - 새 후보 추가 거부")
+                    return False
+
+                # 다른 상태는 업데이트 허용
+                logger.debug(f"🔄 {stock_code} 기존 종목 업데이트 ({existing.status.value})")
                 return self.update_candidate(candidate)
 
             # 최대 관찰 종목 수 체크

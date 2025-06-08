@@ -174,21 +174,44 @@ class CandleTradeManager:
             subscription_success_count = 0
             added_to_all_stocks_count = 0
 
-            for stock_info in existing_stocks:
+            for i, stock_info in enumerate(existing_stocks):
                 try:
+                    stock_code = stock_info.get('stock_code', 'unknown')
+                    stock_name = stock_info.get('stock_name', 'unknown')
+
+                    logger.info(f"🔍 종목 {i+1}/{len(existing_stocks)} 처리 시작: {stock_code}({stock_name})")
+
                     success_sub, success_add = await self._process_single_holding(stock_info)
+
+                    logger.info(f"🔍 종목 {i+1} 처리 결과: 구독={success_sub}, 추가={success_add}")
+
                     if success_sub:
                         subscription_success_count += 1
                     if success_add:
                         added_to_all_stocks_count += 1
 
                 except Exception as e:
-                    logger.error(f"종목 처리 오류: {e}")
+                    stock_code = stock_info.get('stock_code', 'unknown') if stock_info else 'unknown'
+                    logger.error(f"❌ 종목 {i+1} ({stock_code}) 처리 오류: {e}")
                     continue
 
             # 3. 결과 보고
             logger.info(f"📊 기존 보유 종목 웹소켓 구독 완료: {subscription_success_count}/{len(existing_stocks)}개")
             logger.info(f"🔄 _all_stocks에 기존 보유 종목 추가: {added_to_all_stocks_count}개")
+
+            # 🔍 _all_stocks 상태 요약
+            all_stocks_summary = {}
+            entered_stocks = []
+
+            for stock_code, candidate in self.stock_manager._all_stocks.items():
+                status = candidate.status.value
+                all_stocks_summary[status] = all_stocks_summary.get(status, 0) + 1
+
+                if candidate.status.value == 'entered':
+                    entered_stocks.append(f"{stock_code}({candidate.stock_name})")
+
+            logger.info(f"🔍 _all_stocks 최종 상태: {all_stocks_summary}")
+            logger.info(f"🔍 ENTERED 상태 종목들: {', '.join(entered_stocks)}")
 
             return subscription_success_count > 0
 
@@ -200,7 +223,22 @@ class CandleTradeManager:
     async def _fetch_existing_holdings(self) -> List[Dict]:
         try:
             from ..api.kis_market_api import get_existing_holdings
-            return get_existing_holdings()
+            holdings = get_existing_holdings()
+
+            # 🔍 디버깅: 조회된 보유 종목 상세 정보
+            logger.info(f"🔍 계좌 보유 종목 조회 결과: {len(holdings) if holdings else 0}개")
+
+            if holdings:
+                for i, stock in enumerate(holdings):
+                    stock_code = stock.get('stock_code', 'unknown')
+                    stock_name = stock.get('stock_name', 'unknown')
+                    quantity = stock.get('quantity', 0)
+                    current_price = stock.get('current_price', 0)
+                    logger.info(f"   {i+1}. {stock_code}({stock_name}): {quantity}주, {current_price:,}원")
+            else:
+                logger.warning("⚠️ 보유 종목 조회 결과가 비어있음")
+
+            return holdings
 
         except Exception as e:
             logger.error(f"계좌 잔고 조회 오류: {e}")
@@ -240,9 +278,12 @@ class CandleTradeManager:
                                                   buy_price: float, quantity: int) -> bool:
         """보유 종목 CandleTradeCandidate 생성, 패턴 분석, 설정 통합 처리"""
         try:
+            # 🔍 디버깅: 입력 데이터 검증
+            logger.debug(f"🔍 {stock_code} 입력 데이터: 현재가={current_price}, 매수가={buy_price}, 수량={quantity}")
+
             # 이미 _all_stocks에 있는지 확인
             if stock_code in self.stock_manager._all_stocks:
-                logger.debug(f"✅ {stock_code} 이미 _all_stocks에 존재")
+                logger.info(f"⚠️ {stock_code} 이미 _all_stocks에 존재 - 중복 추가 방지")
                 return False
 
             # 1. CandleTradeCandidate 객체 생성
@@ -250,32 +291,41 @@ class CandleTradeManager:
 
             # 2. 진입 정보 설정
             if buy_price > 0 and quantity > 0:
+                logger.debug(f"🔍 {stock_code} 진입 정보 설정 중...")
+
                 existing_candidate.enter_position(float(buy_price), int(quantity))
                 existing_candidate.update_price(float(current_price))
                 existing_candidate.performance.entry_price = float(buy_price)
 
                 # 3. _all_stocks에 먼저 추가 (패턴 분석에서 캐싱 가능하도록)
                 self.stock_manager._all_stocks[stock_code] = existing_candidate
-                logger.debug(f"✅ {stock_code} _all_stocks에 기존 보유 종목으로 추가")
+                logger.info(f"✅ {stock_code} _all_stocks에 기존 보유 종목으로 추가 완료")
 
                 # 4. 캔들 패턴 분석
+                logger.debug(f"🔍 {stock_code} 캔들 패턴 분석 시작...")
                 candle_analysis_result = await self._analyze_existing_holding_patterns(stock_code, stock_name, current_price)
 
                 # 5. 리스크 관리 설정 (패턴 분석 결과 반영)
+                logger.debug(f"🔍 {stock_code} 리스크 관리 설정 중...")
                 self._setup_holding_risk_management(existing_candidate, buy_price, current_price, candle_analysis_result)
 
                 # 6. 메타데이터 설정
+                logger.debug(f"🔍 {stock_code} 메타데이터 설정 중...")
                 self._setup_holding_metadata(existing_candidate, candle_analysis_result)
 
                 # 7. 설정 완료 로그
                 self._log_holding_setup_completion(existing_candidate)
 
+                logger.info(f"✅ {stock_code} 기존 보유 종목 설정 완료")
                 return True
-
-            return False
+            else:
+                logger.warning(f"❌ {stock_code} 진입 정보 부족: 매수가={buy_price}, 수량={quantity}")
+                return False
 
         except Exception as e:
-            logger.error(f"보유 종목 후보 생성 및 분석 오류 ({stock_code}): {e}")
+            logger.error(f"❌ 보유 종목 후보 생성 및 분석 오류 ({stock_code}): {e}")
+            import traceback
+            logger.error(f"❌ 상세 오류: {traceback.format_exc()}")
             return False
 
     async def _analyze_existing_holding_patterns(self, stock_code: str, stock_name: str, current_price: float) -> Optional[Dict]:
@@ -1373,7 +1423,7 @@ class CandleTradeManager:
                 return
 
             # 상태별 분류
-            watching_candidates = [c for c in all_candidates if c.status == CandleStatus.WATCHING]
+            watching_candidates = [c for c in all_candidates if c.status == CandleStatus.WATCHING or c.status == CandleStatus.BUY_READY or c.status == CandleStatus.SCANNING]
             entered_candidates = [c for c in all_candidates if c.status == CandleStatus.ENTERED]
 
             logger.info(f"🔄 신호 재평가: 관찰{len(watching_candidates)}개, 진입{len(entered_candidates)}개 "
@@ -1382,8 +1432,16 @@ class CandleTradeManager:
             # 🎯 1. 관찰 중인 종목들 재평가 (우선순위 높음)
             if watching_candidates:
                 logger.debug(f"📊 관찰 중인 종목 재평가: {len(watching_candidates)}개")
-                watch_updated = await self._batch_evaluate_watching_stocks(watching_candidates)
-                logger.debug(f"✅ 관찰 종목 신호 업데이트: {watch_updated}개")
+
+                # 1-1. 신호(TradeSignal) 업데이트
+                signal_updated = await self._batch_update_signals_for_watching_stocks(watching_candidates)
+                logger.debug(f"✅ 관찰 종목 신호 업데이트: {signal_updated}개")
+
+                # 1-2. 상태(CandleStatus) 전환 검토
+                status_changed = await self._batch_evaluate_status_transitions(watching_candidates)
+                logger.debug(f"✅ 관찰 종목 상태 전환: {status_changed}개")
+
+                watch_updated = signal_updated + status_changed
 
             # 🎯 2. 진입한 종목들 재평가 (매도 신호 중심)
             if entered_candidates:
@@ -1394,8 +1452,8 @@ class CandleTradeManager:
         except Exception as e:
             logger.error(f"주기적 신호 재평가 오류: {e}")
 
-    async def _batch_evaluate_watching_stocks(self, candidates: List[CandleTradeCandidate]) -> int:
-        """관찰 중인 종목들 배치 재평가"""
+    async def _batch_update_signals_for_watching_stocks(self, candidates: List[CandleTradeCandidate]) -> int:
+        """관찰 중인 종목들 신호(TradeSignal) 업데이트"""
         try:
             updated_count = 0
 
@@ -1435,18 +1493,36 @@ class CandleTradeManager:
                 if i + batch_size < len(candidates):
                     await asyncio.sleep(0.5)  # 0.5초 대기
 
-            # 🆕 신호가 업데이트된 종목들 중 BUY_READY 전환 검토 (BuyOpportunityEvaluator 위임)
-            watching_candidates = [c for c in candidates if c.status == CandleStatus.WATCHING]
-            if watching_candidates:
-                buy_ready_count = await self.buy_evaluator.evaluate_watching_stocks_for_entry(watching_candidates)
-                if buy_ready_count > 0:
-                    logger.info(f"🎯 BUY_READY 전환: {buy_ready_count}개 종목")
-                    updated_count += buy_ready_count
-
             return updated_count
 
         except Exception as e:
-            logger.error(f"관찰 종목 배치 재평가 오류: {e}")
+            logger.error(f"관찰 종목 신호 업데이트 오류: {e}")
+            return 0
+
+    async def _batch_evaluate_status_transitions(self, candidates: List[CandleTradeCandidate]) -> int:
+        """관찰 중인 종목들 상태(CandleStatus) 전환 검토"""
+        try:
+            # 🔧 매수 신호 재평가가 필요한 모든 상태 포함 (WATCHING, SCANNING, BUY_READY)
+            eligible_candidates = [
+                c for c in candidates
+                if c.status in [CandleStatus.WATCHING, CandleStatus.SCANNING, CandleStatus.BUY_READY]
+            ]
+
+            if not eligible_candidates:
+                logger.debug(f"📊 매수 신호 재평가 대상 없음 (입력: {len(candidates)}개)")
+                return 0
+
+            logger.info(f"🔍 매수 신호 재평가 대상: {len(eligible_candidates)}개 (WATCHING/SCANNING/BUY_READY)")
+
+            # 매수 신호 재평가 및 상태 전환 검토 (BuyOpportunityEvaluator 위임)
+            buy_ready_count = await self.buy_evaluator.evaluate_watching_stocks_for_entry(eligible_candidates)
+            if buy_ready_count > 0:
+                logger.info(f"🎯 BUY_READY 전환: {buy_ready_count}개 종목")
+
+            return buy_ready_count
+
+        except Exception as e:
+            logger.error(f"상태 전환 검토 오류: {e}")
             return 0
 
     async def _batch_evaluate_entered_stocks(self, candidates: List[CandleTradeCandidate]) -> int:

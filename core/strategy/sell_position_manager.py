@@ -668,11 +668,11 @@ class SellPositionManager:
     def _get_pattern_tier_targets(self, strength_tier: str) -> Tuple[float, float]:
         """패턴 강도 티어별 목표/손절 퍼센트 반환"""
         tier_settings = {
-            'ULTRA_STRONG': (15.0, 4.0),   # 15% 목표, 4% 손절
-            'STRONG': (12.0, 3.0),         # 12% 목표, 3% 손절
-            'MEDIUM': (8.0, 3.0),          # 8% 목표, 3% 손절
-            'WEAK': (5.0, 2.0),            # 5% 목표, 2% 손절
-            'VERY_WEAK': (3.0, 1.5)        # 3% 목표, 1.5% 손절
+            'ULTRA_STRONG': (8.0, 4.0),    # 8% 목표, 4% 손절
+            'STRONG': (6.0, 3.0),          # 6% 목표, 3% 손절
+            'MEDIUM': (4.0, 3.0),          # 4% 목표, 3% 손절
+            'WEAK': (2.0, 2.0),            # 2% 목표, 2% 손절
+            'VERY_WEAK': (2.0, 1.5)        # 2% 목표, 1.5% 손절
         }
         return tier_settings.get(strength_tier, (5.0, 2.0))
 
