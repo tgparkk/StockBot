@@ -70,20 +70,25 @@ class WorkerManager:
             logger.error(f"❌ 워커 시작 오류: {e}")
 
     def _order_cleanup_worker(self, bot_instance: "StockBot"):
-        """주문 정리 워커 (간소화)"""
+        """🧹 주문 정리 워커 (타임아웃 주문 자동 처리)"""
         logger.info("🧹 주문 정리 워커 시작")
 
         while not self.shutdown_event.is_set():
             try:
                 trade_executor = self._safe_get_manager(bot_instance, 'trade_executor')
                 if trade_executor and hasattr(trade_executor, 'cleanup_expired_orders'):
-                    trade_executor.cleanup_expired_orders()
+                    # 🆕 만료된 주문 정리 및 결과 로깅
+                    cleanup_count = trade_executor.cleanup_expired_orders()
+                    # 🔧 안전한 None 검사
+                    if cleanup_count and cleanup_count > 0:
+                        logger.info(f"🧹 만료된 주문 {cleanup_count}개 정리 완료")
 
-                self.shutdown_event.wait(timeout=120)  # 2분마다
+                # 🔧 더 자주 정리 (1분마다 - 5분 타임아웃이므로 충분히 빠름)
+                self.shutdown_event.wait(timeout=60)
 
             except Exception as e:
                 logger.error(f"❌ 주문 정리 오류: {e}")
-                self.shutdown_event.wait(timeout=60)
+                self.shutdown_event.wait(timeout=30)  # 오류시 30초 후 재시도
 
         logger.info("🛑 주문 정리 워커 종료")
 

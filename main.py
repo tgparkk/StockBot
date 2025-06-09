@@ -23,9 +23,9 @@ from utils.logger import setup_logger
 
 # 핵심 모듈들
 from core import (
-    TradingManager, PositionManager,
+    TradingManager,
     KISRestAPIManager, SimpleHybridDataManager, KISWebSocketManager,
-    TradeDatabase, TradeConfig, TradeExecutor, WorkerManager, KISDataCollector
+    TradeDatabase, TradeExecutor, WorkerManager, KISDataCollector
 )
 
 # 설정
@@ -114,12 +114,10 @@ class StockBot:
         self.trade_db = TradeDatabase()
 
         # 7. 거래 실행자 (핵심 비즈니스 로직 분리)
-        trade_config = TradeConfig()  # 기본 설정 사용
         self.trade_executor = TradeExecutor(
             self.trading_manager,
             self.data_manager,
-            self.trade_db,
-            trade_config
+            self.trade_db
         )
 
         # 🆕 캔들 기반 트레이딩 매니저 (기존 전략 대체)

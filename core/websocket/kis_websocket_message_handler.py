@@ -304,7 +304,39 @@ class KISWebSocketMessageHandler:
             # 🎯 CandleTradeManager의 _all_stocks 상태 업데이트도 처리
             if self.candle_trade_manager:
                 logger.info("🔄 CandleTradeManager _all_stocks 상태 업데이트 처리")
-                await self.candle_trade_manager.handle_execution_confirmation(decrypted_data)
+                
+                # 🚨 올바른 형식으로 데이터 전달 (decrypted_data는 문자열이므로 딕셔너리로 래핑)
+                execution_data = {
+                    'raw_data': decrypted_data,
+                    'timestamp': datetime.now(),
+                    'source': 'kis_websocket'
+                }
+                
+                # OrderExecutionManager에서 파싱된 데이터가 있으면 사용
+                try:
+                    if execution_manager and hasattr(execution_manager, '_parse_notice_data'):
+                        parsed_execution = execution_manager._parse_notice_data(decrypted_data)
+                        if parsed_execution:
+                            # 파싱 성공시 주요 정보 추가
+                            execution_data.update({
+                                'stock_code': parsed_execution.get('stock_code', ''),
+                                'order_type': parsed_execution.get('order_type', ''),
+                                'executed_quantity': parsed_execution.get('executed_quantity', 0),
+                                'executed_price': parsed_execution.get('executed_price', 0),
+                                'order_no': parsed_execution.get('order_id', ''),
+                                'parsed_success': True
+                            })
+                            logger.debug(f"✅ 체결통보 파싱 성공: {parsed_execution.get('stock_code')} {parsed_execution.get('order_type')}")
+                        else:
+                            execution_data['parsed_success'] = False
+                    else:
+                        logger.debug("OrderExecutionManager가 없거나 파싱 함수 없음")
+                        execution_data['parsed_success'] = False
+                except Exception as e:
+                    logger.debug(f"파싱된 데이터 추출 실패: {e}")
+                    execution_data['parsed_success'] = False
+                
+                await self.candle_trade_manager.handle_execution_confirmation(execution_data)
             else:
                 logger.debug("💡 CandleTradeManager가 설정되지 않음 - _all_stocks 업데이트 생략")
 

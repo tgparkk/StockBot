@@ -203,9 +203,13 @@ def get_inquire_daily_ccld_obj(dv: str = "01", inqr_strt_dt: Optional[str] = Non
 
 
 def get_inquire_daily_ccld_lst(dv: str = "01", inqr_strt_dt: str = "", inqr_end_dt: str = "",
-                               tr_cont: str = "", FK100: str = "", NK100: str = "",
+                               ccld_dvsn: str = "00", tr_cont: str = "", FK100: str = "", NK100: str = "",
                                dataframe: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
-    """주식일별주문체결조회 - 상세 목록 (페이징 지원)"""
+    """주식일별주문체결조회 - 상세 목록 (페이징 지원)
+    
+    Args:
+        ccld_dvsn: 체결구분 ('00':전체, '01':체결, '02':미체결)
+    """
     url = '/uapi/domestic-stock/v1/trading/inquire-daily-ccld'
 
     if dv == "01":
@@ -226,7 +230,7 @@ def get_inquire_daily_ccld_lst(dv: str = "01", inqr_strt_dt: str = "", inqr_end_
         "SLL_BUY_DVSN_CD": "00",                # 매도매수구분 00:전체
         "INQR_DVSN": "01",                      # 조회구분 01:정순
         "PDNO": "",                             # 종목번호
-        "CCLD_DVSN": "00",                      # 체결구분 00:전체
+        "CCLD_DVSN": ccld_dvsn,                 # 체결구분 00:전체, 01:체결, 02:미체결
         "ORD_GNO_BRNO": "",
         "ODNO": "",
         "INQR_DVSN_3": "00",
@@ -260,6 +264,109 @@ def get_inquire_daily_ccld_lst(dv: str = "01", inqr_strt_dt: str = "", inqr_end_
     elif tr_cont in ("F", "M"):  # 다음 페이지 존재
         logger.debug("다음 페이지 조회 중...")
         time.sleep(0.1)
-        return get_inquire_daily_ccld_lst(dv, inqr_strt_dt, inqr_end_dt, "N", FK100, NK100, dataframe)
+        return get_inquire_daily_ccld_lst(dv, inqr_strt_dt, inqr_end_dt, ccld_dvsn, "N", FK100, NK100, dataframe)
 
     return dataframe
+
+# ========== 🆕 미체결 주문 관리 함수들 ==========
+
+async def check_and_cancel_external_orders(kis_api_manager) -> None:
+    """🆕 KIS API로 전체 미체결 주문 조회 및 취소 (외부 매수 포함)"""
+    try:
+        from datetime import datetime, timedelta
+        
+        # 당일 주문 조회
+        today_orders = kis_api_manager.get_today_orders()
+        
+        if not today_orders:
+            logger.debug("📋 조회된 당일 주문이 없습니다")
+            return
+
+        logger.info(f"📋 당일 주문 조회 결과: {len(today_orders)}건")
+
+        current_time = datetime.now()
+        stale_order_timeout = 300  # 5분
+
+        for order_info in today_orders:
+            try:
+                # 주문 기본 정보 추출
+                stock_code = order_info.get('pdno', '')  # 상품번호 (종목코드)
+                order_no = order_info.get('odno', '')    # 주문번호
+                order_date = order_info.get('ord_dt', '')  # 주문일자
+                order_time = order_info.get('ord_tmd', '')  # 주문시각 (HHMMSS)
+                
+                # 체결 상태 정보
+                total_qty = int(order_info.get('ord_qty', 0))       # 주문수량
+                filled_qty = int(order_info.get('tot_ccld_qty', 0)) # 총체결수량
+                remaining_qty = int(order_info.get('rmn_qty', 0))   # 잔여수량
+                cancel_yn = order_info.get('cncl_yn', 'N')          # 취소여부
+                
+                # 매수/매도 구분
+                buy_sell_code = order_info.get('sll_buy_dvsn_cd', '')  # 01:매도, 02:매수
+                buy_sell_name = order_info.get('sll_buy_dvsn_cd_name', '')
+                
+                order_price = int(order_info.get('ord_unpr', 0))    # 주문단가
+                product_name = order_info.get('prdt_name', '')      # 상품명
+
+                # 🚨 미체결 주문 필터링 (잔여수량 > 0, 취소되지 않음)
+                if remaining_qty <= 0 or cancel_yn == 'Y':
+                    continue
+
+                # 🚨 주문 시간 계산 (당일 주문만 대상)
+                if order_date and order_time and len(order_time) >= 6:
+                    order_datetime_str = f"{order_date} {order_time[:2]}:{order_time[2:4]}:{order_time[4:6]}"
+                    order_datetime = datetime.strptime(order_datetime_str, "%Y%m%d %H:%M:%S")
+                    
+                    # 주문 경과 시간 계산
+                    elapsed_seconds = (current_time - order_datetime).total_seconds()
+                    
+                    if elapsed_seconds < stale_order_timeout:
+                        continue  # 5분 미만이면 아직 취소 안함
+                        
+                    minutes_elapsed = elapsed_seconds / 60
+                    
+                    logger.warning(f"⏰ {stock_code}({product_name}) 미체결 주문 발견: "
+                                 f"{buy_sell_name} {remaining_qty}주 {order_price:,}원 "
+                                 f"(경과: {minutes_elapsed:.1f}분)")
+
+                    # 🎯 미체결 주문 취소 실행
+                    cancel_result = await cancel_external_order(
+                        kis_api_manager, stock_code, order_no, buy_sell_code, 
+                        remaining_qty, product_name
+                    )
+                    
+                    if cancel_result:
+                        logger.info(f"✅ {stock_code} 외부 미체결 주문 취소 성공")
+                    else:
+                        logger.warning(f"❌ {stock_code} 외부 미체결 주문 취소 실패")
+
+            except Exception as e:
+                logger.error(f"❌ 주문 정보 처리 오류: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"❌ 외부 미체결 주문 체크 오류: {e}")
+
+async def cancel_external_order(kis_api_manager, stock_code: str, order_no: str, 
+                              buy_sell_code: str, remaining_qty: int, product_name: str) -> bool:
+    """🆕 외부 미체결 주문 취소 실행"""
+    try:
+        # KIS API를 통한 주문 취소 실행
+        cancel_result = kis_api_manager.cancel_order(
+            order_no=order_no,
+            ord_orgno="",           # 주문조직번호 (공백)
+            ord_dvsn="01",          # 주문구분 (기본값: 지정가)
+            qty_all_ord_yn="Y"      # 전량 취소
+        )
+
+        if cancel_result and cancel_result.get('status') == 'success':
+            logger.info(f"✅ {stock_code}({product_name}) 외부 주문 취소 성공 (주문번호: {order_no})")
+            return True
+        else:
+            error_msg = cancel_result.get('message', 'Unknown error') if cancel_result else 'API call failed'
+            logger.error(f"❌ {stock_code} 외부 주문 취소 실패: {error_msg}")
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ {stock_code} 외부 주문 취소 처리 오류: {e}")
+        return False

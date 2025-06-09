@@ -74,7 +74,12 @@ class TradingManager:
 
             # 3. 결과 처리 - rest_api는 status 필드를 사용
             if result and result.get('status') == 'success':
-                order_no = result.get('order_no', f"order_{int(time.time())}")
+                # 🔧 order_no 검증 및 폴백 처리
+                order_no = result.get('order_no', '')
+                if not order_no or order_no.strip() == '':
+                    # 빈 문자열이면 타임스탬프 기반 주문번호 생성
+                    order_no = f"order_{int(time.time() * 1000)}"  # 밀리초 포함
+                    logger.warning(f"⚠️ {stock_code} API에서 주문번호 누락 - 임시번호 생성: {order_no}")
 
                 # 주문 정보 저장
                 order_info = {
@@ -97,14 +102,31 @@ class TradingManager:
                 return order_no
             else:
                 error_msg = result.get('message', '알 수 없는 오류') if result else '응답 없음'
-                logger.error(f"❌ 주문 실패: {stock_code} {order_type} - {error_msg}")
+                error_code = result.get('error_code', 'UNKNOWN') if result else 'NO_RESPONSE'
+                
+                # 🔧 구체적인 오류 정보 구성
+                detailed_error = f"{error_code}: {error_msg}"
+                logger.error(f"❌ 주문 실패: {stock_code} {order_type} - {detailed_error}")
+                
                 self.stats['failed_orders'] += 1
-                return None
+                # 🆕 오류 정보를 포함한 딕셔너리 반환 (None 대신)
+                return {
+                    'success': False,
+                    'error_code': error_code,
+                    'error_message': error_msg,
+                    'detailed_error': detailed_error
+                }
 
         except Exception as e:
             logger.error(f"주문 실행 오류: {stock_code} {order_type} - {e}")
             self.stats['failed_orders'] += 1
-            return None
+            # 🆕 예외 정보를 포함한 딕셔너리 반환
+            return {
+                'success': False,
+                'error_code': 'EXCEPTION',
+                'error_message': str(e),
+                'detailed_error': f"EXCEPTION: {str(e)}"
+            }
 
     def cancel_order(self, order_no: str) -> bool:
         """주문 취소"""

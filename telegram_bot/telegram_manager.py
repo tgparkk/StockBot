@@ -223,11 +223,8 @@ class TelegramBot:
             return
 
         try:
-            if hasattr(self.stock_bot, 'position_manager'):
-                count = self.stock_bot.position_manager.force_price_update_via_rest_api()
-                await update.message.reply_text(f"REST API 강제 갱신 완료: {count}개 종목")
-            else:
-                await update.message.reply_text("포지션 매니저에 접근할 수 없습니다.")
+            # 캔들 트레이딩 시스템에서는 실시간 데이터를 사용하므로 강제 갱신 불필요
+            await update.message.reply_text("캔들 트레이딩 시스템은 실시간 데이터를 사용합니다.")
         except Exception as e:
             logger.error(f"REST API 갱신 오류: {e}")
             await update.message.reply_text("REST API 갱신 중 오류가 발생했습니다.")
@@ -304,19 +301,16 @@ class TelegramBot:
                 logger.warning(f"KIS API 잔고 조회 실패: {api_error}")
                 await loading_msg.edit_text("API 오류 - 로컬 데이터로 추정합니다...")
 
-            # 로컬 포지션 데이터로 대체
+            # 캔들 트레이딩 시스템 데이터로 대체
             try:
-                if hasattr(self.stock_bot, 'position_manager'):
-                    summary = self.stock_bot.position_manager.get_position_summary()
-                    total_positions = summary.get('total_positions', 0)
-                    total_value = summary.get('total_value', 0)
-                    total_profit_loss = summary.get('total_profit_loss', 0)
+                if hasattr(self.stock_bot, 'candle_trade_manager'):
+                    # CandleTradeManager에서 포지션 정보 조회
+                    active_positions = self.stock_bot.candle_trade_manager.get_active_positions()
+                    total_positions = len(active_positions)
 
                     message = (
-                        f"<b>계좌 정보 (로컬 추정)</b>\n\n"
-                        f"보유 종목: {total_positions}개\n"
-                        f"추정 평가금액: {total_value:,}원\n"
-                        f"추정 평가손익: {total_profit_loss:+,}원\n\n"
+                        f"<b>계좌 정보 (캔들 시스템)</b>\n\n"
+                        f"보유 종목: {total_positions}개\n\n"
                         f"정확한 잔고는 증권사 앱에서 확인하세요.\n"
                         f"시간: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
@@ -324,7 +318,7 @@ class TelegramBot:
                     await loading_msg.edit_text(message, parse_mode='HTML')
                 else:
                     message = (
-                        f"API 오류 및 로컬 데이터 없음\n"
+                        f"API 오류 및 캔들 시스템 데이터 없음\n"
                         f"증권사 앱에서 직접 확인하세요.\n"
                         f"시간: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
@@ -391,44 +385,30 @@ class TelegramBot:
             return
 
         try:
-            if not hasattr(self.stock_bot, 'position_manager'):
-                await update.message.reply_text("포지션 매니저에 접근할 수 없습니다.")
+            if not hasattr(self.stock_bot, 'candle_trade_manager'):
+                await update.message.reply_text("캔들 트레이딩 매니저에 접근할 수 없습니다.")
                 return
 
-            summary = self.stock_bot.position_manager.get_position_summary()
-            positions = summary.get('positions', [])
+            # CandleTradeManager에서 활성 포지션 조회
+            active_positions = self.stock_bot.candle_trade_manager.get_active_positions()
 
-            if not positions:
+            if not active_positions:
                 await update.message.reply_text("현재 보유 중인 포지션이 없습니다.")
                 return
 
-            message = "<b>현재 포지션</b>\n\n"
+            message = "<b>현재 포지션 (캔들 시스템)</b>\n\n"
 
-            for pos in positions:
-                stock_code = pos['stock_code']
-                quantity = pos['quantity']
-                avg_price = pos['buy_price']
-                current_price = pos['current_price']
-                unrealized_pnl = pos['profit_loss']
-                pnl_rate = pos['profit_rate']
-
-                pnl_emoji = "📈" if unrealized_pnl > 0 else "📉" if unrealized_pnl < 0 else "➖"
+            for candidate in active_positions:
+                stock_code = candidate.stock_code
+                stock_name = candidate.stock_name or stock_code
 
                 message += (
-                    f"<b>{stock_code}</b>\n"
-                    f"  {quantity:,}주 @ {avg_price:,}원\n"
-                    f"  {unrealized_pnl:+,}원 ({pnl_rate:+.2f}%)\n\n"
+                    f"<b>{stock_code}</b> ({stock_name})\n"
+                    f"  상태: {candidate.status.value}\n"
+                    f"  신호: {candidate.trade_signal.value}\n\n"
                 )
 
-            total_value = summary.get('total_value', 0)
-            total_pnl = summary.get('total_profit_loss', 0)
-            total_rate = summary.get('total_profit_rate', 0)
-
-            message += (
-                f"<b>합계</b>\n"
-                f"총 평가금액: {total_value:,}원\n"
-                f"총 평가손익: {total_pnl:+,}원 ({total_rate:+.2f}%)"
-            )
+            message += f"총 {len(active_positions)}개 포지션"
 
             await update.message.reply_text(message, parse_mode='HTML')
 

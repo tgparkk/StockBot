@@ -89,14 +89,22 @@ class CandleTradeManager:
             'default_target_profit_pct': 3,    # 기본 목표 수익률 (%) - 3%로 조정 (현실적)
             'max_holding_hours': 6,            # 최대 보유 시간 - 6시간으로 조정 (단기 트레이딩)
 
+            # 🆕 최소 보유시간 설정 (노이즈 거래 방지)
+            'min_holding_minutes': 30,         # 최소 보유시간 30분 (노이즈 거래 방지)
+            'emergency_stop_loss_pct': 3.0,    # 긴급 손절 기준 (최소 보유시간 무시)
+            'min_holding_override_conditions': {
+                'market_crash': -5.0,          # 시장 급락시 (-5%) 최소시간 무시
+                'individual_limit_down': -10.0, # 개별 종목 하한가 근접시 (-10%) 즉시 매도
+            },
+
             # 패턴별 세부 목표 설정 (더 현실적으로)
             'pattern_targets': {
-                'hammer': {'target': 1.5, 'stop': 1.5, 'max_hours': 4},           # 망치형: 4시간
-                'inverted_hammer': {'target': 1.2, 'stop': 1.5, 'max_hours': 4},  # 역망치형: 4시간
-                'bullish_engulfing': {'target': 1.8, 'stop': 1.2, 'max_hours': 4}, # 장악형: 더 보수적 기준
-                'morning_star': {'target': 2.5, 'stop': 1.5, 'max_hours': 8},     # 샛별형: 8시간 (최강, 조금 길게)
-                'rising_three': {'target': 3.0, 'stop': 2.0, 'max_hours': 12},    # 삼법형: 12시간 (지속성 패턴)
-                'doji': {'target': 1.0, 'stop': 1.0, 'max_hours': 2},             # 도지: 2시간 (신중, 빠른 결정)
+                'hammer': {'target': 1.5, 'stop': 1.5, 'max_hours': 4, 'min_minutes': 20},           # 망치형: 최소 20분
+                'inverted_hammer': {'target': 1.2, 'stop': 1.5, 'max_hours': 4, 'min_minutes': 20},  # 역망치형: 최소 20분
+                'bullish_engulfing': {'target': 1.8, 'stop': 1.2, 'max_hours': 4, 'min_minutes': 30}, # 장악형: 최소 30분
+                'morning_star': {'target': 2.5, 'stop': 1.5, 'max_hours': 8, 'min_minutes': 45},     # 샛별형: 최소 45분 (강한 패턴)
+                'rising_three': {'target': 3.0, 'stop': 2.0, 'max_hours': 12, 'min_minutes': 60},    # 삼법형: 최소 1시간 (지속성 패턴)
+                'doji': {'target': 1.0, 'stop': 1.0, 'max_hours': 2, 'min_minutes': 15},             # 도지: 최소 15분 (신중, 빠른 결정)
             },
 
             # 시간 기반 청산 설정
@@ -109,12 +117,13 @@ class CandleTradeManager:
 
             # 🆕 투자금액 계산 설정
             'investment_calculation': {
-                'cash_usage_ratio': 0.8,       # 현금잔고 사용 비율 (80%)
-                'portfolio_usage_ratio': 0.2,  # 총평가액 사용 비율 (20%)
-                'min_cash_threshold': 500_000, # 현금 우선 사용 최소 기준 (50만원)
+                'available_amount_ratio': 0.9,    # 🎯 KIS API 매수가능금액 사용 비율 (90%)
+                'cash_usage_ratio': 0.8,          # 현금잔고 사용 비율 (80%) - 폴백용
+                'portfolio_usage_ratio': 0.2,     # 총평가액 사용 비율 (20%) - 사용하지 않음
+                'min_cash_threshold': 500_000,    # 현금 우선 사용 최소 기준 (50만원)
                 'max_portfolio_limit': 3_000_000, # 평가액 기준 최대 제한 (300만원)
-                'default_investment': 1_000_000,   # 기본 투자 금액 (100만원)
-                'min_investment': 100_000,     # 최소 투자 금액 (10만원)
+                'default_investment': 1_000_000,  # 기본 투자 금액 (100만원)
+                'min_investment': 100_000,        # 최소 투자 금액 (10만원)
             },
         }
 
@@ -153,7 +162,73 @@ class CandleTradeManager:
         from .sell_position_manager import SellPositionManager
         self.sell_manager = SellPositionManager(self)
 
+        # 🆕 주문 타임아웃 콜백 등록 (OrderExecutionManager와 연동)
+        self._register_order_timeout_callback()
+
         logger.info("✅ CandleTradeManager 초기화 완료")
+
+    def _register_order_timeout_callback(self):
+        """🆕 주문 타임아웃 콜백 등록"""
+        try:
+            if (hasattr(self.trade_executor, 'execution_manager') and 
+                self.trade_executor.execution_manager):
+                
+                # 타임아웃 콜백 함수 등록
+                self.trade_executor.execution_manager.add_execution_callback(self._handle_order_timeout)
+                logger.info("✅ 주문 타임아웃 콜백 등록 완료")
+            else:
+                logger.warning("⚠️ OrderExecutionManager 없음 - 타임아웃 콜백 등록 실패")
+        except Exception as e:
+            logger.error(f"❌ 타임아웃 콜백 등록 오류: {e}")
+
+    def _handle_order_timeout(self, timeout_data: Dict):
+        """🆕 주문 타임아웃 처리 - 종목 상태 복원"""
+        try:
+            if timeout_data.get('action') != 'order_timeout':
+                return  # 타임아웃 이벤트가 아님
+
+            stock_code = timeout_data.get('stock_code', '')
+            order_type = timeout_data.get('order_type', '')
+            elapsed_seconds = timeout_data.get('elapsed_seconds', 0)
+            
+            logger.warning(f"⏰ {stock_code} 주문 타임아웃 처리: {order_type} (경과: {elapsed_seconds:.0f}초)")
+
+            # _all_stocks에서 해당 종목 찾기
+            candidate = self.stock_manager._all_stocks.get(stock_code)
+            if not candidate:
+                logger.debug(f"📋 {stock_code} _all_stocks에 없음 - 타임아웃 처리 스킵")
+                return
+
+            # 주문 타입별 상태 복원
+            if order_type.upper() == 'BUY':
+                # 매수 주문 타임아웃 - BUY_READY 상태로 복원
+                candidate.clear_pending_order('buy')
+                candidate.status = CandleStatus.BUY_READY
+                logger.info(f"🔄 {stock_code} 매수 타임아웃 - PENDING_ORDER → BUY_READY 복원")
+                
+            elif order_type.upper() == 'SELL':
+                # 매도 주문 타임아웃 - ENTERED 상태로 복원
+                candidate.clear_pending_order('sell')
+                candidate.status = CandleStatus.ENTERED
+                logger.info(f"🔄 {stock_code} 매도 타임아웃 - PENDING_ORDER → ENTERED 복원")
+
+            # stock_manager에 상태 변경 반영
+            self.stock_manager.update_candidate(candidate)
+
+            # 메타데이터에 타임아웃 이력 기록
+            timeout_history = candidate.metadata.get('timeout_history', [])
+            timeout_history.append({
+                'timeout_time': datetime.now().isoformat(),
+                'order_type': order_type,
+                'elapsed_seconds': elapsed_seconds,
+                'restored_status': candidate.status.value
+            })
+            candidate.metadata['timeout_history'] = timeout_history
+
+            logger.info(f"✅ {stock_code} 주문 타임아웃 복원 완료: {candidate.status.value}")
+
+        except Exception as e:
+            logger.error(f"❌ 주문 타임아웃 처리 오류: {e}")
 
 
     # 🆕 기존 보유 종목 웹소켓 구독 관리 (간소화)
@@ -307,7 +382,7 @@ class CandleTradeManager:
 
                 # 5. 리스크 관리 설정 (패턴 분석 결과 반영)
                 logger.debug(f"🔍 {stock_code} 리스크 관리 설정 중...")
-                self._setup_holding_risk_management(existing_candidate, buy_price, current_price, candle_analysis_result)
+                self.sell_manager.setup_holding_risk_management(existing_candidate, buy_price, current_price, candle_analysis_result)
 
                 # 6. 메타데이터 설정
                 logger.debug(f"🔍 {stock_code} 메타데이터 설정 중...")
@@ -397,37 +472,15 @@ class CandleTradeManager:
             return None
 
     def _generate_trade_signal_from_patterns(self, patterns: List[CandlePatternInfo]) -> Tuple:
-        """패턴 목록에서 매매 신호 생성"""
+        """패턴 목록에서 매매 신호 생성 - candle_analyzer로 위임"""
         try:
-            if not patterns:
-                return 'HOLD', 0
-
-            # 가장 강한 패턴 기준으로 신호 생성
-            strongest_pattern = max(patterns, key=lambda p: p.strength)
-
-            from .candle_trade_candidate import PatternType, TradeSignal
-
-            # 강세 패턴들
-            bullish_patterns = {
-                PatternType.HAMMER, PatternType.INVERTED_HAMMER,
-                PatternType.BULLISH_ENGULFING, PatternType.MORNING_STAR,
-                PatternType.RISING_THREE_METHODS
-            }
-
-            if strongest_pattern.pattern_type in bullish_patterns:
-                # 더 엄격한 기준 적용
-                if strongest_pattern.confidence >= 0.9 and strongest_pattern.strength >= 95:
-                    return TradeSignal.STRONG_BUY, strongest_pattern.strength
-                elif strongest_pattern.confidence >= 0.8 and strongest_pattern.strength >= 85:
-                    return TradeSignal.BUY, strongest_pattern.strength
-                else:
-                    return TradeSignal.HOLD, strongest_pattern.strength
-            else:
-                return TradeSignal.HOLD, strongest_pattern.strength
+            # candle_analyzer의 generate_trade_signal_from_patterns 사용
+            candidate = None  # dummy candidate (실제로는 self.candle_analyzer에서 사용하지 않음)
+            return self.candle_analyzer.generate_trade_signal_from_patterns(candidate, patterns)
 
         except Exception as e:
             logger.error(f"패턴 신호 생성 오류: {e}")
-            return 'HOLD', 0
+            return TradeSignal.HOLD, 0
 
     # ==========================================
     # 기존 메서드들 유지...
@@ -515,364 +568,11 @@ class CandleTradeManager:
             return False
 
     # ========== 매매 신호 생성 ==========
+    # _generate_trade_signal 함수는 candle_analyzer.py로 이동됨
 
-    def _generate_trade_signal(self, candidate: CandleTradeCandidate,
-                             patterns: List[CandlePatternInfo]) -> Tuple[TradeSignal, int]:
-        """패턴 기반 매매 신호 생성"""
-        try:
-            if not patterns:
-                return TradeSignal.HOLD, 0
+    # _check_entry_conditions 함수는 buy_opportunity_evaluator.py로 이동됨
 
-            # 가장 강한 패턴 기준
-            primary_pattern = max(patterns, key=lambda p: p.strength)
-
-            # 패턴별 신호 맵핑
-            bullish_patterns = {
-                PatternType.HAMMER,
-                PatternType.INVERTED_HAMMER,
-                PatternType.BULLISH_ENGULFING,
-                PatternType.MORNING_STAR,
-                PatternType.RISING_THREE_METHODS
-            }
-
-            bearish_patterns = {
-                PatternType.BEARISH_ENGULFING,
-                PatternType.EVENING_STAR,
-                PatternType.FALLING_THREE_METHODS
-            }
-
-            neutral_patterns = {
-                PatternType.DOJI
-            }
-
-            # 신호 결정
-            if primary_pattern.pattern_type in bullish_patterns:
-                if primary_pattern.confidence >= 0.85 and primary_pattern.strength >= 90:
-                    return TradeSignal.STRONG_BUY, primary_pattern.strength
-                elif primary_pattern.confidence >= 0.70:
-                    return TradeSignal.BUY, primary_pattern.strength
-                else:
-                    return TradeSignal.HOLD, primary_pattern.strength
-
-            elif primary_pattern.pattern_type in bearish_patterns:
-                if primary_pattern.confidence >= 0.85:
-                    return TradeSignal.STRONG_SELL, primary_pattern.strength
-                else:
-                    return TradeSignal.SELL, primary_pattern.strength
-
-            elif primary_pattern.pattern_type in neutral_patterns:
-                return TradeSignal.HOLD, primary_pattern.strength
-
-            else:
-                return TradeSignal.HOLD, 0
-
-        except Exception as e:
-            logger.error(f"매매 신호 생성 오류: {e}")
-            return TradeSignal.HOLD, 0
-
-    async def _check_entry_conditions(self, candidate: CandleTradeCandidate,
-                                    current_info: Dict, daily_data: Optional[pd.DataFrame] = None) -> EntryConditions:
-        """진입 조건 종합 체크"""
-        try:
-            conditions = EntryConditions()
-
-            # 1. 거래량 조건
-            volume = int(current_info.get('acml_vol', 0))
-            avg_volume = int(current_info.get('avrg_vol', 1))
-            volume_ratio = volume / max(avg_volume, 1)
-
-            conditions.volume_check = volume_ratio >= self.config['min_volume_ratio']
-            if not conditions.volume_check:
-                conditions.fail_reasons.append(f"거래량 부족 ({volume_ratio:.1f}배)")
-
-            # 2. 기술적 지표 조건 (RSI, MACD, 볼린저밴드 등) - 전달받은 daily_data 사용
-            try:
-                conditions.rsi_check = True  # 기본값
-                conditions.technical_indicators = {}  # 🆕 기술적 지표 저장
-
-                if daily_data is not None and not daily_data.empty and len(daily_data) >= 20:
-                    from ..analysis.technical_indicators import TechnicalIndicators
-
-                    # OHLCV 데이터 추출
-                    ohlcv_data = []
-                    for _, row in daily_data.iterrows():
-                        try:
-                            open_price = float(row.get('stck_oprc', 0))
-                            high_price = float(row.get('stck_hgpr', 0))
-                            low_price = float(row.get('stck_lwpr', 0))
-                            close_price = float(row.get('stck_clpr', 0))
-                            volume = int(row.get('acml_vol', 0))
-
-                            if all(x > 0 for x in [open_price, high_price, low_price, close_price]):
-                                ohlcv_data.append({
-                                    'open': open_price,
-                                    'high': high_price,
-                                    'low': low_price,
-                                    'close': close_price,
-                                    'volume': volume
-                                })
-                        except (ValueError, TypeError):
-                            continue
-
-                    if len(ohlcv_data) >= 14:
-                        close_prices = [x['close'] for x in ohlcv_data]
-                        high_prices = [x['high'] for x in ohlcv_data]
-                        low_prices = [x['low'] for x in ohlcv_data]
-                        volumes = [x['volume'] for x in ohlcv_data]
-
-                        # 🔥 1. RSI 계산 및 체크
-                        rsi_values = TechnicalIndicators.calculate_rsi(close_prices)
-                        current_rsi = rsi_values[-1] if rsi_values else 50.0
-                        conditions.technical_indicators['rsi'] = current_rsi
-
-                        # RSI 과매수 구간 (65 이상) 체크
-                        conditions.rsi_check = current_rsi < 65  # 65 미만일 때 진입 허용
-                        if not conditions.rsi_check:
-                            conditions.fail_reasons.append(f"RSI 과매수 ({current_rsi:.1f})")
-
-                        # 🔥 2. MACD 계산 및 추가 확인
-                        try:
-                            macd_line, macd_signal, macd_histogram = TechnicalIndicators.calculate_macd(close_prices)
-                            if macd_line and macd_signal and macd_histogram:
-                                current_macd = macd_line[-1]
-                                current_signal = macd_signal[-1]
-                                current_histogram = macd_histogram[-1]
-
-                                conditions.technical_indicators['macd'] = float(current_macd)
-                                conditions.technical_indicators['macd_signal'] = float(current_signal)
-                                conditions.technical_indicators['macd_histogram'] = float(current_histogram)
-
-                                # MACD가 상승 전환 중이면 가점 (RSI 과매수여도 진입 고려)
-                                if float(current_macd) > float(current_signal) and float(current_histogram) > 0.0:
-                                    if not conditions.rsi_check and current_rsi < 75:  # RSI가 75 미만이면 MACD 우선
-                                        conditions.rsi_check = True
-                                        conditions.fail_reasons = [r for r in conditions.fail_reasons if 'RSI' not in r]
-                                        logger.debug(f"📊 {candidate.stock_code} MACD 상승전환으로 RSI 조건 완화")
-                        except Exception as e:
-                            logger.debug(f"📊 {candidate.stock_code} MACD 계산 오류: {e}")
-
-                        # 🔥 3. 볼린저 밴드 계산 (추가 확인)
-                        try:
-                            bb_upper, bb_middle, bb_lower = TechnicalIndicators.calculate_bollinger_bands(close_prices, 20, 2)
-                            if bb_upper and bb_middle and bb_lower:
-                                current_price = float(close_prices[-1])
-                                bb_position = (current_price - float(bb_lower[-1])) / (float(bb_upper[-1]) - float(bb_lower[-1]))
-
-                                conditions.technical_indicators['bb_position'] = bb_position
-
-                                # 볼린저 밴드 하단 근처(20% 이하)면 RSI 과매수 조건 완화
-                                if bb_position <= 0.2 and not conditions.rsi_check and current_rsi < 70:
-                                    conditions.rsi_check = True
-                                    conditions.fail_reasons = [r for r in conditions.fail_reasons if 'RSI' not in r]
-                                    logger.debug(f"📊 {candidate.stock_code} 볼린저밴드 하단으로 RSI 조건 완화")
-                        except Exception as e:
-                            logger.debug(f"📊 {candidate.stock_code} 볼린저밴드 계산 오류: {e}")
-
-                        logger.debug(f"📊 {candidate.stock_code} 기술지표 - RSI:{current_rsi:.1f}, "
-                                   f"MACD:{conditions.technical_indicators.get('macd_histogram', 0):.3f}, "
-                                   f"BB위치:{conditions.technical_indicators.get('bb_position', 0.5):.2f}")
-
-                    else:
-                        conditions.rsi_check = True  # 데이터 부족시 통과
-                        logger.debug(f"📊 {candidate.stock_code} 기술지표 데이터 부족 - 통과")
-                else:
-                    conditions.rsi_check = True  # 데이터 없을 시 통과
-                    logger.debug(f"📊 {candidate.stock_code} 일봉 데이터 없음 - 기술지표 체크 통과")
-
-            except Exception as e:
-                logger.error(f"기술지표 계산 오류 ({candidate.stock_code}): {e}")
-                conditions.rsi_check = True  # 오류시 통과
-
-            # 3. 시간대 조건
-            current_time = datetime.now().time()
-            trading_start = datetime.strptime(self.config['trading_start_time'], '%H:%M').time()
-            trading_end = datetime.strptime(self.config['trading_end_time'], '%H:%M').time()
-
-            conditions.time_check = trading_start <= current_time <= trading_end
-            if not conditions.time_check:
-                conditions.fail_reasons.append("거래 시간 외")
-            conditions.time_check = True
-
-            # 4. 가격대 조건
-            price = candidate.current_price
-            conditions.price_check = self.config['min_price'] <= price <= self.config['max_price']
-            if not conditions.price_check:
-                conditions.fail_reasons.append(f"가격대 부적합 ({price:,.0f}원)")
-
-            # 5. 시가총액 조건 (간접 추정)
-            conditions.market_cap_check = price >= 5000  # 간단한 추정
-
-            # 6. 일일 거래대금 조건
-            daily_amount = volume * price
-            conditions.daily_volume_check = daily_amount >= self.config['min_daily_volume']
-            if not conditions.daily_volume_check:
-                conditions.fail_reasons.append(f"거래대금 부족 ({daily_amount/100000000:.0f}억원)")
-
-            # 전체 통과 여부
-            conditions.overall_passed = all([
-                conditions.volume_check,
-                conditions.rsi_check,
-                conditions.time_check,
-                conditions.price_check,
-                conditions.market_cap_check,
-                conditions.daily_volume_check
-            ])
-
-            return conditions
-
-        except Exception as e:
-            logger.error(f"진입 조건 체크 오류: {e}")
-            return EntryConditions()
-
-    def _calculate_risk_management(self, candidate: CandleTradeCandidate) -> RiskManagement:
-        """리스크 관리 설정 계산"""
-        try:
-            current_price = candidate.current_price
-
-            # 패턴별 포지션 크기 조정
-            if candidate.primary_pattern:
-                pattern_type = candidate.primary_pattern.pattern_type
-                confidence = candidate.primary_pattern.confidence
-
-                # 강한 패턴일수록 큰 포지션
-                if pattern_type in [PatternType.MORNING_STAR, PatternType.BULLISH_ENGULFING]:
-                    base_position_pct = min(30, self.config['max_position_size_pct'])
-                elif pattern_type in [PatternType.HAMMER, PatternType.INVERTED_HAMMER]:
-                    base_position_pct = 20
-                else:
-                    base_position_pct = 15
-
-                # 신뢰도에 따른 조정
-                position_size_pct = base_position_pct * confidence
-            else:
-                position_size_pct = 10
-
-            # 손절가/목표가 계산 - 패턴별 세부 설정 적용
-            stop_loss_pct = self.config['default_stop_loss_pct']
-            target_profit_pct = self.config['default_target_profit_pct']
-
-            # 🆕 패턴별 목표 설정 적용
-            if candidate.primary_pattern:
-                pattern_name = candidate.primary_pattern.pattern_type.value.lower()
-                pattern_config = self.config['pattern_targets'].get(pattern_name)
-
-                if pattern_config:
-                    target_profit_pct = pattern_config['target']
-                    stop_loss_pct = pattern_config['stop']
-                    logger.debug(f"📊 {candidate.stock_code} 패턴별 목표 적용: {pattern_name} - 목표:{target_profit_pct}%, 손절:{stop_loss_pct}%")
-                else:
-                    # 패턴 강도에 따른 기본 조정
-                    if candidate.primary_pattern.pattern_type == PatternType.MORNING_STAR:
-                        target_profit_pct = 2.5  # 샛별형은 강한 반전 신호
-                        stop_loss_pct = 1.5
-                    elif candidate.primary_pattern.pattern_type == PatternType.BULLISH_ENGULFING:
-                        target_profit_pct = 2.0  # 장악형도 강함
-                        stop_loss_pct = 1.5
-                    elif candidate.primary_pattern.pattern_type == PatternType.HAMMER:
-                        target_profit_pct = 1.5  # 망치형은 보수적
-                        stop_loss_pct = 1.5
-
-            stop_loss_price = current_price * (1 - stop_loss_pct / 100)
-            target_price = current_price * (1 + target_profit_pct / 100)
-
-            # 추적 손절 설정
-            trailing_stop_pct = stop_loss_pct * 0.6  # 손절의 60% 수준
-
-            # 최대 보유 시간 (패턴별 조정)
-            max_holding_hours = self.config['max_holding_hours']
-            if candidate.primary_pattern:
-                pattern_name = candidate.primary_pattern.pattern_type.value.lower()
-                pattern_config = self.config['pattern_targets'].get(pattern_name)
-
-                if pattern_config and 'max_hours' in pattern_config:
-                    max_holding_hours = pattern_config['max_hours']
-                    logger.debug(f"📊 {candidate.stock_code} 패턴별 보유 시간 적용: {pattern_name} - {max_holding_hours}시간")
-                else:
-                    # 패턴별 기본 조정 (백업)
-                    if candidate.primary_pattern.pattern_type in [PatternType.RISING_THREE_METHODS]:
-                        max_holding_hours = 12  # 추세 지속 패턴은 길게
-                    elif candidate.primary_pattern.pattern_type == PatternType.MORNING_STAR:
-                        max_holding_hours = 8   # 샛별형은 강력한 패턴
-                    elif candidate.primary_pattern.pattern_type in [PatternType.HAMMER, PatternType.INVERTED_HAMMER]:
-                        max_holding_hours = 4   # 망치형은 짧게
-                    elif candidate.primary_pattern.pattern_type == PatternType.DOJI:
-                        max_holding_hours = 2   # 도지는 매우 짧게
-
-            # 위험도 점수 계산
-            risk_score = self._calculate_risk_score({'stck_prpr': current_price})
-
-            return RiskManagement(
-                position_size_pct=position_size_pct,
-                position_amount=0,  # 실제 투자금액은 진입시 계산
-                stop_loss_price=stop_loss_price,
-                target_price=target_price,
-                trailing_stop_pct=trailing_stop_pct,
-                max_holding_hours=max_holding_hours,
-                risk_score=risk_score
-            )
-
-        except Exception as e:
-            logger.error(f"리스크 관리 계산 오류: {e}")
-            return RiskManagement(0, 0, 0, 0, 0, 8, 100)
-
-    def _calculate_risk_score(self, stock_info: dict) -> int:
-        """위험도 점수 계산 (0-100)"""
-        try:
-            risk_score = 50  # 기본 점수
-
-            current_price = float(stock_info.get('stck_prpr', 0))
-            change_rate = float(stock_info.get('prdy_ctrt', 0))
-
-            # 가격대별 위험도
-            if current_price < 5000:
-                risk_score += 20  # 저가주 위험
-            elif current_price > 100000:
-                risk_score += 10  # 고가주 위험
-
-            # 변동률별 위험도
-            if abs(change_rate) > 10:
-                risk_score += 30  # 급등락 위험
-            elif abs(change_rate) > 5:
-                risk_score += 15
-
-            return min(100, max(0, risk_score))
-        except:
-            return 50
-
-    def _calculate_entry_priority(self, candidate: CandleTradeCandidate) -> int:
-        """🆕 진입 우선순위 계산 (0~100)"""
-        try:
-            priority = 0
-
-            # 1. 신호 강도 (30%)
-            priority += candidate.signal_strength * 0.3
-
-            # 2. 패턴 점수 (30%)
-            priority += candidate.pattern_score * 0.3
-
-            # 3. 패턴 신뢰도 (20%)
-            if candidate.primary_pattern:
-                priority += candidate.primary_pattern.confidence * 100 * 0.2
-
-            # 4. 패턴별 가중치 (20%)
-            if candidate.primary_pattern:
-                pattern_weights = {
-                    PatternType.MORNING_STAR: 20,      # 최고 신뢰도
-                    PatternType.BULLISH_ENGULFING: 18,
-                    PatternType.HAMMER: 15,
-                    PatternType.INVERTED_HAMMER: 15,
-                    PatternType.RISING_THREE_METHODS: 12,
-                    PatternType.DOJI: 8,               # 가장 낮음
-                }
-                weight = pattern_weights.get(candidate.primary_pattern.pattern_type, 10)
-                priority += weight
-
-            # 정규화 (0~100)
-            return min(100, max(0, int(priority)))
-
-        except Exception as e:
-            logger.error(f"진입 우선순위 계산 오류: {e}")
-            return 50
+    # _calculate_risk_score, _calculate_entry_priority 함수는 candle_analyzer.py로 이동됨
 
     # ========== 진입 기회 평가 ==========
     # 진입 기회 평가 = 매수 준비 종목 평가
@@ -889,6 +589,10 @@ class CandleTradeManager:
         """기존 포지션 관리 (손절/익절/추적손절) - SellPositionManager에 위임"""
         try:
             await self.sell_manager.manage_existing_positions()
+            
+            # 🧹 주기적으로 조정 이력 정리 (1시간마다)
+            self.sell_manager.cleanup_adjustment_history()
+            
         except Exception as e:
             logger.error(f"❌ 포지션 관리 오류: {e}")
 
@@ -977,7 +681,7 @@ class CandleTradeManager:
                 existing_candidate.performance.entry_price = float(buy_price)
 
                 # 리스크 관리 설정
-                self._setup_holding_risk_management(existing_candidate, buy_price, current_price, candle_analysis_result)
+                self.sell_manager.setup_holding_risk_management(existing_candidate, buy_price, current_price, candle_analysis_result)
 
                 # 메타데이터 설정
                 self._setup_holding_metadata(existing_candidate, candle_analysis_result)
@@ -1011,135 +715,7 @@ class CandleTradeManager:
             created_at=datetime.now()
         )
 
-    def _setup_holding_risk_management(self, candidate: CandleTradeCandidate, buy_price: float,
-                                     current_price: float, candle_analysis_result: Optional[Dict]):
-        """보유 종목 리스크 관리 설정"""
-        try:
-            from .candle_trade_candidate import RiskManagement
 
-            entry_price = float(buy_price)
-            current_price_float = float(current_price)
-
-            if candle_analysis_result and candle_analysis_result.get('patterns_detected'):
-                # 캔들 패턴 분석 성공 시
-                target_price, stop_loss_price, trailing_stop_pct, max_holding_hours, position_size_pct, risk_score, source_info = \
-                    self._calculate_pattern_based_risk_settings(entry_price, current_price_float, candle_analysis_result)
-
-                # 패턴 정보 저장
-                self._save_pattern_info_to_candidate(candidate, candle_analysis_result)
-
-                logger.info(f"✅ {candidate.stock_code} 패턴 분석 성공: {candle_analysis_result['strongest_pattern']['type']} "
-                           f"(강도: {candle_analysis_result['strongest_pattern']['strength']}, "
-                           f"신뢰도: {candle_analysis_result['strongest_pattern']['confidence']:.2f})")
-            else:
-                # 패턴 감지 실패 시 기본 설정
-                target_price, stop_loss_price, trailing_stop_pct, max_holding_hours, position_size_pct, risk_score, source_info = \
-                    self._calculate_default_risk_settings(entry_price, current_price_float)
-
-            # RiskManagement 객체 생성
-            entry_quantity = candidate.performance.entry_quantity or 0
-            candidate.risk_management = RiskManagement(
-                position_size_pct=position_size_pct,
-                position_amount=int(entry_price * entry_quantity),
-                stop_loss_price=stop_loss_price,
-                target_price=target_price,
-                trailing_stop_pct=trailing_stop_pct,
-                max_holding_hours=max_holding_hours,
-                risk_score=risk_score
-            )
-
-            # 메타데이터에 설정 출처 저장
-            candidate.metadata['risk_management_source'] = source_info
-
-        except Exception as e:
-            logger.error(f"리스크 관리 설정 오류: {e}")
-
-    def _calculate_pattern_based_risk_settings(self, entry_price: float, current_price: float,
-                                             candle_analysis_result: Dict) -> Tuple[float, float, float, int, float, int, str]:
-        """패턴 기반 리스크 설정 계산"""
-        try:
-            patterns = candle_analysis_result['patterns']
-            strongest_pattern = candle_analysis_result['strongest_pattern']
-
-            logger.info(f"🔄 실시간 캔들 패턴 감지: {strongest_pattern['type']} (강도: {strongest_pattern['strength']})")
-
-            # 패턴별 설정 적용
-            pattern_config = self.config['pattern_targets'].get(strongest_pattern['type'].lower())
-            if pattern_config:
-                target_pct = pattern_config['target']
-                stop_pct = pattern_config['stop']
-                max_holding_hours = pattern_config['max_hours']
-            else:
-                # 패턴 강도별 기본 설정
-                if strongest_pattern['strength'] >= 90:
-                    target_pct, stop_pct, max_holding_hours = 15.0, 4.0, 8
-                elif strongest_pattern['strength'] >= 80:
-                    target_pct, stop_pct, max_holding_hours = 12.0, 3.0, 6
-                elif strongest_pattern['strength'] >= 70:
-                    target_pct, stop_pct, max_holding_hours = 8.0, 3.0, 4
-                else:
-                    target_pct, stop_pct, max_holding_hours = 5.0, 2.0, 2
-
-            target_price = entry_price * (1 + target_pct / 100)
-            stop_loss_price = entry_price * (1 - stop_pct / 100)
-            trailing_stop_pct = stop_pct * 0.6
-            position_size_pct = 20.0
-            risk_score = 100 - strongest_pattern['confidence'] * 100
-
-            source_info = f"실시간패턴분석({strongest_pattern['type']})"
-
-            return target_price, stop_loss_price, trailing_stop_pct, max_holding_hours, position_size_pct, risk_score, source_info
-
-        except Exception as e:
-            logger.error(f"패턴 기반 설정 계산 오류: {e}")
-            return self._calculate_default_risk_settings(entry_price, current_price)
-
-    def _calculate_default_risk_settings(self, entry_price: float, current_price: float) -> Tuple[float, float, float, int, float, int, str]:
-        """기본 리스크 설정 계산"""
-        try:
-            logger.info("🔧 캔들 패턴 감지 실패 - 기본 설정 적용")
-
-            # 기본 3% 목표가, 2% 손절가 설정
-            target_price = entry_price * 1.03  # 3% 익절
-            stop_loss_price = entry_price * 0.98  # 2% 손절
-
-            # 현재가가 진입가보다 높다면 목표가 조정
-            if current_price > entry_price:
-                current_profit_rate = (current_price - entry_price) / entry_price
-                if current_profit_rate >= 0.02:  # 이미 2% 이상 수익
-                    target_price = current_price * 1.01  # 현재가에서 1% 더
-                    stop_loss_price = current_price * 0.985  # 현재가에서 1.5% 하락
-
-            trailing_stop_pct = 1.0
-            max_holding_hours = 24
-            position_size_pct = 20.0
-            risk_score = 50
-            source_info = "기본설정(패턴미감지)"
-
-            return target_price, stop_loss_price, trailing_stop_pct, max_holding_hours, position_size_pct, risk_score, source_info
-
-        except Exception as e:
-            logger.error(f"기본 설정 계산 오류: {e}")
-            # 최소한의 안전 설정
-            return entry_price * 1.03, entry_price * 0.98, 1.0, 24, 20.0, 50, "오류시기본값"
-
-    def _save_pattern_info_to_candidate(self, candidate: CandleTradeCandidate, candle_analysis_result: Dict):
-        """패턴 정보를 candidate에 저장"""
-        try:
-            patterns = candle_analysis_result['patterns']
-            strongest_pattern = candle_analysis_result['strongest_pattern']
-
-            # 메타데이터 저장
-            candidate.metadata['original_pattern_type'] = strongest_pattern['type']
-            candidate.metadata['original_pattern_strength'] = strongest_pattern['strength']
-            candidate.metadata['pattern_confidence'] = strongest_pattern['confidence']
-
-            # 감지된 패턴 정보 추가
-            for pattern in patterns:
-                candidate.add_pattern(pattern)
-
-        except Exception as e:
-            logger.error(f"패턴 정보 저장 오류: {e}")
 
     def _setup_holding_metadata(self, candidate: CandleTradeCandidate, candle_analysis_result: Optional[Dict]):
         """보유 종목 메타데이터 설정"""
@@ -1267,15 +843,30 @@ class CandleTradeManager:
 
     # ========== 🆕 체결 확인 처리 ==========
 
-    async def handle_execution_confirmation(self, execution_data: Dict):
+    async def handle_execution_confirmation(self, execution_data):
         """🎯 웹소켓 체결 통보 처리 - 매수/매도 체결 확인 후 상태 업데이트"""
         try:
+            # 🚨 타입 안전성 검사 (문자열로 전달된 경우 처리)
+            if isinstance(execution_data, str):
+                logger.warning(f"⚠️ execution_data가 문자열로 전달됨: {execution_data}")
+                # 문자열 파싱 시도하거나 빈 딕셔너리로 처리
+                execution_data = {}
+            
+            if not isinstance(execution_data, dict):
+                logger.error(f"❌ execution_data 타입 오류: {type(execution_data)}")
+                return
+            
             # 체결 데이터에서 주요 정보 추출
             stock_code = execution_data.get('stock_code', '')
             order_type = execution_data.get('order_type', '')  # 매수/매도 구분
             executed_quantity = int(execution_data.get('executed_quantity', 0))
             executed_price = float(execution_data.get('executed_price', 0))
             order_no = execution_data.get('order_no', '')
+
+            # 체결 통보 파싱 성공 여부 확인
+            if not execution_data.get('parsed_success', False):
+                logger.debug(f"📝 체결통보 파싱 실패 또는 미파싱 데이터: {execution_data.get('raw_data', '')[:50]}...")
+                return
 
             if not stock_code or not order_type:
                 logger.warning(f"⚠️ 체결 통보 데이터 부족: {execution_data}")
@@ -1475,7 +1066,7 @@ class CandleTradeManager:
                             candidate.signal_updated_at = datetime.now(self.korea_tz)
 
                             # 우선순위 재계산
-                            candidate.entry_priority = self._calculate_entry_priority(candidate)
+                            candidate.entry_priority = self.candle_analyzer.calculate_entry_priority(candidate)
 
                             # stock_manager 업데이트
                             self.stock_manager.update_candidate(candidate)
@@ -1728,32 +1319,37 @@ class CandleTradeManager:
             stale_order_timeout = 300  # 5분 (300초)
             current_time = datetime.now()
 
-            # PENDING_ORDER 상태인 종목들 확인
+            # ========== 1. 웹소켓 관리 종목들의 PENDING_ORDER 상태 체크 ==========
             pending_candidates = [
                 candidate for candidate in self.stock_manager._all_stocks.values()
                 if candidate.status == CandleStatus.PENDING_ORDER
             ]
 
-            if not pending_candidates:
-                return
+            if pending_candidates:
+                logger.debug(f"🕐 웹소켓 관리 종목 미체결 주문 체크: {len(pending_candidates)}개")
 
-            logger.debug(f"🕐 미체결 주문 체크: {len(pending_candidates)}개 종목")
+                for candidate in pending_candidates:
+                    try:
+                        # 주문 경과 시간 확인
+                        order_age = candidate.get_pending_order_age_seconds()
+                        if order_age is None or order_age < stale_order_timeout:
+                            continue
 
-            for candidate in pending_candidates:
-                try:
-                    # 주문 경과 시간 확인
-                    order_age = candidate.get_pending_order_age_seconds()
-                    if order_age is None or order_age < stale_order_timeout:
-                        continue
+                        # 5분 이상 미체결 주문 취소 처리
+                        await self._cancel_stale_order(candidate, order_age)
 
-                    # 5분 이상 미체결 주문 취소 처리
-                    await self._cancel_stale_order(candidate, order_age)
+                    except Exception as e:
+                        logger.error(f"❌ {candidate.stock_code} 미체결 주문 처리 오류: {e}")
 
-                except Exception as e:
-                    logger.error(f"❌ {candidate.stock_code} 미체결 주문 처리 오류: {e}")
+            # ========== 2. 🆕 KIS API로 전체 미체결 주문 조회 및 취소 ==========
+            logger.debug("🔍 KIS API를 통한 전체 미체결 주문 조회 시작")
+            from ..api import kis_order_api
+            await kis_order_api.check_and_cancel_external_orders(self.kis_api_manager)
 
         except Exception as e:
             logger.error(f"❌ 미체결 주문 체크 오류: {e}")
+
+
 
     async def _cancel_stale_order(self, candidate: CandleTradeCandidate, order_age: float):
         """개별 미체결 주문 취소 처리"""

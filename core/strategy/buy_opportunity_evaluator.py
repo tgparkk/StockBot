@@ -51,23 +51,63 @@ class BuyOpportunityEvaluator:
             logger.info(f"📊 전체 종목 상태: {status_summary}")
             logger.info(f"📊 준비 상태 분석: {ready_status_summary}")
 
-            # 🎯 매수 준비 상태인 종목들만 필터링 (이미 모든 검증 완료됨)
-            buy_ready_candidates = [
-                candidate for candidate in all_stocks
-                if candidate.is_ready_for_entry()
-            ]
+            # 🎯 매수 준비 상태인 종목들만 필터링 (이미 모든 검증 완료됨) + 중복 주문 방지
+            buy_ready_candidates = []
+            for candidate in all_stocks:
+                if not candidate.is_ready_for_entry():
+                    continue
+                    
+                # 🚨 PENDING_ORDER 상태 종목 제외
+                if candidate.status == CandleStatus.PENDING_ORDER:
+                    logger.debug(f"🚫 {candidate.stock_code} PENDING_ORDER 상태 - 매수 스킵")
+                    continue
+                    
+                # 🚨 매수 주문 대기 중인 종목 제외
+                if candidate.has_pending_order('buy'):
+                    logger.debug(f"🚫 {candidate.stock_code} 매수 주문 대기 중 - 매수 스킵")
+                    continue
+                    
+                # 🚨 최근에 매수 주문을 낸 종목 제외 (5분 내)
+                if candidate.pending_order_time:
+                    time_since_order = (datetime.now() - candidate.pending_order_time).total_seconds()
+                    if time_since_order < 300:  # 5분 내
+                        logger.debug(f"🚫 {candidate.stock_code} 최근 주문 후 {time_since_order:.0f}초 경과 - 매수 스킵")
+                        continue
+                
+                buy_ready_candidates.append(candidate)
 
             if not buy_ready_candidates:
                 logger.info("📊 매수 준비된 종목이 없습니다")
+                
+                # 🔍 BUY_READY 상태인데 is_ready_for_entry()가 False인 종목 체크
+                buy_ready_status_only = [
+                    candidate for candidate in all_stocks
+                    if candidate.status == CandleStatus.BUY_READY
+                ]
+                
+                if buy_ready_status_only:
+                    logger.warning(f"⚠️ BUY_READY 상태이지만 매수 준비되지 않은 종목: {len(buy_ready_status_only)}개")
+                    for candidate in buy_ready_status_only:
+                        ready_check = candidate.is_ready_for_entry()
+                        logger.warning(f"   🔍 {candidate.stock_code}: status={candidate.status.value}, "
+                                     f"is_ready={ready_check}, signal={candidate.trade_signal.value}, "
+                                     f"entry_conditions={candidate.entry_conditions is not None}")
+                
                 return
 
             logger.info(f"💰 매수 실행: {len(buy_ready_candidates)}개 준비된 종목")
+            
+            # 🔍 매수 후보 종목 상세 정보 로그
+            for candidate in buy_ready_candidates:
+                logger.info(f"   💰 매수 후보: {candidate.stock_code} (신호:{candidate.trade_signal.value}, "
+                           f"강도:{candidate.signal_strength}, 상태:{candidate.status.value})")
 
             # 🚀 개별 종목별로 순차 매수 실행 (잔액 실시간 반영)
             successful_orders = 0
             for candidate in buy_ready_candidates:
                 try:
                     # 💰 매수 직전 최신 계좌 정보 조회 (잔액 실시간 반영)
+                    logger.info(f"🔍 {candidate.stock_code} 계좌 정보 조회 시작...")
                     account_info = await self._get_account_info()
                     if not account_info:
                         logger.warning(f"⚠️ {candidate.stock_code} 계좌 정보 조회 실패 - 매수 스킵")
@@ -78,16 +118,22 @@ class BuyOpportunityEvaluator:
                     logger.info(f"💰 {candidate.stock_code} 가용 투자 자금: {available_funds:,.0f}원")
 
                     if available_funds <= 0:
-                        logger.warning(f"⚠️ {candidate.stock_code} 가용 자금 부족 - 매수 중단")
+                        logger.warning(f"⚠️ {candidate.stock_code} 가용 자금 부족 ({available_funds:,.0f}원) - 매수 중단")
                         break  # 자금 부족시 추가 매수 중단
 
                     # 🎯 개별 종목 투자금액 계산
                     current_positions = len([c for c in self.manager.stock_manager._all_stocks.values()
                                            if c.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]])
+                    min_investment = self.manager.config['investment_calculation']['min_investment']
+                    
+                    logger.info(f"🔍 {candidate.stock_code} 투자금액 계산: 현재포지션={current_positions}개, "
+                               f"가용자금={available_funds:,.0f}원, 최소투자금={min_investment:,.0f}원")
+                    
                     investment_amount = self._calculate_entry_params(candidate, available_funds, current_positions)
+                    logger.info(f"💰 {candidate.stock_code} 계산된 투자금액: {investment_amount:,.0f}원")
 
-                    if investment_amount < self.manager.config['investment_calculation']['min_investment']:
-                        logger.warning(f"⚠️ {candidate.stock_code} 투자금액 부족: {investment_amount:,.0f}원")
+                    if investment_amount < min_investment:
+                        logger.warning(f"⚠️ {candidate.stock_code} 투자금액 부족: {investment_amount:,.0f}원 < {min_investment:,.0f}원")
                         continue
 
                     # 📈 매수 주문 실행
@@ -95,11 +141,18 @@ class BuyOpportunityEvaluator:
                     if success:
                         successful_orders += 1
 
-                        # 🔧 매수 주문 성공시 PENDING_ORDER 상태로 변경
-                        candidate.status = CandleStatus.PENDING_ORDER
+                        # 🔧 매수 주문 성공시 stock_manager 업데이트 (set_pending_order에서 이미 PENDING_ORDER 설정됨)
                         self.manager.stock_manager.update_candidate(candidate)
 
-                        logger.info(f"✅ {candidate.stock_code} 매수 주문 성공 - PENDING_ORDER 상태 전환")
+                        # 🔍 상태 변경 확인
+                        updated_candidate = self.manager.stock_manager._all_stocks.get(candidate.stock_code)
+                        if updated_candidate:
+                            actual_status = updated_candidate.status.value
+                            is_ready_check = updated_candidate.is_ready_for_entry()
+                            logger.info(f"✅ {candidate.stock_code} 매수 주문 성공 - {actual_status} 상태 "
+                                       f"(is_ready={is_ready_check}, 주문번호: {updated_candidate.get_pending_order_no('buy')})")
+                        else:
+                            logger.error(f"❌ {candidate.stock_code} stock_manager 업데이트 실패!")
                     else:
                         # 🔧 매수 주문 실패시 원래 상태 유지 (BUY_READY)
                         logger.warning(f"❌ {candidate.stock_code} 매수 주문 실패 - BUY_READY 상태 유지")
@@ -219,7 +272,7 @@ class BuyOpportunityEvaluator:
             logger.debug(f"✅ {candidate.stock_code} 2단계 통과: 기본 필터")
 
             # 3. 🔍 상세 진입 조건 체크
-            entry_conditions = await self.manager._check_entry_conditions(candidate, stock_info_dict)
+            entry_conditions = await self.check_entry_conditions(candidate, stock_info_dict)
 
             if not entry_conditions.overall_passed:
                 logger.info(f"❌ {candidate.stock_code} 3단계 실패: 상세 진입 조건 미통과 - {', '.join(entry_conditions.fail_reasons)}")
@@ -319,28 +372,39 @@ class BuyOpportunityEvaluator:
             return None
 
     def _calculate_available_funds(self, account_info: Dict) -> float:
-        """🆕 가용 투자 자금 계산 (현금 + 평가액 기반)"""
+        """🆕 가용 투자 자금 계산 (KIS API dnca_tot_amt 매수가능금액 활용)"""
         try:
             investment_config = self.manager.config['investment_calculation']
 
-            # 현금 잔고
-            cash_balance = float(account_info.get('cash_balance', 0))
+            # 🎯 KIS API에서 제공하는 실제 매수가능금액 사용 (dnca_tot_amt)
+            available_amount = float(account_info.get('available_amount', 0))  # dnca_tot_amt
+            cash_balance = float(account_info.get('cash_balance', 0))          # 현금잔고
+            total_value = float(account_info.get('total_value', 0))           # 총평가액
 
-            # 총 평가액
-            total_evaluation = float(account_info.get('total_evaluation', 0))
+            logger.info(f"💰 계좌 정보: 매수가능금액={available_amount:,.0f}원, "
+                       f"현금잔고={cash_balance:,.0f}원, 총평가액={total_value:,.0f}원")
 
-            # 현금이 충분한 경우 현금 위주 사용
-            if cash_balance >= investment_config['min_cash_threshold']:
-                available_funds = cash_balance * investment_config['cash_usage_ratio']
-                logger.debug(f"💰 현금 기반 투자: {available_funds:,.0f}원 (현금잔고: {cash_balance:,.0f}원)")
+            # 🎯 매수가능금액이 있으면 이를 기준으로 사용 (가장 정확한 값)
+            if available_amount > 0:
+                # 매수가능금액의 일정 비율만 사용 (안전 마진)
+                safe_ratio = investment_config.get('available_amount_ratio', 0.9)  # 90% 사용
+                available_funds = available_amount * safe_ratio
+                
+                logger.info(f"💰 매수가능금액 기반 투자: {available_funds:,.0f}원 "
+                           f"(매수가능금액의 {safe_ratio*100:.0f}%)")
+            
+            # 매수가능금액 정보가 없으면 기존 로직 사용 (폴백)
+            elif cash_balance > 0:
+                # 현금 잔고 기반 계산
+                cash_usage_ratio = investment_config.get('cash_usage_ratio', 0.8)
+                available_funds = cash_balance * cash_usage_ratio
+                
+                logger.warning(f"⚠️ 매수가능금액 정보 없음 - 현금잔고 기반: {available_funds:,.0f}원 "
+                              f"(현금잔고의 {cash_usage_ratio*100:.0f}%)")
+            
             else:
-                # 현금이 부족한 경우 평가액 일부 활용
-                portfolio_based = total_evaluation * investment_config['portfolio_usage_ratio']
-                portfolio_based = min(portfolio_based, investment_config['max_portfolio_limit'])
-
-                available_funds = cash_balance * 0.9 + portfolio_based  # 현금 90% + 평가액 일부
-                logger.debug(f"💰 평가액 기반 투자: {available_funds:,.0f}원 "
-                           f"(현금: {cash_balance:,.0f}원, 평가액활용: {portfolio_based:,.0f}원)")
+                logger.error("❌ 매수가능금액과 현금잔고 모두 0원 또는 정보 없음")
+                return 0
 
             # 최소 투자금액 확보 여부 체크
             min_required = investment_config['min_investment']
@@ -348,15 +412,25 @@ class BuyOpportunityEvaluator:
                 logger.warning(f"⚠️ 가용자금 부족: {available_funds:,.0f}원 < {min_required:,.0f}원")
                 return 0
 
+            logger.info(f"✅ 최종 가용 투자자금: {available_funds:,.0f}원")
             return available_funds
 
         except Exception as e:
             logger.error(f"가용 자금 계산 오류: {e}")
-            return self.manager.config['investment_calculation']['default_investment']
+            return 0
 
     async def _execute_entry(self, candidate: CandleTradeCandidate, investment_amount: float) -> bool:
         """매수 실행 - 주문만 하고 체결은 웹소켓에서 확인"""
         try:
+            # 🚨 최종 중복 주문 방지 체크
+            if candidate.status == CandleStatus.PENDING_ORDER:
+                logger.warning(f"🚫 {candidate.stock_code} 이미 PENDING_ORDER 상태 - 매수 중단")
+                return False
+                
+            if candidate.has_pending_order('buy'):
+                logger.warning(f"🚫 {candidate.stock_code} 이미 매수 주문 대기 중 - 매수 중단")
+                return False
+
             current_price = candidate.current_price
             quantity = int(investment_amount / current_price)
 
@@ -445,3 +519,162 @@ class BuyOpportunityEvaluator:
         except Exception as e:
             logger.warning(f"⚠️ {candidate.stock_code} 캔들 전략 매수 DB 저장 오류: {e}")
             # DB 저장 실패해도 거래는 계속 진행
+
+    # ========== 🆕 진입 조건 체크 ==========
+
+    async def check_entry_conditions(self, candidate: CandleTradeCandidate,
+                                   current_info: Dict, daily_data: Optional[Any] = None):
+        """🔍 진입 조건 종합 체크 (CandleTradeManager에서 이관)"""
+        try:
+            from .candle_trade_candidate import EntryConditions
+            
+            conditions = EntryConditions()
+
+            # 1. 거래량 조건
+            current_volume = int(current_info.get('acml_vol', 0))  # 🎯 현재 누적 거래량
+            avg_volume = int(current_info.get('avrg_vol', 1))
+            volume_ratio = current_volume / max(avg_volume, 1)
+
+            conditions.volume_check = volume_ratio >= self.manager.config['min_volume_ratio']
+            if not conditions.volume_check:
+                conditions.fail_reasons.append(f"거래량 부족 ({volume_ratio:.1f}배)")
+
+            # 2. 기술적 지표 조건 (RSI, MACD, 볼린저밴드 등) - 전달받은 daily_data 사용
+            try:
+                conditions.rsi_check = True  # 기본값
+                conditions.technical_indicators = {}  # 🆕 기술적 지표 저장
+
+                if daily_data is not None and not daily_data.empty and len(daily_data) >= 20:
+                    from ..analysis.technical_indicators import TechnicalIndicators
+
+                    # OHLCV 데이터 추출
+                    ohlcv_data = []
+                    for _, row in daily_data.iterrows():
+                        try:
+                            open_price = float(row.get('stck_oprc', 0))
+                            high_price = float(row.get('stck_hgpr', 0))
+                            low_price = float(row.get('stck_lwpr', 0))
+                            close_price = float(row.get('stck_clpr', 0))
+                            daily_volume = int(row.get('acml_vol', 0))  # 🎯 일봉별 거래량
+
+                            if all(x > 0 for x in [open_price, high_price, low_price, close_price]):
+                                ohlcv_data.append({
+                                    'open': open_price,
+                                    'high': high_price,
+                                    'low': low_price,
+                                    'close': close_price,
+                                    'volume': daily_volume
+                                })
+                        except (ValueError, TypeError):
+                            continue
+
+                    if len(ohlcv_data) >= 14:
+                        close_prices = [x['close'] for x in ohlcv_data]
+                        high_prices = [x['high'] for x in ohlcv_data]
+                        low_prices = [x['low'] for x in ohlcv_data]
+                        volumes = [x['volume'] for x in ohlcv_data]
+
+                        # 🔥 1. RSI 계산 및 체크
+                        rsi_values = TechnicalIndicators.calculate_rsi(close_prices)
+                        current_rsi = rsi_values[-1] if rsi_values else 50.0
+                        conditions.technical_indicators['rsi'] = current_rsi
+
+                        # RSI 과매수 구간 (65 이상) 체크
+                        conditions.rsi_check = current_rsi < 65  # 65 미만일 때 진입 허용
+                        if not conditions.rsi_check:
+                            conditions.fail_reasons.append(f"RSI 과매수 ({current_rsi:.1f})")
+
+                        # 🔥 2. MACD 계산 및 추가 확인
+                        try:
+                            macd_line, macd_signal, macd_histogram = TechnicalIndicators.calculate_macd(close_prices)
+                            if macd_line and macd_signal and macd_histogram:
+                                current_macd = macd_line[-1]
+                                current_signal = macd_signal[-1]
+                                current_histogram = macd_histogram[-1]
+
+                                conditions.technical_indicators['macd'] = float(current_macd)
+                                conditions.technical_indicators['macd_signal'] = float(current_signal)
+                                conditions.technical_indicators['macd_histogram'] = float(current_histogram)
+
+                                # MACD가 상승 전환 중이면 가점 (RSI 과매수여도 진입 고려)
+                                if float(current_macd) > float(current_signal) and float(current_histogram) > 0.0:
+                                    if not conditions.rsi_check and current_rsi < 75:  # RSI가 75 미만이면 MACD 우선
+                                        conditions.rsi_check = True
+                                        conditions.fail_reasons = [r for r in conditions.fail_reasons if 'RSI' not in r]
+                                        logger.debug(f"📊 {candidate.stock_code} MACD 상승전환으로 RSI 조건 완화")
+                        except Exception as e:
+                            logger.debug(f"📊 {candidate.stock_code} MACD 계산 오류: {e}")
+
+                        # 🔥 3. 볼린저 밴드 계산 (추가 확인)
+                        try:
+                            bb_upper, bb_middle, bb_lower = TechnicalIndicators.calculate_bollinger_bands(close_prices, 20, 2)
+                            if bb_upper and bb_middle and bb_lower:
+                                current_price = float(close_prices[-1])
+                                bb_position = (current_price - float(bb_lower[-1])) / (float(bb_upper[-1]) - float(bb_lower[-1]))
+
+                                conditions.technical_indicators['bb_position'] = bb_position
+
+                                # 볼린저 밴드 하단 근처(20% 이하)면 RSI 과매수 조건 완화
+                                if bb_position <= 0.2 and not conditions.rsi_check and current_rsi < 70:
+                                    conditions.rsi_check = True
+                                    conditions.fail_reasons = [r for r in conditions.fail_reasons if 'RSI' not in r]
+                                    logger.debug(f"📊 {candidate.stock_code} 볼린저밴드 하단으로 RSI 조건 완화")
+                        except Exception as e:
+                            logger.debug(f"📊 {candidate.stock_code} 볼린저밴드 계산 오류: {e}")
+
+                        logger.debug(f"📊 {candidate.stock_code} 기술지표 - RSI:{current_rsi:.1f}, "
+                                   f"MACD:{conditions.technical_indicators.get('macd_histogram', 0):.3f}, "
+                                   f"BB위치:{conditions.technical_indicators.get('bb_position', 0.5):.2f}")
+
+                    else:
+                        conditions.rsi_check = True  # 데이터 부족시 통과
+                        logger.debug(f"📊 {candidate.stock_code} 기술지표 데이터 부족 - 통과")
+                else:
+                    conditions.rsi_check = True  # 데이터 없을 시 통과
+                    logger.debug(f"📊 {candidate.stock_code} 일봉 데이터 없음 - 기술지표 체크 통과")
+
+            except Exception as e:
+                logger.error(f"기술지표 계산 오류 ({candidate.stock_code}): {e}")
+                conditions.rsi_check = True  # 오류시 통과
+
+            # 3. 시간대 조건
+            current_time = datetime.now().time()
+            from datetime import datetime as dt
+            trading_start = dt.strptime(self.manager.config['trading_start_time'], '%H:%M').time()
+            trading_end = dt.strptime(self.manager.config['trading_end_time'], '%H:%M').time()
+
+            conditions.time_check = trading_start <= current_time <= trading_end
+            if not conditions.time_check:
+                conditions.fail_reasons.append("거래 시간 외")
+            conditions.time_check = True
+
+            # 4. 가격대 조건
+            price = candidate.current_price
+            conditions.price_check = self.manager.config['min_price'] <= price <= self.manager.config['max_price']
+            if not conditions.price_check:
+                conditions.fail_reasons.append(f"가격대 부적합 ({price:,.0f}원)")
+
+            # 5. 시가총액 조건 (간접 추정)
+            conditions.market_cap_check = price >= 5000  # 간단한 추정
+
+            # 6. 일일 거래대금 조건 (현재 누적 거래량 × 현재가)
+            daily_amount = current_volume * price
+            conditions.daily_volume_check = daily_amount >= self.manager.config['min_daily_volume']
+            if not conditions.daily_volume_check:
+                conditions.fail_reasons.append(f"거래대금 부족 ({daily_amount/100000000:.0f}억원)")
+
+            # 전체 통과 여부
+            conditions.overall_passed = all([
+                conditions.volume_check,
+                conditions.rsi_check,
+                conditions.time_check,
+                conditions.price_check,
+                conditions.market_cap_check,
+                conditions.daily_volume_check
+            ])
+
+            return conditions
+
+        except Exception as e:
+            logger.error(f"진입 조건 체크 오류: {e}")
+            return EntryConditions()

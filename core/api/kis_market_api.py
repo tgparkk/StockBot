@@ -717,7 +717,7 @@ if __name__ == "__main__":
 # =============================================================================
 
 def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
-                     FK100: str = "", NK100: str = "") -> Optional[pd.DataFrame]:
+                     FK100: str = "", NK100: str = "") -> Optional[Tuple[pd.DataFrame, Dict]]:
     """
     주식잔고조회 (TR: TTTC8434R)
 
@@ -728,7 +728,8 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
         NK100: 연속조회키100
 
     Returns:
-        주식잔고 데이터 (보유종목별 정보)
+        Tuple[pd.DataFrame, Dict]: (보유종목 데이터, 계좌요약 정보)
+        계좌요약에는 dnca_tot_amt(매수가능금액) 포함
     """
     url = '/uapi/domestic-stock/v1/trading/inquire-balance'
     tr_id = "TTTC8434R"  # 주식잔고조회
@@ -762,23 +763,37 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
 
             # output1: 개별 종목 잔고
             output1_data = getattr(body, 'output1', [])
-            # output2: 잔고요약
+            # output2: 잔고요약 (매수가능금액 등 포함)
             output2_data = getattr(body, 'output2', [])
+
+            # 🎯 계좌요약 정보 처리 (output2_data)
+            account_summary = {}
+            if output2_data:
+                summary = output2_data[0] if isinstance(output2_data, list) else output2_data
+                
+                # 💰 매수가능금액 등 주요 정보 추출
+                account_summary = {
+                    'dnca_tot_amt': int(summary.get('dnca_tot_amt', '0')),           # 🎯 매수가능금액 (핵심!)
+                    'tot_evlu_amt': int(summary.get('tot_evlu_amt', '0')),          # 총평가액
+                    'evlu_pfls_smtl_amt': int(summary.get('evlu_pfls_smtl_amt', '0')), # 평가손익합계
+                    'prvs_rcdl_excc_amt': int(summary.get('prvs_rcdl_excc_amt', '0')), # 전일결산예탁금
+                    'pchs_amt_smtl_amt': int(summary.get('pchs_amt_smtl_amt', '0')),   # 매입금액합계
+                    'evlu_amt_smtl_amt': int(summary.get('evlu_amt_smtl_amt', '0')),   # 평가금액합계
+                    'nxdy_excc_amt': int(summary.get('nxdy_excc_amt', '0')),           # 익일예탁금
+                    'raw_summary': summary  # 원본 데이터 보관
+                }
+                
+                logger.info(f"✅ 계좌요약: 💰매수가능={account_summary['dnca_tot_amt']:,}원, "
+                           f"총평가액={account_summary['tot_evlu_amt']:,}원, "
+                           f"평가손익={account_summary['evlu_pfls_smtl_amt']:+,}원")
 
             if output1_data:
                 balance_df = pd.DataFrame(output1_data)
                 logger.info(f"✅ 주식잔고조회 성공: {len(balance_df)}개 종목")
-
-                # 요약 정보도 추가
-                if output2_data:
-                    summary = output2_data[0] if isinstance(output2_data, list) else output2_data
-                    logger.info(f"📊 잔고요약: 총평가액={summary.get('tot_evlu_amt', '0'):>12}원, "
-                               f"평가손익={summary.get('evlu_pfls_smtl_amt', '0'):>10}원")
-
-                return balance_df
+                return balance_df, account_summary
             else:
                 logger.info("📊 보유 종목 없음")
-                return pd.DataFrame()
+                return pd.DataFrame(), account_summary
         else:
             logger.error("❌ 주식잔고조회 실패")
             return None
@@ -790,23 +805,33 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
 
 def get_account_balance() -> Optional[Dict]:
     """
-    계좌잔고조회 - 요약 정보
+    계좌잔고조회 - 요약 정보 (매수가능금액 포함)
 
     Returns:
-        계좌 요약 정보
+        계좌 요약 정보 (dnca_tot_amt 매수가능금액 포함)
     """
     try:
-        balance_data = get_stock_balance()
-        if balance_data is None:
+        result = get_stock_balance()
+        if result is None:
             return None
+            
+        balance_data, account_summary = result
+
+        # 🎯 매수가능금액을 포함한 기본 정보
+        base_info = {
+            'total_stocks': 0,
+            'total_value': account_summary.get('tot_evlu_amt', 0),
+            'total_profit_loss': account_summary.get('evlu_pfls_smtl_amt', 0),
+            'available_amount': account_summary.get('dnca_tot_amt', 0),  # 🎯 매수가능금액 (핵심!)
+            'cash_balance': account_summary.get('prvs_rcdl_excc_amt', 0),
+            'purchase_amount': account_summary.get('pchs_amt_smtl_amt', 0),
+            'next_day_amount': account_summary.get('nxdy_excc_amt', 0),
+            'stocks': []
+        }
 
         if balance_data.empty:
-            return {
-                'total_stocks': 0,
-                'total_value': 0,
-                'total_profit_loss': 0,
-                'stocks': []
-            }
+            logger.info(f"💰 매수가능금액: {base_info['available_amount']:,}원 (보유종목 없음)")
+            return base_info
 
         # 보유 종목 요약 생성
         stocks = []
@@ -838,19 +863,21 @@ def get_account_balance() -> Optional[Dict]:
                 total_value += eval_amt
                 total_profit_loss += profit_loss
 
-        result = {
+        # 🎯 base_info 업데이트
+        base_info.update({
             'total_stocks': len(stocks),
             'total_value': total_value,
             'total_profit_loss': total_profit_loss,
             'total_profit_loss_rate': (total_profit_loss / total_value * 100) if total_value > 0 else 0.0,
             'stocks': stocks,
             'inquiry_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
+        })
 
         logger.info(f"💰 계좌요약: {len(stocks)}개 종목, 총 {total_value:,}원, "
-                   f"손익 {total_profit_loss:+,}원 ({result['total_profit_loss_rate']:+.2f}%)")
+                   f"손익 {total_profit_loss:+,}원 ({base_info['total_profit_loss_rate']:+.2f}%), "
+                   f"💰매수가능={base_info['available_amount']:,}원")
 
-        return result
+        return base_info
 
     except Exception as e:
         logger.error(f"계좌잔고 요약 오류: {e}")

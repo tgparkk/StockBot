@@ -12,11 +12,11 @@ from .data.data_priority import DataPriority
 from .data.kis_data_collector import KISDataCollector
 from .data.hybrid_data_manager import SimpleHybridDataManager
 from .trading.trade_database import TradeDatabase
-from .trading.trade_executor import TradeExecutor, TradeConfig
+from .trading.trade_executor import TradeExecutor
 from .strategy.candle_pattern_detector import CandlePatternDetector
 from .strategy.candle_stock_manager import CandleStockManager
 from .websocket.kis_websocket_manager import KISWebSocketManager
-from .trading.position_manager import PositionManager
+
 from .trading.trading_manager import TradingManager  # 의존성이 많으므로 나중에
 from .strategy.candle_trade_manager import CandleTradeManager  # TradingManager 이후
 from .system.worker_manager import WorkerManager
@@ -24,7 +24,7 @@ from .system.worker_manager import WorkerManager
 # 🔄 기존 호환성을 위한 직접 export (main.py 등에서 사용)
 kis_websocket_manager = KISWebSocketManager
 trading_manager = TradingManager
-position_manager = PositionManager
+
 trade_executor = TradeExecutor
 trade_database = TradeDatabase
 candle_trade_manager = CandleTradeManager
@@ -50,9 +50,7 @@ class APIModule:
 class TradingModule:
     """거래 관련 모듈 접근자"""
     TradingManager = TradingManager
-    PositionManager = PositionManager
     TradeExecutor = TradeExecutor
-    TradeConfig = TradeConfig
     TradeDatabase = TradeDatabase
 
 class StrategyModule:
@@ -83,7 +81,6 @@ __all__ = [
     # 🔄 기존 클래스들 (100% 호환성)
     'KISWebSocketManager',
     'TradingManager',
-    'PositionManager',
     'TradeExecutor',
     'TradeConfig',
     'TradeDatabase',

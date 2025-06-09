@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Callable
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from utils.logger import setup_logger
-from core.trading.position_manager import PositionManager
+
 
 logger = setup_logger(__name__)
 
@@ -29,15 +29,22 @@ class PendingOrder:
 
     def is_expired(self) -> bool:
         """주문 타임아웃 여부"""
-        return (datetime.now() - self.timestamp).total_seconds() > self.timeout_seconds
+        try:
+            if self.timestamp is None or self.timeout_seconds is None:
+                return True  # None 값이면 만료된 것으로 처리
+            
+            elapsed_seconds = (datetime.now() - self.timestamp).total_seconds()
+            return elapsed_seconds > self.timeout_seconds
+        except Exception as e:
+            # 오류 발생시 만료된 것으로 처리
+            return True
 
 
 class OrderExecutionManager:
     """🎯 웹소켓 NOTICE 기반 주문 실행 결과 처리 관리자"""
 
-    def __init__(self, trade_db, async_logger, position_manager: Optional[PositionManager] = None):
-        """초기화 - position_manager는 선택적 매개변수로 변경"""
-        self.position_manager = position_manager
+    def __init__(self, trade_db, async_logger):
+        """초기화"""
         self.trade_db = trade_db
         self.async_logger = async_logger
 
@@ -56,10 +63,7 @@ class OrderExecutionManager:
         # 콜백 함수들
         self.execution_callbacks: List[Callable] = []
 
-        if self.position_manager:
-            logger.info("✅ 주문 실행 관리자 초기화 완료 (PositionManager 연동)")
-        else:
-            logger.info("✅ 주문 실행 관리자 초기화 완료 (PositionManager 없음 - API 직접 사용)")
+        logger.info("✅ 주문 실행 관리자 초기화 완료 (KIS API 직접 사용)")
 
     def add_pending_order(self, order_id: str, stock_code: str, order_type: str,
                          quantity: int, price: int, strategy_type: str) -> bool:
@@ -135,13 +139,21 @@ class OrderExecutionManager:
             logger.error(f"❌ 체결통보 처리 오류: {e}")
             return False
 
-    def _parse_notice_data(self, notice_data: Dict) -> Optional[Dict]:
+    def _parse_notice_data(self, notice_data) -> Optional[Dict]:
         """🔔 체결통보 데이터 파싱 - KIS 공식 문서 기준 (실전투자 전용)"""
         try:
-            # 웹소켓에서 받은 체결통보 데이터 구조
-            data = notice_data.get('data', '')
-            if not data:
-                logger.warning("⚠️ 체결통보 데이터가 없습니다")
+            # 🚨 입력 데이터 타입 처리 (문자열 또는 딕셔너리)
+            if isinstance(notice_data, str):
+                # 웹소켓에서 직접 문자열로 전달된 경우
+                data = notice_data
+            elif isinstance(notice_data, dict):
+                # 딕셔너리 구조로 전달된 경우
+                data = notice_data.get('data', '')
+                if not data:
+                    logger.warning("⚠️ 체결통보 데이터가 없습니다")
+                    return None
+            else:
+                logger.error(f"❌ 지원하지 않는 데이터 타입: {type(notice_data)}")
                 return None
 
             # 🔒 체결통보 데이터는 암호화되어 전송됨 - 복호화 필요
@@ -152,39 +164,47 @@ class OrderExecutionManager:
 
             # KIS 공식 문서에 따른 '^' 구분자로 필드 분리
             parts = data.split('^')
-            if len(parts) < 25:  # 최소 필요 필드 수
-                logger.warning(f"⚠️ 체결통보 데이터 필드 부족: {len(parts)}개 (최소 25개 필요)")
+            
+            # 🔧 로깅을 통한 디버깅 정보 추가
+            logger.debug(f"📋 체결통보 파싱 정보: 전체필드={len(parts)}개")
+            if len(parts) < 20:  # 최소 필요 필드 수 완화
+                logger.warning(f"⚠️ 체결통보 데이터 필드 부족: {len(parts)}개 (최소 20개 필요)")
+                logger.debug(f"📋 체결통보 원본 데이터: {data[:200]}...")  # 처음 200자만 로그
                 return None
 
-            # 🎯 KIS 공식 문서에 따른 정확한 필드 매핑
+            # 🎯 KIS 공식 문서에 따른 정확한 필드 매핑 (안전한 인덱스 접근)
+            def safe_get(index: int, default: str = '') -> str:
+                """안전한 배열 접근"""
+                return parts[index] if index < len(parts) else default
+            
             execution_info = {
-                'cust_id': parts[0],                    # CUST_ID: 고객 ID
-                'account_no': parts[1],                 # ACNT_NO: 계좌번호
-                'order_id': parts[2],                   # ODER_NO: 주문번호 (핵심!)
-                'original_order_id': parts[3],          # OODER_NO: 원주문번호
-                'buy_sell_code': parts[4],              # SELN_BYOV_CLS: 매도매수구분
-                'modify_code': parts[5],                # RCTF_CLS: 정정구분
-                'order_kind': parts[6],                 # ODER_KIND: 주문종류
-                'order_condition': parts[7],            # ODER_COND: 주문조건
-                'stock_code': parts[8],                 # STCK_SHRN_ISCD: 주식 단축 종목코드
-                'executed_quantity': parts[9],          # CNTG_QTY: 체결 수량
-                'executed_price': parts[10],            # CNTG_UNPR: 체결단가
-                'execution_time': parts[11],            # STCK_CNTG_HOUR: 주식 체결 시간
-                'reject_yn': parts[12],                 # RFUS_YN: 거부여부
-                'execution_yn': parts[13],              # CNTG_YN: 체결여부 (중요!)
-                'accept_yn': parts[14],                 # ACPT_YN: 접수여부
-                'branch_no': parts[15],                 # BRNC_NO: 지점번호
-                'order_quantity': parts[16],            # ODER_QTY: 주문수량
-                'account_name': parts[17],              # ACNT_NAME: 계좌명
-                'order_condition_price': parts[18],     # ORD_COND_PRC: 호가조건가격
-                'order_exchange_code': parts[19],       # ORD_EXG_GB: 주문거래소 구분
-                'popup_yn': parts[20],                  # POPUP_YN: 실시간체결창 표시여부
-                'filler': parts[21],                    # FILLER: 필러
-                'credit_code': parts[22],               # CRDT_CLS: 신용구분
-                'credit_loan_date': parts[23],          # CRDT_LOAN_DATE: 신용대출일자
-                'stock_name': parts[24],                # CNTG_ISNM40: 체결종목명
-                'order_price': parts[25] if len(parts) > 25 else '',  # ODER_PRC: 주문가격
-                'timestamp': notice_data.get('timestamp', datetime.now())
+                'cust_id': safe_get(0),                    # CUST_ID: 고객 ID
+                'account_no': safe_get(1),                 # ACNT_NO: 계좌번호
+                'order_id': safe_get(2),                   # ODER_NO: 주문번호 (핵심!)
+                'original_order_id': safe_get(3),          # OODER_NO: 원주문번호
+                'buy_sell_code': safe_get(4),              # SELN_BYOV_CLS: 매도매수구분
+                'modify_code': safe_get(5),                # RCTF_CLS: 정정구분
+                'order_kind': safe_get(6),                 # ODER_KIND: 주문종류
+                'order_condition': safe_get(7),            # ODER_COND: 주문조건
+                'stock_code': safe_get(8),                 # STCK_SHRN_ISCD: 주식 단축 종목코드
+                'executed_quantity': safe_get(9),          # CNTG_QTY: 체결 수량
+                'executed_price': safe_get(10),            # CNTG_UNPR: 체결단가
+                'execution_time': safe_get(11),            # STCK_CNTG_HOUR: 주식 체결 시간
+                'reject_yn': safe_get(12),                 # RFUS_YN: 거부여부
+                'execution_yn': safe_get(13),              # CNTG_YN: 체결여부 (중요!)
+                'accept_yn': safe_get(14),                 # ACPT_YN: 접수여부
+                'branch_no': safe_get(15),                 # BRNC_NO: 지점번호
+                'order_quantity': safe_get(16),            # ODER_QTY: 주문수량
+                'account_name': safe_get(17),              # ACNT_NAME: 계좌명
+                'order_condition_price': safe_get(18),     # ORD_COND_PRC: 호가조건가격
+                'order_exchange_code': safe_get(19),       # ORD_EXG_GB: 주문거래소 구분
+                'popup_yn': safe_get(20),                  # POPUP_YN: 실시간체결창 표시여부
+                'filler': safe_get(21),                    # FILLER: 필러
+                'credit_code': safe_get(22),               # CRDT_CLS: 신용구분
+                'credit_loan_date': safe_get(23),          # CRDT_LOAN_DATE: 신용대출일자
+                'stock_name': safe_get(24),                # CNTG_ISNM40: 체결종목명
+                'order_price': safe_get(25),               # ODER_PRC: 주문가격
+                'timestamp': notice_data.get('timestamp', datetime.now()) if isinstance(notice_data, dict) else datetime.now()
             }
 
             # 🎯 체결여부 검증 (가장 중요!)
@@ -376,17 +396,8 @@ class OrderExecutionManager:
             executed_quantity = execution_info['executed_quantity']
             executed_price = execution_info['executed_price']
 
-            # 1. 포지션 매니저에 추가 (선택적)
-            if self.position_manager:
-                self.position_manager.add_position(
-                    stock_code=pending_order.stock_code,
-                    quantity=executed_quantity,
-                    buy_price=executed_price,
-                    strategy_type=pending_order.strategy_type
-                )
-                logger.debug(f"✅ PositionManager에 포지션 추가: {pending_order.stock_code}")
-            else:
-                logger.info(f"💡 PositionManager 없음 - KIS API로 포지션 관리: {pending_order.stock_code}")
+            # 1. 포지션 관리는 KIS API로 처리
+            logger.debug(f"💡 KIS API로 포지션 관리: {pending_order.stock_code}")
 
             # 2. 거래 기록 저장
             trade_id = self.trade_db.record_buy_trade(
@@ -433,16 +444,8 @@ class OrderExecutionManager:
             executed_quantity = execution_info['executed_quantity']
             executed_price = execution_info['executed_price']
 
-            # 1. 포지션에서 제거/수정 (선택적)
-            if self.position_manager:
-                self.position_manager.remove_position(
-                    pending_order.stock_code,
-                    executed_quantity,
-                    executed_price
-                )
-                logger.debug(f"✅ PositionManager에서 포지션 제거: {pending_order.stock_code}")
-            else:
-                logger.info(f"💡 PositionManager 없음 - KIS API로 포지션 관리: {pending_order.stock_code}")
+            # 1. 포지션 관리는 KIS API로 처리
+            logger.debug(f"💡 KIS API로 포지션 관리: {pending_order.stock_code}")
 
             # 2. 거래 기록 저장
             buy_trade_id = self.trade_db.find_buy_trade_for_sell(
@@ -493,8 +496,8 @@ class OrderExecutionManager:
         """체결 콜백 함수 추가"""
         self.execution_callbacks.append(callback)
 
-    def cleanup_expired_orders(self):
-        """만료된 대기 주문 정리"""
+    def cleanup_expired_orders(self) -> int:
+        """🆕 만료된 대기 주문 정리 및 상태 복원"""
         try:
             current_time = datetime.now()
             expired_orders = []
@@ -503,20 +506,64 @@ class OrderExecutionManager:
                 if pending_order.is_expired():
                     expired_orders.append(order_id)
 
+            cleanup_count = 0
             for order_id in expired_orders:
                 pending_order = self.pending_orders.pop(order_id)
                 self.stats['orders_timeout'] += 1
+                cleanup_count += 1
 
                 logger.warning(f"⏰ 주문 타임아웃: {pending_order.order_type} {pending_order.stock_code} (ID: {order_id})")
 
-                # 타임아웃된 주문에 대한 추가 처리 (필요시)
-                # 예: 주문 취소 API 호출
+                # 🆕 타임아웃 콜백 실행 (CandleTradeManager에서 상태 복원)
+                try:
+                    self._execute_timeout_callbacks(pending_order)
+                except Exception as cb_error:
+                    logger.error(f"❌ 타임아웃 콜백 오류: {cb_error}")
 
-            if expired_orders:
-                logger.info(f"🧹 만료된 주문 정리 완료: {len(expired_orders)}개")
+            if cleanup_count > 0:
+                logger.info(f"🧹 만료된 주문 정리 완료: {cleanup_count}개")
+
+            return cleanup_count
 
         except Exception as e:
             logger.error(f"❌ 만료 주문 정리 오류: {e}")
+            return 0
+
+    def _execute_timeout_callbacks(self, expired_order: PendingOrder):
+        """🆕 타임아웃 콜백 실행 (종목 상태 복원용)"""
+        try:
+            # 🔧 안전한 elapsed_seconds 계산
+            elapsed_seconds = 0
+            try:
+                if expired_order.timestamp:
+                    elapsed_seconds = (datetime.now() - expired_order.timestamp).total_seconds()
+            except Exception:
+                elapsed_seconds = 0
+            
+            timeout_data = {
+                'action': 'order_timeout',
+                'order_id': expired_order.order_id,
+                'stock_code': expired_order.stock_code,
+                'order_type': expired_order.order_type,
+                'quantity': expired_order.quantity,
+                'price': expired_order.price,
+                'strategy_type': expired_order.strategy_type,
+                'timeout_reason': 'order_expired',
+                'elapsed_seconds': elapsed_seconds
+            }
+            
+            # 🎯 중요: 동기 콜백으로 처리 (CandleTradeManager 상태 복원)
+            for callback in self.execution_callbacks:
+                try:
+                    if hasattr(callback, '__call__'):
+                        callback(timeout_data)
+                    else:
+                        logger.warning(f"⚠️ 유효하지 않은 콜백: {callback}")
+                except Exception as cb_error:
+                    logger.error(f"❌ 개별 타임아웃 콜백 오류: {cb_error}")
+                    
+        except Exception as e:
+            logger.error(f"❌ 타임아웃 콜백 실행 오류: {e}")
 
     def get_pending_orders_count(self) -> int:
         """대기 중인 주문 수"""
@@ -524,18 +571,35 @@ class OrderExecutionManager:
 
     def get_stats(self) -> Dict:
         """통계 정보"""
-        return {
-            **self.stats,
-            'pending_orders_count': len(self.pending_orders),
-            'pending_orders': [
-                {
+        try:
+            pending_orders_list = []
+            for order in self.pending_orders.values():
+                # 🔧 안전한 elapsed_seconds 계산
+                elapsed_seconds = 0
+                try:
+                    if order.timestamp:
+                        elapsed_seconds = (datetime.now() - order.timestamp).total_seconds()
+                except Exception:
+                    elapsed_seconds = 0
+                
+                pending_orders_list.append({
                     'order_id': order.order_id,
                     'stock_code': order.stock_code,
                     'order_type': order.order_type,
                     'quantity': order.quantity,
                     'price': order.price,
-                    'elapsed_seconds': (datetime.now() - order.timestamp).total_seconds()
-                }
-                for order in self.pending_orders.values()
-            ]
-        }
+                    'elapsed_seconds': elapsed_seconds
+                })
+            
+            return {
+                **self.stats,
+                'pending_orders_count': len(self.pending_orders),
+                'pending_orders': pending_orders_list
+            }
+        except Exception as e:
+            logger.error(f"❌ 통계 조회 오류: {e}")
+            return {
+                **self.stats,
+                'pending_orders_count': len(self.pending_orders),
+                'pending_orders': []
+            }

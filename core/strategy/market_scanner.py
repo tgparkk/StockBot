@@ -254,7 +254,7 @@ class MarketScanner:
             candidate.signal_updated_at = datetime.now()
 
             # 🆕 진입 우선순위 계산
-            candidate.entry_priority = self._calculate_entry_priority(candidate)
+            candidate.entry_priority = self.manager.candle_analyzer.calculate_entry_priority(candidate)
 
             # 🆕 리스크 관리 설정
             candidate.risk_management = self._calculate_risk_management(candidate)
@@ -273,7 +273,7 @@ class MarketScanner:
                         pattern_strength=strongest_pattern.strength,
                         signal_strength='HIGH' if strongest_pattern.strength >= 80 else 'MEDIUM',
                         entry_reason=strongest_pattern.description,
-                        risk_score=self._calculate_risk_score({'stck_prpr': current_price}),
+                        risk_score=self.manager.candle_analyzer.calculate_risk_score({'stck_prpr': current_price}),
                         target_price=int(current_price * 1.05),  # 5% 목표
                         stop_loss_price=int(current_price * 0.95)  # 5% 손절
                     )
@@ -353,92 +353,10 @@ class MarketScanner:
 
     def _generate_trade_signal(self, candidate: CandleTradeCandidate,
                              patterns: List[CandlePatternInfo]) -> Tuple[TradeSignal, int]:
-        """패턴 기반 매매 신호 생성"""
-        try:
-            if not patterns:
-                return TradeSignal.HOLD, 0
+        """패턴 기반 매매 신호 생성 - candle_analyzer로 위임"""
+        return self.manager.candle_analyzer.generate_trade_signal_from_patterns(candidate, patterns)
 
-            # 가장 강한 패턴 기준
-            primary_pattern = max(patterns, key=lambda p: p.strength)
-
-            # 패턴별 신호 맵핑
-            bullish_patterns = {
-                PatternType.HAMMER,
-                PatternType.INVERTED_HAMMER,
-                PatternType.BULLISH_ENGULFING,
-                PatternType.MORNING_STAR,
-                PatternType.RISING_THREE_METHODS
-            }
-
-            bearish_patterns = {
-                PatternType.BEARISH_ENGULFING,
-                PatternType.EVENING_STAR,
-                PatternType.FALLING_THREE_METHODS
-            }
-
-            neutral_patterns = {
-                PatternType.DOJI
-            }
-
-            # 신호 결정
-            if primary_pattern.pattern_type in bullish_patterns:
-                if primary_pattern.confidence >= 0.85 and primary_pattern.strength >= 90:
-                    return TradeSignal.STRONG_BUY, primary_pattern.strength
-                elif primary_pattern.confidence >= 0.70:
-                    return TradeSignal.BUY, primary_pattern.strength
-                else:
-                    return TradeSignal.HOLD, primary_pattern.strength
-
-            elif primary_pattern.pattern_type in bearish_patterns:
-                if primary_pattern.confidence >= 0.85:
-                    return TradeSignal.STRONG_SELL, primary_pattern.strength
-                else:
-                    return TradeSignal.SELL, primary_pattern.strength
-
-            elif primary_pattern.pattern_type in neutral_patterns:
-                return TradeSignal.HOLD, primary_pattern.strength
-
-            else:
-                return TradeSignal.HOLD, 0
-
-        except Exception as e:
-            logger.error(f"매매 신호 생성 오류: {e}")
-            return TradeSignal.HOLD, 0
-
-    def _calculate_entry_priority(self, candidate: CandleTradeCandidate) -> int:
-        """🆕 진입 우선순위 계산 (0~100)"""
-        try:
-            priority = 0
-
-            # 1. 신호 강도 (30%)
-            priority += candidate.signal_strength * 0.3
-
-            # 2. 패턴 점수 (30%)
-            priority += candidate.pattern_score * 0.3
-
-            # 3. 패턴 신뢰도 (20%)
-            if candidate.primary_pattern:
-                priority += candidate.primary_pattern.confidence * 100 * 0.2
-
-            # 4. 패턴별 가중치 (20%)
-            if candidate.primary_pattern:
-                pattern_weights = {
-                    PatternType.MORNING_STAR: 20,      # 최고 신뢰도
-                    PatternType.BULLISH_ENGULFING: 18,
-                    PatternType.HAMMER: 15,
-                    PatternType.INVERTED_HAMMER: 15,
-                    PatternType.RISING_THREE_METHODS: 12,
-                    PatternType.DOJI: 8,               # 가장 낮음
-                }
-                weight = pattern_weights.get(candidate.primary_pattern.pattern_type, 10)
-                priority += weight
-
-            # 정규화 (0~100)
-            return min(100, max(0, int(priority)))
-
-        except Exception as e:
-            logger.error(f"진입 우선순위 계산 오류: {e}")
-            return 50
+    # _calculate_entry_priority 함수는 candle_analyzer.py로 이동됨
 
     def _calculate_risk_management(self, candidate: CandleTradeCandidate) -> RiskManagement:
         """리스크 관리 설정 계산"""
@@ -515,7 +433,7 @@ class MarketScanner:
                         max_holding_hours = 2   # 도지는 매우 짧게
 
             # 위험도 점수 계산
-            risk_score = self._calculate_risk_score({'stck_prpr': current_price})
+            risk_score = self.manager.candle_analyzer.calculate_risk_score({'stck_prpr': current_price})
 
             return RiskManagement(
                 position_size_pct=position_size_pct,
@@ -531,29 +449,7 @@ class MarketScanner:
             logger.error(f"리스크 관리 계산 오류: {e}")
             return RiskManagement(0, 0, 0, 0, 0, 8, 100)
 
-    def _calculate_risk_score(self, stock_info: dict) -> int:
-        """위험도 점수 계산 (0-100)"""
-        try:
-            risk_score = 50  # 기본 점수
-
-            current_price = float(stock_info.get('stck_prpr', 0))
-            change_rate = float(stock_info.get('prdy_ctrt', 0))
-
-            # 가격대별 위험도
-            if current_price < 5000:
-                risk_score += 20  # 저가주 위험
-            elif current_price > 100000:
-                risk_score += 10  # 고가주 위험
-
-            # 변동률별 위험도
-            if abs(change_rate) > 10:
-                risk_score += 30  # 급등락 위험
-            elif abs(change_rate) > 5:
-                risk_score += 15
-
-            return min(100, max(0, risk_score))
-        except:
-            return 50
+    # _calculate_risk_score 함수는 candle_analyzer.py로 이동됨
 
     # 상태 조회 메서드
     def get_scan_status(self) -> Dict[str, Any]:
