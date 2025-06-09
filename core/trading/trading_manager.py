@@ -2,7 +2,7 @@
 거래 관리자 - 주문 실행 및 포지션 관리
 """
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from utils.logger import setup_logger
 from ..api.rest_api_manager import KISRestAPIManager
 from ..data.kis_data_collector import KISDataCollector
@@ -35,8 +35,13 @@ class TradingManager:
         }
 
     def execute_order(self, stock_code: str, order_type: str, quantity: int,
-                     price: int = 0, strategy_type: str = "manual") -> Optional[str]:
-        """주문 실행 (간소화 버전)"""
+                     price: int = 0, strategy_type: str = "manual") -> Union[str, Dict]:
+        """주문 실행 (간소화 버전)
+
+        Returns:
+            성공시: order_no (str)
+            실패시: {'success': False, 'error_code': str, 'error_message': str, 'detailed_error': str}
+        """
         self.stats['total_orders'] += 1
 
         try:
@@ -47,15 +52,26 @@ class TradingManager:
                              f"현재 상태: {market_status.get('status', '확인불가')} "
                              f"({market_status.get('current_time', 'N/A')})")
                 self.stats['failed_orders'] += 1
-                return None
+                return {
+                    'success': False,
+                    'error_code': 'MARKET_CLOSED',
+                    'error_message': f"장외 시간 주문 불가 - {market_status.get('status', '확인불가')}",
+                    'detailed_error': f"MARKET_CLOSED: 장외 시간 주문 불가 - {market_status.get('status', '확인불가')}"
+                }
 
             # 1. 현재가 확인 (시장가 주문시)
             if price == 0:
                 price_data = self.data_collector.get_current_price(stock_code, use_cache=True)
                 if price_data.get('status') != 'success':
-                    logger.error(f"현재가 조회 실패: {stock_code}")
+                    error_msg = price_data.get('message', '현재가 조회 실패')
+                    logger.error(f"현재가 조회 실패: {stock_code} - {error_msg}")
                     self.stats['failed_orders'] += 1
-                    return None
+                    return {
+                        'success': False,
+                        'error_code': 'PRICE_FETCH_FAILED',
+                        'error_message': error_msg,
+                        'detailed_error': f"PRICE_FETCH_FAILED: {error_msg}"
+                    }
 
                 # 시장가는 현재가 기준으로 설정
                 current_price = price_data.get('current_price', 0)
@@ -103,11 +119,11 @@ class TradingManager:
             else:
                 error_msg = result.get('message', '알 수 없는 오류') if result else '응답 없음'
                 error_code = result.get('error_code', 'UNKNOWN') if result else 'NO_RESPONSE'
-                
+
                 # 🔧 구체적인 오류 정보 구성
                 detailed_error = f"{error_code}: {error_msg}"
                 logger.error(f"❌ 주문 실패: {stock_code} {order_type} - {detailed_error}")
-                
+
                 self.stats['failed_orders'] += 1
                 # 🆕 오류 정보를 포함한 딕셔너리 반환 (None 대신)
                 return {

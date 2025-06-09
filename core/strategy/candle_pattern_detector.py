@@ -51,8 +51,8 @@ class CandlePatternDetector:
                 logger.warning(f"종목 {stock_code}: OHLCV 데이터 없음")
                 return []
 
-            # 🔧 데이터 부족 조건 완화 (5일 → 3일)
-            if len(ohlcv_data) < 3:
+            # 🔧 데이터 부족 조건 완화 (10일)
+            if len(ohlcv_data) < 10:
                 logger.warning(f"종목 {stock_code}: 데이터 부족 ({len(ohlcv_data)}일)")
                 return []
 
@@ -100,7 +100,7 @@ class CandlePatternDetector:
 
             if filtered_patterns:
                 pattern_names = [p.pattern_type.value for p in filtered_patterns]
-                logger.info(f"🎯 {stock_code} 패턴 감지: {', '.join(pattern_names)}")
+                # logger.info(f"🎯 {stock_code} 패턴 감지: {', '.join(pattern_names)}")
             else:
                 logger.debug(f"❌ {stock_code} 패턴 감지 실패 - 조건을 만족하는 패턴 없음")
 

@@ -24,12 +24,12 @@ class SellPositionManager:
             candle_trade_manager: CandleTradeManager 인스턴스
         """
         self.manager = candle_trade_manager
-        
+
         # 🚨 연속 조정 방지를 위한 이력 추적
         self._adjustment_history = {}  # {stock_code: {'last_adjustment_time', 'last_direction', 'adjustment_count'}}
         self._min_adjustment_interval = 300  # 최소 5분 간격
         self._max_consecutive_adjustments = 3  # 최대 연속 조정 횟수
-        
+
         logger.info("✅ SellPositionManager 초기화 완료")
 
     async def manage_existing_positions(self):
@@ -130,16 +130,32 @@ class SellPositionManager:
     def _get_pattern_based_target(self, position: CandleTradeCandidate) -> Tuple[float, float, int, bool]:
         """🎯 캔들 패턴별 수익률 목표, 손절, 시간 설정 결정"""
         try:
+            # 🔍 디버깅: 각 조건 값 확인
+            restored_from_db = position.metadata.get('restored_from_db', False)
+            original_entry_source = position.metadata.get('original_entry_source')
+            detected_patterns_count = len(position.detected_patterns)
+
+            logger.info(f"🔍 {position.stock_code} 캔들 전략 확인:")
+            logger.info(f"   - restored_from_db: {restored_from_db}")
+            logger.info(f"   - original_entry_source: {original_entry_source}")
+            logger.info(f"   - detected_patterns 개수: {detected_patterns_count}")
+            logger.info(f"   - is_existing_holding: {position.metadata.get('is_existing_holding', False)}")
+            logger.info(f"   - pattern_analysis_success: {position.metadata.get('pattern_analysis_success', None)}")
+
             # 1. 캔들 전략으로 매수한 종목인지 확인
             is_candle_strategy = (
-                position.metadata.get('restored_from_db', False) or  # DB에서 복원됨
-                position.metadata.get('original_entry_source') == 'candle_strategy' or  # 캔들 전략 매수
-                len(position.detected_patterns) > 0  # 패턴 정보가 있음
+                restored_from_db or  # DB에서 복원됨
+                original_entry_source == 'candle_strategy' or  # 캔들 전략 매수
+                detected_patterns_count > 0  # 패턴 정보가 있음
             )
+
+            logger.info(f"   - is_candle_strategy 최종 결과: {is_candle_strategy}")
 
             if not is_candle_strategy:
                 # 수동/앱 매수 종목: 큰 수익/손실 허용 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
-                logger.debug(f"📊 {position.stock_code} 패턴 미발견 매수 종목 - 기본 설정 적용")
+                logger.warning(f"⚠️ {position.stock_code} 패턴 미발견 매수 종목으로 분류됨 - 기본 설정 적용")
+                logger.warning(f"   모든 조건이 False: restored_from_db={restored_from_db}, "
+                             f"original_entry_source={original_entry_source}, patterns={detected_patterns_count}")
                 return 3.0, 3.0, 24, False
 
             # 2. 🔄 실시간 캔들 패턴 재분석 (🆕 캐싱 활용)
@@ -209,25 +225,11 @@ class SellPositionManager:
                                 f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
                     return target_pct, stop_pct, max_hours, True
                 else:
-                    # 패턴 config에 없으면 패턴 강도에 따라 결정 (🎯 큰 수익/손실 허용)
-                    if position.detected_patterns:
-                        strongest_pattern = max(position.detected_patterns, key=lambda p: p.strength)
-                        if strongest_pattern.strength >= 90:
-                            target_pct, stop_pct, max_hours = 15.0, 4.0, 8  # 매우 강한 패턴
-                        elif strongest_pattern.strength >= 80:
-                            target_pct, stop_pct, max_hours = 12.0, 3.0, 6  # 강한 패턴
-                        elif strongest_pattern.strength >= 70:
-                            target_pct, stop_pct, max_hours = 8.0, 3.0, 4  # 중간 패턴
-                        else:
-                            target_pct, stop_pct, max_hours = 5.0, 2.0, 2  # 약한 패턴
-
-                        logger.debug(f"📊 {position.stock_code} 패턴 강도 {strongest_pattern.strength} - "
-                                    f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
-                        return target_pct, stop_pct, max_hours, True
+                    return 3.0, 3.0, 12, True
 
             # 4. 기본값: 캔들 전략이지만 패턴 정보 없음 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
             logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용")
-            return 3.0, 3.0, 6, True
+            return 3.0, 3.0, 12, True
 
         except Exception as e:
             logger.error(f"패턴별 설정 결정 오류 ({position.stock_code}): {e}")
@@ -579,15 +581,15 @@ class SellPositionManager:
             # 🆕 현재 목표가/손절가 백업
             original_target = position.risk_management.target_price
             original_stop = position.risk_management.stop_loss_price
-            
+
             # 🚨 1단계: 연속 조정 방지 검증
             target_multiplier = profit_update.get('target_multiplier', 1.0)
             trend_multiplier = trend_update.get('trend_multiplier', 1.0)
-            
+
             # 조정 방향 결정
             will_increase_target = (target_multiplier > 1.0) or (trend_multiplier > 1.0)
             will_decrease_target = (target_multiplier < 1.0) or (trend_multiplier < 1.0)
-            
+
             adjustment_direction = None
             if will_increase_target:
                 adjustment_direction = "UP"
@@ -595,7 +597,7 @@ class SellPositionManager:
                 adjustment_direction = "DOWN"
             else:
                 adjustment_direction = "NEUTRAL"
-            
+
             # 🚨 연속 조정 방지 검증
             if adjustment_direction != "NEUTRAL":
                 if not self._can_apply_adjustment(position.stock_code, adjustment_direction):
@@ -703,7 +705,7 @@ class SellPositionManager:
 
                 if reasons:
                     logger.info(f"   📋 조정사유: {', '.join(reasons)}")
-                
+
                 # 🚨 조정 이력 기록
                 if adjustment_direction != "NEUTRAL":
                     self._record_adjustment(position.stock_code, adjustment_direction)
@@ -740,31 +742,31 @@ class SellPositionManager:
         """🚨 연속 조정 방지 검증"""
         try:
             from datetime import datetime, timedelta
-            
+
             current_time = datetime.now()
-            
+
             # 이력이 없으면 허용
             if stock_code not in self._adjustment_history:
                 return True
-            
+
             history = self._adjustment_history[stock_code]
             last_time = history.get('last_adjustment_time')
             last_direction = history.get('last_direction')
             adjustment_count = history.get('adjustment_count', 0)
-            
+
             # 시간 간격 체크 (최소 5분)
             if last_time and (current_time - last_time).total_seconds() < self._min_adjustment_interval:
                 logger.warning(f"⏰ {stock_code} 조정 간격 부족 - 대기 중 (최소 {self._min_adjustment_interval}초)")
                 return False
-            
+
             # 연속 조정 방향 체크
             if last_direction == adjustment_direction:
                 if adjustment_count >= self._max_consecutive_adjustments:
                     logger.warning(f"🔄 {stock_code} 연속 조정 한도 초과 ({adjustment_direction}) - 차단")
                     return False
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"조정 검증 오류 ({stock_code}): {e}")
             return False
@@ -773,9 +775,9 @@ class SellPositionManager:
         """🚨 조정 이력 기록"""
         try:
             from datetime import datetime
-            
+
             current_time = datetime.now()
-            
+
             if stock_code not in self._adjustment_history:
                 self._adjustment_history[stock_code] = {
                     'last_adjustment_time': current_time,
@@ -785,19 +787,19 @@ class SellPositionManager:
             else:
                 history = self._adjustment_history[stock_code]
                 last_direction = history.get('last_direction')
-                
+
                 # 같은 방향이면 카운트 증가, 다른 방향이면 카운트 리셋
                 if last_direction == adjustment_direction:
                     history['adjustment_count'] = history.get('adjustment_count', 0) + 1
                 else:
                     history['adjustment_count'] = 1
-                
+
                 history['last_adjustment_time'] = current_time
                 history['last_direction'] = adjustment_direction
-                        
+
             logger.debug(f"📝 {stock_code} 조정 이력 기록: {adjustment_direction} "
                         f"(연속: {self._adjustment_history[stock_code]['adjustment_count']}회)")
-            
+
         except Exception as e:
             logger.error(f"조정 이력 기록 오류 ({stock_code}): {e}")
 
@@ -805,23 +807,23 @@ class SellPositionManager:
         """🧹 오래된 조정 이력 정리 (1시간 이상 된 이력 제거)"""
         try:
             from datetime import datetime, timedelta
-            
+
             current_time = datetime.now()
             cutoff_time = current_time - timedelta(hours=1)
-            
+
             stocks_to_remove = []
             for stock_code, history in self._adjustment_history.items():
                 last_time = history.get('last_adjustment_time')
                 if last_time and last_time < cutoff_time:
                     stocks_to_remove.append(stock_code)
-            
+
             for stock_code in stocks_to_remove:
                 del self._adjustment_history[stock_code]
                 logger.debug(f"🧹 {stock_code} 조정 이력 정리 완료")
-            
+
             if stocks_to_remove:
                 logger.info(f"🧹 조정 이력 정리: {len(stocks_to_remove)}개 종목")
-                
+
         except Exception as e:
             logger.error(f"조정 이력 정리 오류: {e}")
 
@@ -849,7 +851,7 @@ class SellPositionManager:
                 remaining_minutes = min_minutes - holding_minutes
                 logger.debug(f"⏰ {position.stock_code} 최소 보유시간 미달: {holding_minutes:.1f}분/{min_minutes}분 (남은시간: {remaining_minutes:.1f}분)")
                 return {
-                    'can_exit': False, 
+                    'can_exit': False,
                     'reason': f'min_holding_time',
                     'detail': f'{holding_minutes:.1f}분/{min_minutes}분 보유',
                     'remaining_minutes': remaining_minutes
@@ -954,7 +956,7 @@ class SellPositionManager:
 
     # ========== 🆕 보유 종목 리스크 관리 함수들 ==========
 
-    def setup_holding_risk_management(self, candidate: CandleTradeCandidate, buy_price: float, 
+    def setup_holding_risk_management(self, candidate: CandleTradeCandidate, buy_price: float,
                                      current_price: float, candle_analysis_result: Optional[Dict[str, Any]]) -> None:
         """🆕 보유 종목 리스크 관리 설정"""
         try:
@@ -965,7 +967,7 @@ class SellPositionManager:
                 # 캔들 패턴 분석 성공 시
                 risk_settings: Tuple[float, float, float, int, float, int, str] = \
                     self.calculate_pattern_based_risk_settings(entry_price, current_price_float, candle_analysis_result)
-                
+
                 target_price, stop_loss_price, trailing_stop_pct, max_holding_hours, position_size_pct, risk_score, source_info = risk_settings
 
                 # 패턴 정보 저장
@@ -979,13 +981,13 @@ class SellPositionManager:
                 # 패턴 감지 실패 시 기본 설정
                 risk_settings: Tuple[float, float, float, int, float, int, str] = \
                     self.calculate_default_risk_settings(entry_price, current_price_float)
-                
+
                 target_price, stop_loss_price, trailing_stop_pct, max_holding_hours, position_size_pct, risk_score, source_info = risk_settings
 
             # RiskManagement 객체 생성
             entry_quantity: int = candidate.performance.entry_quantity or 0
             position_amount: int = int(entry_price * entry_quantity)
-            
+
             candidate.risk_management = RiskManagement(
                 position_size_pct=float(position_size_pct),
                 position_amount=position_amount,
@@ -1013,7 +1015,7 @@ class SellPositionManager:
             pattern_strength: int = int(strongest_pattern['strength'])
             pattern_confidence: float = float(strongest_pattern['confidence'])
 
-            logger.info(f"🔄 실시간 캔들 패턴 감지: {pattern_type} (강도: {pattern_strength})")
+            #logger.info(f"🔄 실시간 캔들 패턴 감지: {pattern_type} (강도: {pattern_strength})")
 
             # 패턴별 설정 적용
             pattern_config: Optional[Dict[str, Any]] = self.manager.config['pattern_targets'].get(pattern_type.lower())
@@ -1024,13 +1026,13 @@ class SellPositionManager:
             else:
                 # 패턴 강도별 기본 설정
                 if pattern_strength >= 90:
-                    target_pct, stop_pct, max_holding_hours = 15.0, 4.0, 8
+                    target_pct, stop_pct, max_holding_hours = 5.0, 4.0, 8
                 elif pattern_strength >= 80:
-                    target_pct, stop_pct, max_holding_hours = 12.0, 3.0, 6
+                    target_pct, stop_pct, max_holding_hours = 4.0, 3.0, 6
                 elif pattern_strength >= 70:
-                    target_pct, stop_pct, max_holding_hours = 8.0, 3.0, 4
+                    target_pct, stop_pct, max_holding_hours = 3.0, 3.0, 4
                 else:
-                    target_pct, stop_pct, max_holding_hours = 5.0, 2.0, 2
+                    target_pct, stop_pct, max_holding_hours = 2.0, 2.0, 2
 
             target_price: float = entry_price * (1 + target_pct / 100)
             stop_loss_price: float = entry_price * (1 - stop_pct / 100)

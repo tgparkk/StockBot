@@ -31,60 +31,60 @@ class BuyOpportunityEvaluator:
         try:
             # 🔍 전체 종목 상태 분석
             all_stocks = self.manager.stock_manager._all_stocks.values()
-            status_summary = {}
-            ready_status_summary = {}
+            #status_summary = {}
+            #ready_status_summary = {}
 
-            for candidate in all_stocks:
-                status = candidate.status.value
-                status_summary[status] = status_summary.get(status, 0) + 1
+            #for candidate in all_stocks:
+            #    status = candidate.status.value
+            #    status_summary[status] = status_summary.get(status, 0) + 1
 
                 # is_ready_for_entry() 결과 분석
-                is_ready = candidate.is_ready_for_entry()
-                ready_key = f"{status}_ready={is_ready}"
-                ready_status_summary[ready_key] = ready_status_summary.get(ready_key, 0) + 1
+            #    is_ready = candidate.is_ready_for_entry()
+            #    ready_key = f"{status}_ready={is_ready}"
+            #    ready_status_summary[ready_key] = ready_status_summary.get(ready_key, 0) + 1
 
                 # BUY_READY 상태인 종목 상세 정보
-                if status == "BUY_READY":
-                    logger.info(f"🔍 {candidate.stock_code} BUY_READY 상태: is_ready={is_ready}, "
-                               f"신호={candidate.trade_signal.value}, 강도={candidate.signal_strength}")
+                #if status == "BUY_READY":
+                #    logger.info(f"🔍 {candidate.stock_code} BUY_READY 상태: is_ready={is_ready}, "
+                #               f"신호={candidate.trade_signal.value}, 강도={candidate.signal_strength}")
 
-            logger.info(f"📊 전체 종목 상태: {status_summary}")
-            logger.info(f"📊 준비 상태 분석: {ready_status_summary}")
+            # logger.info(f"📊 전체 종목 상태: {status_summary}")
+            # logger.info(f"📊 준비 상태 분석: {ready_status_summary}")
 
             # 🎯 매수 준비 상태인 종목들만 필터링 (이미 모든 검증 완료됨) + 중복 주문 방지
             buy_ready_candidates = []
             for candidate in all_stocks:
                 if not candidate.is_ready_for_entry():
                     continue
-                    
+
                 # 🚨 PENDING_ORDER 상태 종목 제외
                 if candidate.status == CandleStatus.PENDING_ORDER:
                     logger.debug(f"🚫 {candidate.stock_code} PENDING_ORDER 상태 - 매수 스킵")
                     continue
-                    
+
                 # 🚨 매수 주문 대기 중인 종목 제외
                 if candidate.has_pending_order('buy'):
                     logger.debug(f"🚫 {candidate.stock_code} 매수 주문 대기 중 - 매수 스킵")
                     continue
-                    
+
                 # 🚨 최근에 매수 주문을 낸 종목 제외 (5분 내)
                 if candidate.pending_order_time:
                     time_since_order = (datetime.now() - candidate.pending_order_time).total_seconds()
                     if time_since_order < 300:  # 5분 내
                         logger.debug(f"🚫 {candidate.stock_code} 최근 주문 후 {time_since_order:.0f}초 경과 - 매수 스킵")
                         continue
-                
+
                 buy_ready_candidates.append(candidate)
 
             if not buy_ready_candidates:
                 logger.info("📊 매수 준비된 종목이 없습니다")
-                
+
                 # 🔍 BUY_READY 상태인데 is_ready_for_entry()가 False인 종목 체크
                 buy_ready_status_only = [
                     candidate for candidate in all_stocks
                     if candidate.status == CandleStatus.BUY_READY
                 ]
-                
+
                 if buy_ready_status_only:
                     logger.warning(f"⚠️ BUY_READY 상태이지만 매수 준비되지 않은 종목: {len(buy_ready_status_only)}개")
                     for candidate in buy_ready_status_only:
@@ -92,22 +92,17 @@ class BuyOpportunityEvaluator:
                         logger.warning(f"   🔍 {candidate.stock_code}: status={candidate.status.value}, "
                                      f"is_ready={ready_check}, signal={candidate.trade_signal.value}, "
                                      f"entry_conditions={candidate.entry_conditions is not None}")
-                
+
                 return
 
-            logger.info(f"💰 매수 실행: {len(buy_ready_candidates)}개 준비된 종목")
-            
-            # 🔍 매수 후보 종목 상세 정보 로그
-            for candidate in buy_ready_candidates:
-                logger.info(f"   💰 매수 후보: {candidate.stock_code} (신호:{candidate.trade_signal.value}, "
-                           f"강도:{candidate.signal_strength}, 상태:{candidate.status.value})")
+            #logger.info(f"💰 매수 실행: {len(buy_ready_candidates)}개 준비된 종목")
 
             # 🚀 개별 종목별로 순차 매수 실행 (잔액 실시간 반영)
             successful_orders = 0
             for candidate in buy_ready_candidates:
                 try:
                     # 💰 매수 직전 최신 계좌 정보 조회 (잔액 실시간 반영)
-                    logger.info(f"🔍 {candidate.stock_code} 계좌 정보 조회 시작...")
+                    #logger.info(f"🔍 {candidate.stock_code} 계좌 정보 조회 시작...")
                     account_info = await self._get_account_info()
                     if not account_info:
                         logger.warning(f"⚠️ {candidate.stock_code} 계좌 정보 조회 실패 - 매수 스킵")
@@ -115,7 +110,7 @@ class BuyOpportunityEvaluator:
 
                     # 💰 현재 가용 투자 자금 계산 (매수마다 업데이트)
                     available_funds = self._calculate_available_funds(account_info)
-                    logger.info(f"💰 {candidate.stock_code} 가용 투자 자금: {available_funds:,.0f}원")
+                    #logger.info(f"💰 {candidate.stock_code} 가용 투자 자금: {available_funds:,.0f}원")
 
                     if available_funds <= 0:
                         logger.warning(f"⚠️ {candidate.stock_code} 가용 자금 부족 ({available_funds:,.0f}원) - 매수 중단")
@@ -125,12 +120,12 @@ class BuyOpportunityEvaluator:
                     current_positions = len([c for c in self.manager.stock_manager._all_stocks.values()
                                            if c.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]])
                     min_investment = self.manager.config['investment_calculation']['min_investment']
-                    
-                    logger.info(f"🔍 {candidate.stock_code} 투자금액 계산: 현재포지션={current_positions}개, "
-                               f"가용자금={available_funds:,.0f}원, 최소투자금={min_investment:,.0f}원")
-                    
+
+                    #logger.info(f"🔍 {candidate.stock_code} 투자금액 계산: 현재포지션={current_positions}개, "
+                    #           f"가용자금={available_funds:,.0f}원, 최소투자금={min_investment:,.0f}원")
+
                     investment_amount = self._calculate_entry_params(candidate, available_funds, current_positions)
-                    logger.info(f"💰 {candidate.stock_code} 계산된 투자금액: {investment_amount:,.0f}원")
+                    #logger.info(f"💰 {candidate.stock_code} 계산된 투자금액: {investment_amount:,.0f}원")
 
                     if investment_amount < min_investment:
                         logger.warning(f"⚠️ {candidate.stock_code} 투자금액 부족: {investment_amount:,.0f}원 < {min_investment:,.0f}원")
@@ -158,7 +153,7 @@ class BuyOpportunityEvaluator:
                         logger.warning(f"❌ {candidate.stock_code} 매수 주문 실패 - BUY_READY 상태 유지")
 
                     # 주문 간 간격 (API 부하 방지)
-                    await asyncio.sleep(0.5)
+                    #await asyncio.sleep(0.5)
 
                 except Exception as e:
                     logger.error(f"❌ {candidate.stock_code} 매수 처리 오류: {e}")
@@ -389,19 +384,19 @@ class BuyOpportunityEvaluator:
                 # 매수가능금액의 일정 비율만 사용 (안전 마진)
                 safe_ratio = investment_config.get('available_amount_ratio', 0.9)  # 90% 사용
                 available_funds = available_amount * safe_ratio
-                
+
                 logger.info(f"💰 매수가능금액 기반 투자: {available_funds:,.0f}원 "
                            f"(매수가능금액의 {safe_ratio*100:.0f}%)")
-            
+
             # 매수가능금액 정보가 없으면 기존 로직 사용 (폴백)
             elif cash_balance > 0:
                 # 현금 잔고 기반 계산
                 cash_usage_ratio = investment_config.get('cash_usage_ratio', 0.8)
                 available_funds = cash_balance * cash_usage_ratio
-                
+
                 logger.warning(f"⚠️ 매수가능금액 정보 없음 - 현금잔고 기반: {available_funds:,.0f}원 "
                               f"(현금잔고의 {cash_usage_ratio*100:.0f}%)")
-            
+
             else:
                 logger.error("❌ 매수가능금액과 현금잔고 모두 0원 또는 정보 없음")
                 return 0
@@ -426,7 +421,7 @@ class BuyOpportunityEvaluator:
             if candidate.status == CandleStatus.PENDING_ORDER:
                 logger.warning(f"🚫 {candidate.stock_code} 이미 PENDING_ORDER 상태 - 매수 중단")
                 return False
-                
+
             if candidate.has_pending_order('buy'):
                 logger.warning(f"🚫 {candidate.stock_code} 이미 매수 주문 대기 중 - 매수 중단")
                 return False
@@ -527,7 +522,7 @@ class BuyOpportunityEvaluator:
         """🔍 진입 조건 종합 체크 (CandleTradeManager에서 이관)"""
         try:
             from .candle_trade_candidate import EntryConditions
-            
+
             conditions = EntryConditions()
 
             # 1. 거래량 조건
