@@ -528,30 +528,16 @@ class CandleAnalyzer:
                                 f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
                     return target_pct, stop_pct, max_hours, True
                 else:
-                    # 패턴 config에 없으면 패턴 강도에 따라 결정 (🎯 큰 수익/손실 허용)
-                    if position.detected_patterns:
-                        strongest_pattern = max(position.detected_patterns, key=lambda p: p.strength)
-                        if strongest_pattern.strength >= 90:
-                            target_pct, stop_pct, max_hours = 15.0, 4.0, 8  # 매우 강한 패턴
-                        elif strongest_pattern.strength >= 80:
-                            target_pct, stop_pct, max_hours = 12.0, 3.0, 6  # 강한 패턴
-                        elif strongest_pattern.strength >= 70:
-                            target_pct, stop_pct, max_hours = 8.0, 3.0, 4  # 중간 패턴
-                        else:
-                            target_pct, stop_pct, max_hours = 5.0, 2.0, 2  # 약한 패턴
-
-                        logger.debug(f"📊 {position.stock_code} 패턴 강도 {strongest_pattern.strength} - "
-                                    f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
-                        return target_pct, stop_pct, max_hours, True
+                    return 3.0, 3.0, 24, True
 
             # 4. 기본값: 캔들 전략이지만 패턴 정보 없음 (🎯 큰 수익/손실 허용)
             logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용")
-            return 10.0, 5.0, 6, True
+            return 3.0, 3.0, 6, True
 
         except Exception as e:
             logger.error(f"패턴별 설정 결정 오류 ({position.stock_code}): {e}")
             # 오류시 안전하게 기본값 반환 (🎯 큰 수익/손실 허용)
-            return 10.0, 5.0, 24, False
+            return 3.0, 3.0, 24, False
 
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
         """🆕 패턴별 시간 청산 조건 체크"""
@@ -601,8 +587,7 @@ class CandleAnalyzer:
 
     # ========== 🆕 패턴 기반 매매 신호 생성 ==========
 
-    def generate_trade_signal_from_patterns(self, candidate: CandleTradeCandidate, 
-                                          patterns: List[CandlePatternInfo]) -> Tuple[TradeSignal, int]:
+    def generate_trade_signal_from_patterns(self, patterns: List[CandlePatternInfo]) -> Tuple[TradeSignal, int]:
         """🎯 패턴 기반 매매 신호 생성"""
         try:
             if not patterns:

@@ -49,12 +49,7 @@ class MarketScanner:
         try:
             current_time = datetime.now()
 
-            # 스캔 간격 체크
-            # if (self._last_scan_time and
-            #     (current_time - self._last_scan_time).total_seconds() < self._scan_interval):
-            #     return
-
-            logger.info("🔍 매수 후보 종목 스캔 시작")
+            #logger.info("🔍 매수 후보 종목 스캔 시작")
 
             # 시장별 스캔
             markets = ['0001', '1001']  # 코스피, 코스닥
@@ -62,7 +57,7 @@ class MarketScanner:
                 await self.scan_market_for_patterns(market)
 
             self._last_scan_time = current_time
-            logger.info("✅ 종목 스캔 완료")
+            #logger.info("✅ 종목 스캔 완료")
 
         except Exception as e:
             logger.error(f"종목 스캔 오류: {e}")
@@ -248,7 +243,7 @@ class MarketScanner:
                 candidate.add_pattern(pattern)
 
             # 🆕 매매 신호 생성 및 설정
-            trade_signal, signal_strength = self._generate_trade_signal(candidate, pattern_result)
+            trade_signal, signal_strength = self._generate_trade_signal(pattern_result)
             candidate.trade_signal = trade_signal
             candidate.signal_strength = signal_strength
             candidate.signal_updated_at = datetime.now()
@@ -259,8 +254,8 @@ class MarketScanner:
             # 🆕 리스크 관리 설정
             candidate.risk_management = self._calculate_risk_management(candidate)
 
-            logger.info(f"✅ {stock_code}({stock_name}) 신호 생성: {trade_signal.value.upper()} "
-                       f"(강도:{signal_strength}) 패턴:{strongest_pattern.pattern_type.value}")
+            # logger.info(f"✅ {stock_code}({stock_name}) 신호 생성: {trade_signal.value.upper()} "
+            #            f"(강도:{signal_strength}) 패턴:{strongest_pattern.pattern_type.value}")
 
             # 🆕 7. 데이터베이스에 후보 저장
             try:
@@ -279,7 +274,7 @@ class MarketScanner:
                     )
 
                     candidate.metadata['db_id'] = candidate_id  # metadata에 저장
-                    logger.info(f"🗄️ {stock_code} 후보 DB 저장 완료 (ID: {candidate_id})")
+                    # logger.info(f"🗄️ {stock_code} 후보 DB 저장 완료 (ID: {candidate_id})")
 
                     # 패턴 분석 결과도 저장
                     if pattern_result:
@@ -351,10 +346,9 @@ class MarketScanner:
             logger.error(f"기본 필터링 오류: {e}")
             return False
 
-    def _generate_trade_signal(self, candidate: CandleTradeCandidate,
-                             patterns: List[CandlePatternInfo]) -> Tuple[TradeSignal, int]:
+    def _generate_trade_signal(self, patterns: List[CandlePatternInfo]) -> Tuple[TradeSignal, int]:
         """패턴 기반 매매 신호 생성 - candle_analyzer로 위임"""
-        return self.manager.candle_analyzer.generate_trade_signal_from_patterns(candidate, patterns)
+        return self.manager.candle_analyzer.generate_trade_signal_from_patterns(patterns)
 
     # _calculate_entry_priority 함수는 candle_analyzer.py로 이동됨
 

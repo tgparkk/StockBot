@@ -436,8 +436,8 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
         is_market_open = 9 <= current_time.hour < 16
         time_context += f" 장운영:{'Y' if is_market_open else 'N'}"
 
-        logger.info(f"🔍 등락률순위 API 호출 - {time_context}")
-        logger.debug(f"📋 요청파라미터: 시장={fid_input_iscd}, 등락률={fid_rsfl_rate1}~{fid_rsfl_rate2}%, 정렬={fid_rank_sort_cls_code}")
+        #logger.info(f"🔍 등락률순위 API 호출 - {time_context}")
+        #logger.debug(f"📋 요청파라미터: 시장={fid_input_iscd}, 등락률={fid_rsfl_rate1}~{fid_rsfl_rate2}%, 정렬={fid_rank_sort_cls_code}")
 
         res = kis._url_fetch(url, tr_id, tr_cont, params)
 
@@ -452,14 +452,14 @@ def get_fluctuation_rank(fid_cond_mrkt_div_code: str = "J",
                 msg_cd = getattr(body, 'msg_cd', 'Unknown')
                 msg1 = getattr(body, 'msg1', 'Unknown')
 
-                logger.info(f"📡 API 응답상태: rt_cd={rt_cd}, msg_cd={msg_cd}, msg1='{msg1}'")
+                #logger.info(f"📡 API 응답상태: rt_cd={rt_cd}, msg_cd={msg_cd}, msg1='{msg1}'")
 
                 # output 확인
                 if hasattr(body, 'output'):
                     output_data = getattr(body, 'output', [])
                     if output_data:
                         current_data = pd.DataFrame(output_data)
-                        logger.info(f"✅ 등락률 순위 조회 성공: {len(current_data)}건")
+                        #logger.info(f"✅ 등락률 순위 조회 성공: {len(current_data)}건")
                         return current_data
                     else:
                         logger.warning(f"⚠️ 등락률 순위: output이 빈 리스트 (조건 만족 종목 없음)")
@@ -770,7 +770,7 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
             account_summary = {}
             if output2_data:
                 summary = output2_data[0] if isinstance(output2_data, list) else output2_data
-                
+
                 # 💰 매수가능금액 등 주요 정보 추출
                 account_summary = {
                     'dnca_tot_amt': int(summary.get('dnca_tot_amt', '0')),           # 🎯 매수가능금액 (핵심!)
@@ -782,7 +782,7 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
                     'nxdy_excc_amt': int(summary.get('nxdy_excc_amt', '0')),           # 익일예탁금
                     'raw_summary': summary  # 원본 데이터 보관
                 }
-                
+
                 logger.info(f"✅ 계좌요약: 💰매수가능={account_summary['dnca_tot_amt']:,}원, "
                            f"총평가액={account_summary['tot_evlu_amt']:,}원, "
                            f"평가손익={account_summary['evlu_pfls_smtl_amt']:+,}원")
@@ -814,7 +814,7 @@ def get_account_balance() -> Optional[Dict]:
         result = get_stock_balance()
         if result is None:
             return None
-            
+
         balance_data, account_summary = result
 
         # 🎯 매수가능금액을 포함한 기본 정보
