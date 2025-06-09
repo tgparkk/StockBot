@@ -388,17 +388,6 @@ class MarketScanner:
                     target_profit_pct = pattern_config['target']
                     stop_loss_pct = pattern_config['stop']
                     logger.debug(f"📊 {candidate.stock_code} 패턴별 목표 적용: {pattern_name} - 목표:{target_profit_pct}%, 손절:{stop_loss_pct}%")
-                else:
-                    # 패턴 강도에 따른 기본 조정
-                    if candidate.primary_pattern.pattern_type == PatternType.MORNING_STAR:
-                        target_profit_pct = 2.5  # 샛별형은 강한 반전 신호
-                        stop_loss_pct = 1.5
-                    elif candidate.primary_pattern.pattern_type == PatternType.BULLISH_ENGULFING:
-                        target_profit_pct = 2.0  # 장악형도 강함
-                        stop_loss_pct = 1.5
-                    elif candidate.primary_pattern.pattern_type == PatternType.HAMMER:
-                        target_profit_pct = 1.5  # 망치형은 보수적
-                        stop_loss_pct = 1.5
 
             stop_loss_price = current_price * (1 - stop_loss_pct / 100)
             target_price = current_price * (1 + target_profit_pct / 100)

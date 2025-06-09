@@ -95,6 +95,10 @@ class PerformanceTracking:
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
 
+    # 🆕 매수/매도 체결 시간 추가
+    buy_execution_time: Optional[datetime] = None
+    sell_execution_time: Optional[datetime] = None
+
     # 계산된 성과
     unrealized_pnl: Optional[float] = None
     realized_pnl: Optional[float] = None

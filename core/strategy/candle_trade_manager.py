@@ -83,36 +83,60 @@ class CandleTradeManager:
             'max_price': 500000,               # 최대 주가
             'min_daily_volume': 5000000000,    # 최소 일일 거래대금 (50억)
 
-            # 리스크 관리 설정
+            # 🆕 기술적 지표 임계값 설정
+            'rsi_oversold_threshold': 30,      # RSI 과매도 기준
+            'rsi_overbought_threshold': 70,    # RSI 과매수 기준
+
+            # 🆕 안전성 검증 설정
+            'max_day_change_pct': 15.0,        # 최대 일일 변동률 (급등락 차단)
+            'max_signal_age_seconds': 300,     # 신호 유효시간 (5분)
+            'min_order_interval_seconds': 300, # 최소 주문 간격 (5분)
+
+            # 🆕 우선순위 기반 투자금액 조정
+            'max_priority_multiplier': 1.5,    # 최대 우선순위 배수
+            'base_priority_multiplier': 0.5,   # 기본 우선순위 배수
+            'max_single_investment_ratio': 0.4, # 단일 종목 최대 투자 비율 (40%)
+
+            # 리스크 관리 설정 (캔들패턴에 맞게 조정)
             'max_position_size_pct': 30,       # 최대 포지션 크기 (%)
-            'default_stop_loss_pct': 1.8,      # 기본 손절 비율 (%) - 1.8%로 더 빠른 손절
-            'default_target_profit_pct': 3,    # 기본 목표 수익률 (%) - 3%로 조정 (현실적)
-            'max_holding_hours': 6,            # 최대 보유 시간 - 6시간으로 조정 (단기 트레이딩)
+            'default_stop_loss_pct': 2.0,      # 기본 손절 비율 (%) - 2%로 조정
+            'default_target_profit_pct': 2.0,  # 기본 목표 수익률 (%) - 2%로 조정 (캔들패턴은 더 큰 목표)
+            'max_holding_hours': 48,           # 최대 보유 시간 - 48시간(2일)로 확장
 
-            # 🆕 최소 보유시간 설정 (노이즈 거래 방지)
-            'min_holding_minutes': 30,         # 최소 보유시간 30분 (노이즈 거래 방지)
-            'emergency_stop_loss_pct': 3.0,    # 긴급 손절 기준 (최소 보유시간 무시)
+            # 🆕 최소 보유시간 설정 (캔들패턴 전략에 맞게 하루 기준)
+            'min_holding_minutes': 1440,       # 최소 보유시간 24시간(1440분) - 캔들패턴은 최소 하루
+            'emergency_stop_loss_pct': 5.0,    # 긴급 손절 기준 (최소 보유시간 무시) - 5%로 확대
             'min_holding_override_conditions': {
-                'market_crash': -5.0,          # 시장 급락시 (-5%) 최소시간 무시
-                'individual_limit_down': -10.0, # 개별 종목 하한가 근접시 (-10%) 즉시 매도
+                'high_profit_target': 3.0,     # 3% 이상 수익시 즉시 매도 허용
+                'market_crash': -7.0,          # 시장 급락시 (-7%) 최소시간 무시
+                'individual_limit_down': -15.0, # 개별 종목 큰 하락시 (-15%) 즉시 매도
             },
 
-            # 패턴별 세부 목표 설정 (더 현실적으로)
+            # 패턴별 세부 목표 설정 (캔들패턴 이론에 맞게 하루 이상 보유)
             'pattern_targets': {
-                'hammer': {'target': 1.5, 'stop': 1.5, 'max_hours': 4, 'min_minutes': 20},           # 망치형: 최소 20분
-                'inverted_hammer': {'target': 1.2, 'stop': 1.5, 'max_hours': 4, 'min_minutes': 20},  # 역망치형: 최소 20분
-                'bullish_engulfing': {'target': 1.8, 'stop': 1.2, 'max_hours': 4, 'min_minutes': 30}, # 장악형: 최소 30분
-                'morning_star': {'target': 2.5, 'stop': 1.5, 'max_hours': 8, 'min_minutes': 45},     # 샛별형: 최소 45분 (강한 패턴)
-                'rising_three': {'target': 3.0, 'stop': 2.0, 'max_hours': 12, 'min_minutes': 60},    # 삼법형: 최소 1시간 (지속성 패턴)
-                'doji': {'target': 1.0, 'stop': 1.0, 'max_hours': 2, 'min_minutes': 15},             # 도지: 최소 15분 (신중, 빠른 결정)
+                'hammer': {'target': 3.0, 'stop': 2.0, 'max_hours': 48, 'min_minutes': 1440},           # 망치형: 최소 1일
+                'inverted_hammer': {'target': 2.5, 'stop': 2.0, 'max_hours': 36, 'min_minutes': 1440},  # 역망치형: 최소 1일
+                'bullish_engulfing': {'target': 3.0, 'stop': 2.5, 'max_hours': 48, 'min_minutes': 1440}, # 장악형: 최소 1일
+                'morning_star': {'target': 3.25, 'stop': 2.5, 'max_hours': 72, 'min_minutes': 1440},     # 샛별형: 최소 1일 (강한 패턴)
+                'rising_three': {'target': 3.5, 'stop': 3.0, 'max_hours': 96, 'min_minutes': 1440},    # 삼법형: 최소 1일 (지속성 패턴)
+                'doji': {'target': 2.0, 'stop': 1.5, 'max_hours': 24, 'min_minutes': 720},             # 도지: 최소 12시간 (신중한 패턴)
             },
 
-            # 시간 기반 청산 설정
+            # 시간 기반 청산 설정 (캔들패턴에 맞게 조정)
             'time_exit_rules': {
-                'profit_exit_hours': 3,        # 3시간 후 수익중이면 청산 고려
-                'min_profit_for_time_exit': 0.5,  # 시간 청산 최소 수익률 0.5%
+                'profit_exit_hours': 24,        # 24시간 후 수익중이면 청산 고려
+                'min_profit_for_time_exit': 2.0,  # 시간 청산 최소 수익률 2%
                 'market_close_exit_minutes': 30,  # 장 마감 30분 전 청산
-                'overnight_avoid': False,      # 오버나이트 포지션 허용 (갭 활용)
+                'overnight_avoid': False,      # 오버나이트 포지션 허용 (캔들패턴은 하루 이상 보유)
+            },
+
+            # 🆕 매수체결시간 기반 캔들전략 설정
+            'execution_time_strategy': {
+                'use_execution_time': True,     # 매수체결시간 활용 여부
+                'min_holding_from_execution': 1440,  # 체결시간 기준 최소 보유시간 (24시간)
+                'early_morning_bonus_hours': 2,      # 장 시작 2시간 내 매수시 추가 보유시간
+                'late_trading_penalty_hours': -4,    # 장 종료 전 매수시 보유시간 단축
+                'weekend_gap_consideration': True,    # 주말 갭 고려
             },
 
             # 🆕 투자금액 계산 설정
@@ -743,7 +767,7 @@ class CandleTradeManager:
 
             # 최근 2일간만 조회해서 API 부하 최소화
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=2)
+            start_date = end_date - timedelta(days=4)
 
             start_date_str = start_date.strftime("%Y%m%d")
             end_date_str = end_date.strftime("%Y%m%d")
