@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from utils.logger import setup_logger
+import time
 
 if TYPE_CHECKING:
     from .candle_trade_manager import CandleTradeManager
@@ -68,9 +69,12 @@ class BuyOpportunityEvaluator:
                     continue
 
                 # 🚨 최근에 매수 주문을 낸 종목 제외 (5분 내)
-                if candidate.pending_order_time:
-                    time_since_order = (datetime.now() - candidate.pending_order_time).total_seconds()
-                    if time_since_order < 300:  # 5분 내
+                recent_order_time = candidate.metadata.get('last_buy_order_time')
+                if recent_order_time:
+                    time_since_order = time.time() - recent_order_time
+                    # 🔧 config에서 최소 주문 간격 가져오기
+                    min_order_interval = self.manager.config.get('min_order_interval_seconds', 300)  # 기본 5분
+                    if time_since_order < min_order_interval:
                         logger.debug(f"🚫 {candidate.stock_code} 최근 주문 후 {time_since_order:.0f}초 경과 - 매수 스킵")
                         continue
 
@@ -299,7 +303,9 @@ class BuyOpportunityEvaluator:
         try:
             # 1. 급등/급락 상태 체크
             day_change_pct = float(stock_info.get('prdy_ctrt', 0))
-            if abs(day_change_pct) > 15.0:  # 15% 이상 급등락시 제외
+            # 🔧 config에서 급등락 임계값 가져오기
+            max_day_change = self.manager.config.get('max_day_change_pct', 15.0)
+            if abs(day_change_pct) > max_day_change:
                 logger.debug(f"❌ {candidate.stock_code} 급등락 상태: {day_change_pct:.2f}%")
                 return False
 
@@ -312,14 +318,18 @@ class BuyOpportunityEvaluator:
             # 3. 최근 신호 생성 시간 체크 (너무 오래된 신호 제외)
             if candidate.signal_updated_at:
                 signal_age = datetime.now(self.manager.korea_tz) - candidate.signal_updated_at
-                if signal_age.total_seconds() > 300:  # 5분 이상 된 신호
+                # 🔧 config에서 신호 유효시간 가져오기
+                max_signal_age = self.manager.config.get('max_signal_age_seconds', 300)  # 기본 5분
+                if signal_age.total_seconds() > max_signal_age:
                     logger.debug(f"❌ {candidate.stock_code} 신호가 너무 오래됨: {signal_age}")
                     return False
 
             # 4. 패턴 신뢰도 재확인
             if candidate.detected_patterns:
                 primary_pattern = candidate.detected_patterns[0]
-                if primary_pattern.confidence < 0.6:  # 60% 미만 신뢰도
+                # 🔧 config에서 최소 신뢰도 가져오기
+                min_confidence = self.manager.config.get('pattern_confidence_threshold', 0.6)
+                if primary_pattern.confidence < min_confidence:
                     logger.debug(f"❌ {candidate.stock_code} 패턴 신뢰도 부족: {primary_pattern.confidence:.2f}")
                     return False
 
@@ -332,20 +342,21 @@ class BuyOpportunityEvaluator:
     def _calculate_entry_params(self, candidate: CandleTradeCandidate, available_funds: float, position_count: int) -> float:
         """개별 종목 투자금액 계산"""
         try:
-            # 기본 투자금액 계산
-            investment_config = self.manager.config['investment_calculation']
-            base_amount = investment_config['default_investment']
+            # 우선순위에 따른 투자금액 조정 (우선순위가 높을수록 더 많이 투자)
+            # 🔧 config에서 우선순위 배수 설정 가져오기
+            max_priority_multiplier = self.manager.config.get('max_priority_multiplier', 1.5)
+            base_multiplier = self.manager.config.get('base_priority_multiplier', 0.5)
+            priority_multiplier = min(max_priority_multiplier, candidate.entry_priority / 100 + base_multiplier)
 
-            # 우선순위에 따른 조정 (높은 우선순위일수록 더 많이)
-            priority_multiplier = min(1.5, candidate.entry_priority / 100 + 0.5)
-            adjusted_amount = base_amount * priority_multiplier
+            # 단일 종목 최대 투자한도 적용
+            max_single_investment_ratio = self.manager.config.get('max_single_investment_ratio', 0.4)
+            max_single_investment = available_funds * max_single_investment_ratio  # config에서 설정된 비율
 
             # 포지션 분산을 위한 조정 (여러 종목에 분산)
-            max_single_investment = available_funds * 0.4  # 가용 자금의 40% 이하
-            adjusted_amount = min(adjusted_amount, max_single_investment)
+            adjusted_amount = max_single_investment
 
             # 최소/최대 제한 적용
-            min_investment = investment_config['min_investment']
+            min_investment = self.manager.config['investment_calculation']['min_investment']
             adjusted_amount = max(min_investment, adjusted_amount)
 
             logger.debug(f"💰 {candidate.stock_code} 투자금액: {adjusted_amount:,.0f}원 "

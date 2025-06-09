@@ -111,13 +111,17 @@ class CandleAnalyzer:
                 trend = 'neutral'
 
             # 종합 신호
-            if current_rsi < 30 and trend in ['uptrend', 'neutral']:
+            # 🔧 config에서 RSI 임계값 가져오기
+            rsi_oversold = self.config.get('rsi_oversold_threshold', 30)
+            rsi_overbought = self.config.get('rsi_overbought_threshold', 70)
+
+            if current_rsi < rsi_oversold and trend in ['uptrend', 'neutral']:
                 signal = 'oversold_bullish'
-            elif current_rsi > 70 and trend in ['downtrend', 'neutral']:
+            elif current_rsi > rsi_overbought and trend in ['downtrend', 'neutral']:
                 signal = 'overbought_bearish'
-            elif current_rsi < 30:
+            elif current_rsi < rsi_oversold:
                 signal = 'oversold'
-            elif current_rsi > 70:
+            elif current_rsi > rsi_overbought:
                 signal = 'overbought'
             else:
                 signal = 'neutral'
@@ -199,19 +203,19 @@ class CandleAnalyzer:
                 risk_level = 'profit_secure'
             elif current_price <= stop_loss_price:
                 signal = 'stop_loss'
-                risk_level = 'high_loss'
-            elif pnl_pct >= 3.0:  # 3% 수익 (사용자 요구사항)
+                risk_level = 'high_risk'
+            elif pnl_pct >= self.config.get('default_target_profit_pct', 3.0):  # 기본 3% 수익
                 signal = 'profit_target'
-                risk_level = 'secure_profit'
-            elif pnl_pct <= -3.0:  # 3% 손실
+                risk_level = 'profit_zone'
+            elif pnl_pct <= -self.config.get('default_stop_loss_pct', 3.0):  # 기본 3% 손실
                 signal = 'loss_limit'
-                risk_level = 'high_loss'
+                risk_level = 'loss_zone'
             elif pnl_pct >= 1.0:
                 signal = 'profit_zone'
-                risk_level = 'low'
+                risk_level = 'low_risk'
             elif pnl_pct <= -1.0:
                 signal = 'loss_zone'
-                risk_level = 'medium'
+                risk_level = 'medium_risk'
             else:
                 signal = 'neutral'
                 risk_level = 'medium'
