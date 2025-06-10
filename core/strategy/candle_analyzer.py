@@ -141,7 +141,7 @@ class CandleAnalyzer:
     def analyze_time_conditions(self, candidate: CandleTradeCandidate) -> Dict:
         """⏰ 시간 기반 조건 분석"""
         try:
-            current_time = datetime.now()
+            current_time = datetime.now(self.korea_tz)
 
             # 거래 시간 체크
             trading_hours = self._is_trading_time()
@@ -150,7 +150,10 @@ class CandleAnalyzer:
             holding_duration = None
             time_pressure = 'none'
 
-            if candidate.status == CandleStatus.ENTERED and candidate.performance.entry_time:
+            if (candidate.status == CandleStatus.ENTERED and
+                candidate.performance and
+                candidate.performance.entry_time):
+
                 holding_duration = current_time - candidate.performance.entry_time
                 max_holding = timedelta(hours=candidate.risk_management.max_holding_hours)
 
@@ -179,7 +182,7 @@ class CandleAnalyzer:
             }
 
         except Exception as e:
-            logger.debug(f"시간 조건 분석 오류: {e}")
+            logger.debug(f"❌ {candidate.stock_code} 시간 조건 분석 오류: {e}")
             return {'signal': 'normal', 'trading_hours': True, 'time_pressure': 'none'}
 
     def analyze_risk_conditions(self, candidate: CandleTradeCandidate, current_price: float) -> Dict:
@@ -233,7 +236,7 @@ class CandleAnalyzer:
             return {'signal': 'neutral', 'risk_level': 'medium'}
 
     async def comprehensive_signal_analysis(self, candidate: CandleTradeCandidate, focus_on_exit: bool = False) -> Optional[Dict]:
-        """🔍 다각도 종합 신호 분석"""
+        """🔍 캔들패턴 거래 관점의 종합 신호 분석"""
         try:
             stock_code = candidate.stock_code
 
@@ -252,59 +255,729 @@ class CandleAnalyzer:
             old_price = candidate.current_price
             candidate.update_price(current_price)
 
-            # 🆕 캐시된 OHLCV 데이터 우선 사용 (API 호출 제거)
-            ohlcv_data = candidate.get_ohlcv_data()
-            if ohlcv_data is None:
-                logger.debug(f"📄 {stock_code} 캐시된 일봉 데이터 없음 - 분석 제한")
-                # 캐시된 데이터가 없어도 기본 분석은 진행
-                ohlcv_data = None
+            # 🔄 일봉 데이터 확인 및 업데이트 (캔들패턴의 핵심)
+            ohlcv_data = await self._ensure_fresh_ohlcv_data(candidate, stock_code)
 
-            # 2. 📊 최신 캔들 패턴 재분석 (OHLCV 데이터 전달)
-            pattern_signals = await self.analyze_current_patterns(stock_code, current_price, ohlcv_data)
+            # 🎯 캔들패턴 전략에서는 일봉 데이터가 필수
+            if ohlcv_data is None or ohlcv_data.empty:
+                logger.warning(f"📊 {stock_code} 일봉 데이터 없음 - 캔들패턴 분석 불가")
+                # 패턴 분석 없이 기본 리스크 관리만 수행
+                return await self._basic_risk_analysis_only(candidate, current_price, focus_on_exit)
 
-            # 3. 📈 기술적 지표 분석 (OHLCV 데이터 전달)
-            technical_signals = await self.analyze_technical_indicators(stock_code, current_price, ohlcv_data)
+            # 🆕 2-1. 장중 데이터 보조 분석 (선택적)
+            intraday_signals = await self._analyze_intraday_confirmation(stock_code, current_price, ohlcv_data)
 
-            # 4. ⏰ 시간 기반 조건 분석
-            time_signals = self.analyze_time_conditions(candidate)
+            # 2. 🕯️ 패턴 전환 감지 (매우 중요!)
+            pattern_change_analysis = await self._analyze_pattern_changes(candidate, stock_code, current_price, ohlcv_data)
 
-            # 5. 💰 리스크 조건 분석
-            risk_signals = self.analyze_risk_conditions(candidate, current_price)
+            # 3. 📊 현재 패턴 상태 분석 (일봉 기준)
+            current_pattern_signals = await self._analyze_daily_candle_patterns(stock_code, current_price, ohlcv_data)
 
-            # 6. 🎯 포지션 상태별 특화 분석
+            # 4. 📈 기술적 지표와 패턴 조화성 분석
+            technical_harmony = await self._analyze_pattern_technical_harmony(stock_code, current_price, ohlcv_data, current_pattern_signals)
+
+            # 5. ⏰ 캔들패턴 시간 조건 분석 (일봉 기준)
+            pattern_time_signals = self._analyze_candle_pattern_timing(candidate)
+
+            # 6. 💰 패턴별 리스크 조건 분석
+            pattern_risk_signals = self._analyze_pattern_specific_risks(candidate, current_price, current_pattern_signals)
+
+            # 7. 🎯 캔들패턴 기반 포지션 분석
             if focus_on_exit:
-                position_signals = self._analyze_exit_conditions(candidate, current_price, ohlcv_data)
+                position_signals = self._analyze_candle_exit_conditions(candidate, current_price, pattern_change_analysis)
             else:
-                position_signals = self._analyze_entry_conditions_simple(candidate, current_price)
+                position_signals = self._analyze_candle_entry_conditions(candidate, current_price, current_pattern_signals)
 
-            # 7. 종합 신호 계산
-            final_signal, signal_strength = self._calculate_comprehensive_signal(
-                pattern_signals, technical_signals, time_signals,
-                risk_signals, position_signals, focus_on_exit
+            # 🆕 7-1. 장중 데이터로 포지션 신호 정밀화
+            if intraday_signals and intraday_signals.get('valid', False):
+                position_signals = self._refine_position_signals_with_intraday(position_signals, intraday_signals, focus_on_exit)
+
+            # 8. 🧮 캔들패턴 중심의 종합 신호 계산
+            final_signal, signal_strength = self._calculate_candle_focused_signal(
+                current_pattern_signals, pattern_change_analysis, technical_harmony,
+                pattern_time_signals, pattern_risk_signals, position_signals, focus_on_exit
             )
 
             return {
                 'new_signal': final_signal,
                 'signal_strength': signal_strength,
                 'price_change_pct': ((current_price - old_price) / old_price * 100) if old_price > 0 else 0,
-                'pattern_signals': pattern_signals,
-                'technical_signals': technical_signals,
-                'time_signals': time_signals,
-                'risk_signals': risk_signals,
+
+                # 🆕 캔들패턴 전용 분석 결과
+                'current_pattern_signals': current_pattern_signals,
+                'pattern_change_analysis': pattern_change_analysis,
+                'technical_harmony': technical_harmony,
+                'pattern_time_signals': pattern_time_signals,
+                'pattern_risk_signals': pattern_risk_signals,
                 'position_signals': position_signals,
-                'analysis_time': datetime.now()
+
+                # 🆕 장중 데이터 분석 결과
+                'intraday_signals': intraday_signals,
+
+                # 분석 메타데이터
+                'analysis_time': datetime.now(),
+                'analysis_type': 'candle_pattern_focused_with_intraday',
+                'daily_candle_updated': pattern_change_analysis.get('ohlcv_updated', False)
             }
 
         except Exception as e:
-            logger.debug(f"종합 신호 분석 오류 ({candidate.stock_code}): {e}")
+            logger.error(f"❌ 캔들패턴 신호 분석 오류 ({candidate.stock_code}): {e}")
             return None
 
-    def _analyze_exit_conditions(self, candidate: CandleTradeCandidate, current_price: float, ohlcv_data: Optional[Any] = None) -> Dict:
+    async def _analyze_intraday_confirmation(self, stock_code: str, current_price: float, daily_ohlcv: Any) -> Dict:
+        """🕐 장중 데이터 보조 분석 (일봉 패턴의 보완용)"""
+        try:
+            # 기본 구조
+            intraday_analysis = {
+                'valid': False,
+                'timing_score': 0.5,  # 0~1 (진입/청산 타이밍 점수)
+                'trend_confirmation': 'neutral',  # 'bullish', 'bearish', 'neutral'
+                'volume_surge': False,
+                'support_resistance_level': None,
+                'entry_timing_quality': 'normal',  # 'excellent', 'good', 'normal', 'poor'
+                'exit_timing_quality': 'normal',
+                'analysis_source': 'minute_data'
+            }
+
+            # 🎯 장중 분석이 유용한 상황인지 판단
+            if not self._should_use_intraday_analysis():
+                logger.debug(f"📊 {stock_code} 장중 분석 스킵 (장시간 외 또는 설정 비활성화)")
+                return intraday_analysis
+
+            # 🆕 분봉 데이터 조회 (5분봉)
+            minute_data = await self._get_minute_candle_data(stock_code, period_minutes=5, count=20)
+            if not minute_data or minute_data.empty:
+                logger.debug(f"📊 {stock_code} 분봉 데이터 조회 실패")
+                return intraday_analysis
+
+            # 유효한 분석 시작
+            intraday_analysis['valid'] = True
+
+            # 1. 🔍 단기 추세 확인 (최근 5개 분봉)
+            trend_confirmation = self._analyze_minute_trend(minute_data, current_price)
+            intraday_analysis['trend_confirmation'] = trend_confirmation
+
+            # 2. 📊 거래량 급증 감지
+            volume_surge = self._detect_volume_surge(minute_data)
+            intraday_analysis['volume_surge'] = volume_surge
+
+            # 3. 🎯 지지/저항선 근접성 분석
+            support_resistance = self._analyze_support_resistance_proximity(minute_data, current_price, daily_ohlcv)
+            intraday_analysis['support_resistance_level'] = support_resistance
+
+            # 4. ⏰ 진입 타이밍 품질 평가
+            entry_timing = self._evaluate_entry_timing_quality(minute_data, current_price, trend_confirmation, volume_surge)
+            intraday_analysis['entry_timing_quality'] = entry_timing
+
+            # 5. 📈 청산 타이밍 품질 평가
+            exit_timing = self._evaluate_exit_timing_quality(minute_data, current_price, trend_confirmation)
+            intraday_analysis['exit_timing_quality'] = exit_timing
+
+            # 6. 🧮 종합 타이밍 점수 계산
+            timing_score = self._calculate_intraday_timing_score(
+                trend_confirmation, volume_surge, support_resistance, entry_timing, exit_timing
+            )
+            intraday_analysis['timing_score'] = timing_score
+
+            logger.debug(f"📊 {stock_code} 장중 분석 완료: 추세={trend_confirmation}, "
+                       f"거래량급증={volume_surge}, 타이밍점수={timing_score:.2f}")
+
+            return intraday_analysis
+
+        except Exception as e:
+            logger.debug(f"❌ {stock_code} 장중 데이터 분석 오류: {e}")
+            return {'valid': False, 'timing_score': 0.5, 'analysis_source': 'error'}
+
+    def _should_use_intraday_analysis(self) -> bool:
+        """장중 분석 사용 여부 판단"""
+        try:
+            # 1. 거래 시간 체크
+            if not self._is_trading_time():
+                return False
+
+            # 2. 설정에서 장중 분석 활성화 여부 체크
+            intraday_config = self.config.get('intraday_analysis', {})
+            if not intraday_config.get('enabled', True):  # 기본값: 활성화
+                return False
+
+            # 3. 특별한 시간대 제외 (장 시작 10분, 장 마감 10분)
+            current_time = datetime.now()
+
+            # 장 시작 10분은 변동성이 너무 커서 제외
+            if current_time.hour == 9 and current_time.minute < 10:
+                return False
+
+            # 장 마감 10분은 거래량 폭증으로 노이즈 심해서 제외
+            if current_time.hour == 15 and current_time.minute >= 20:
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"장중 분석 사용 여부 판단 오류: {e}")
+            return False
+
+    async def _get_minute_candle_data(self, stock_code: str, period_minutes: int = 5, count: int = 20) -> Optional[Any]:
+        """분봉 데이터 조회 (KIS API 활용)"""
+        try:
+            # 🚨 주의: 실제 KIS API에서 분봉 데이터 조회하는 함수가 있다면 사용
+            # 현재는 예시 구조만 제공
+
+            # 예시: get_inquire_minute_itemchartprice 같은 API가 있다고 가정
+            # from ..api.kis_market_api import get_inquire_minute_itemchartprice
+            #
+            # minute_data = get_inquire_minute_itemchartprice(
+            #     stock_code=stock_code,
+            #     period_minutes=period_minutes,
+            #     count=count
+            # )
+
+            # 🔧 현재는 None 반환 (실제 API 구현 필요)
+            logger.debug(f"📊 {stock_code} {period_minutes}분봉 데이터 조회 요청 (API 구현 필요)")
+            return None
+
+        except Exception as e:
+            logger.debug(f"분봉 데이터 조회 오류 ({stock_code}): {e}")
+            return None
+
+    def _analyze_minute_trend(self, minute_data: Any, current_price: float) -> str:
+        """분봉 기반 단기 추세 분석"""
+        try:
+            if minute_data is None or minute_data.empty or len(minute_data) < 5:
+                return 'neutral'
+
+            # 최근 5개 분봉의 종가 추세 확인
+            recent_closes = [float(row.get('close', 0)) for _, row in minute_data.head(5).iterrows()]
+
+            if len(recent_closes) < 3:
+                return 'neutral'
+
+            # 단순 추세 판단: 상승/하락/횡보
+            if recent_closes[0] > recent_closes[-1] * 1.002:  # 0.2% 이상 상승
+                return 'bullish'
+            elif recent_closes[0] < recent_closes[-1] * 0.998:  # 0.2% 이상 하락
+                return 'bearish'
+            else:
+                return 'neutral'
+
+        except Exception as e:
+            logger.debug(f"분봉 추세 분석 오류: {e}")
+            return 'neutral'
+
+    def _detect_volume_surge(self, minute_data: Any) -> bool:
+        """거래량 급증 감지"""
+        try:
+            if minute_data is None or minute_data.empty or len(minute_data) < 10:
+                return False
+
+            # 최근 3개 분봉 vs 이전 7개 분봉 거래량 비교
+            recent_volumes = [int(row.get('volume', 0)) for _, row in minute_data.head(3).iterrows()]
+            previous_volumes = [int(row.get('volume', 0)) for _, row in minute_data.iloc[3:10].iterrows()]
+
+            if not recent_volumes or not previous_volumes:
+                return False
+
+            avg_recent = sum(recent_volumes) / len(recent_volumes)
+            avg_previous = sum(previous_volumes) / len(previous_volumes)
+
+            # 거래량이 2배 이상 증가했으면 급증으로 판단
+            return avg_recent > avg_previous * 2.0
+
+        except Exception as e:
+            logger.debug(f"거래량 급증 감지 오류: {e}")
+            return False
+
+    def _analyze_support_resistance_proximity(self, minute_data: Any, current_price: float, daily_ohlcv: Any) -> Optional[Dict]:
+        """지지/저항선 근접성 분석"""
+        try:
+            # 일봉 데이터에서 주요 지지/저항선 추출
+            if daily_ohlcv is None or daily_ohlcv.empty or len(daily_ohlcv) < 20:
+                return None
+
+            # 최근 20일간의 고가/저가에서 지지/저항선 찾기
+            recent_highs = [float(row.get('stck_hgpr', 0)) for _, row in daily_ohlcv.head(20).iterrows()]
+            recent_lows = [float(row.get('stck_lwpr', 0)) for _, row in daily_ohlcv.head(20).iterrows()]
+
+            # 주요 저항선 (고가들의 평균 상위)
+            resistance_level = sum(sorted(recent_highs, reverse=True)[:5]) / 5
+
+            # 주요 지지선 (저가들의 평균 하위)
+            support_level = sum(sorted(recent_lows)[:5]) / 5
+
+            # 현재가와의 거리 계산
+            resistance_distance = (resistance_level - current_price) / current_price * 100
+            support_distance = (current_price - support_level) / current_price * 100
+
+            return {
+                'resistance_level': resistance_level,
+                'support_level': support_level,
+                'resistance_distance_pct': resistance_distance,
+                'support_distance_pct': support_distance,
+                'near_resistance': abs(resistance_distance) < 1.0,  # 1% 이내
+                'near_support': abs(support_distance) < 1.0,        # 1% 이내
+            }
+
+        except Exception as e:
+            logger.debug(f"지지/저항선 분석 오류: {e}")
+            return None
+
+    def _evaluate_entry_timing_quality(self, minute_data: Any, current_price: float,
+                                     trend_confirmation: str, volume_surge: bool) -> str:
+        """진입 타이밍 품질 평가"""
+        try:
+            score = 0
+
+            # 추세 확인 점수
+            if trend_confirmation == 'bullish':
+                score += 3
+            elif trend_confirmation == 'neutral':
+                score += 1
+
+            # 거래량 급증 점수
+            if volume_surge:
+                score += 2
+
+            # 타이밍 품질 판정
+            if score >= 4:
+                return 'excellent'
+            elif score >= 3:
+                return 'good'
+            elif score >= 1:
+                return 'normal'
+            else:
+                return 'poor'
+
+        except Exception as e:
+            logger.debug(f"진입 타이밍 평가 오류: {e}")
+            return 'normal'
+
+    def _evaluate_exit_timing_quality(self, minute_data: Any, current_price: float, trend_confirmation: str) -> str:
+        """청산 타이밍 품질 평가"""
+        try:
+            # 하락 추세시 좋은 청산 타이밍
+            if trend_confirmation == 'bearish':
+                return 'excellent'
+            elif trend_confirmation == 'neutral':
+                return 'good'
+            else:
+                return 'normal'
+
+        except Exception as e:
+            logger.debug(f"청산 타이밍 평가 오류: {e}")
+            return 'normal'
+
+    def _calculate_intraday_timing_score(self, trend_confirmation: str, volume_surge: bool,
+                                       support_resistance: Optional[Dict], entry_timing: str, exit_timing: str) -> float:
+        """장중 타이밍 종합 점수 계산"""
+        try:
+            score = 0.5  # 기본값
+
+            # 추세 확인 (±0.2)
+            if trend_confirmation == 'bullish':
+                score += 0.2
+            elif trend_confirmation == 'bearish':
+                score -= 0.1
+
+            # 거래량 급증 (+0.1)
+            if volume_surge:
+                score += 0.1
+
+            # 지지/저항선 근접성 (±0.1)
+            if support_resistance:
+                if support_resistance.get('near_support'):
+                    score += 0.1  # 지지선 근처는 좋은 진입점
+                elif support_resistance.get('near_resistance'):
+                    score -= 0.1  # 저항선 근처는 주의
+
+            # 진입 타이밍 품질 (±0.1)
+            timing_scores = {'excellent': 0.1, 'good': 0.05, 'normal': 0, 'poor': -0.1}
+            score += timing_scores.get(entry_timing, 0)
+
+            # 0~1 범위로 제한
+            return max(0.0, min(1.0, score))
+
+        except Exception as e:
+            logger.debug(f"장중 타이밍 점수 계산 오류: {e}")
+            return 0.5
+
+    def _refine_position_signals_with_intraday(self, position_signals: Dict, intraday_signals: Dict, focus_on_exit: bool) -> Dict:
+        """장중 데이터로 포지션 신호 정밀화"""
+        try:
+            if not intraday_signals.get('valid', False):
+                return position_signals
+
+            refined_signals = position_signals.copy()
+            timing_score = intraday_signals.get('timing_score', 0.5)
+            trend_confirmation = intraday_signals.get('trend_confirmation', 'neutral')
+
+            if focus_on_exit:
+                # 📈 매도 신호 정밀화
+                if position_signals.get('signal') in ['strong_sell', 'sell']:
+                    # 하락 추세 + 좋은 타이밍이면 신호 강화
+                    if trend_confirmation == 'bearish' and timing_score > 0.7:
+                        refined_signals['intraday_enhancement'] = 'exit_timing_excellent'
+                        logger.debug("🎯 장중 분석: 매도 타이밍 최적화")
+                    elif trend_confirmation == 'bullish':
+                        # 상승 추세인데 매도 신호면 신중하게
+                        refined_signals['intraday_enhancement'] = 'exit_timing_caution'
+                        logger.debug("⚠️ 장중 분석: 매도 신호 있지만 상승 추세")
+
+            else:
+                # 💰 매수 신호 정밀화
+                if position_signals.get('signal') in ['buy_ready', 'strong_buy']:
+                    # 상승 추세 + 좋은 타이밍이면 신호 강화
+                    if trend_confirmation == 'bullish' and timing_score > 0.7:
+                        refined_signals['intraday_enhancement'] = 'entry_timing_excellent'
+                        logger.debug("🎯 장중 분석: 매수 타이밍 최적화")
+                    elif trend_confirmation == 'bearish':
+                        # 하락 추세인데 매수 신호면 대기
+                        refined_signals['signal'] = 'wait'
+                        refined_signals['intraday_enhancement'] = 'entry_timing_poor'
+                        logger.debug("⚠️ 장중 분석: 매수 신호 있지만 하락 추세 - 대기")
+
+            # 장중 분석 메타데이터 추가
+            refined_signals['intraday_timing_score'] = timing_score
+            refined_signals['intraday_trend'] = trend_confirmation
+
+            return refined_signals
+
+        except Exception as e:
+            logger.debug(f"장중 데이터 신호 정밀화 오류: {e}")
+            return position_signals
+
+    async def _ensure_fresh_ohlcv_data(self, candidate: CandleTradeCandidate, stock_code: str) -> Optional[Any]:
+        """�� 최신 일봉 데이터 확보 (캔들패턴의 핵심)"""
+        try:
+            # 기존 캐시된 데이터 확인
+            cached_data = candidate.get_ohlcv_data()
+
+            # 🕒 일봉 데이터 갱신 필요성 체크
+            need_update = self._should_update_daily_candle_data(cached_data)
+
+            if not need_update and cached_data is not None:
+                logger.debug(f"📊 {stock_code} 캐시된 일봉 데이터 사용")
+                return cached_data
+
+            # 🆕 최신 일봉 데이터 조회
+            logger.debug(f"📥 {stock_code} 최신 일봉 데이터 조회")
+            from ..api.kis_market_api import get_inquire_daily_itemchartprice
+            fresh_ohlcv = get_inquire_daily_itemchartprice(
+                output_dv="2",  # 일자별 차트 데이터
+                itm_no=stock_code,
+                period_code="D",
+                adj_prc="1"
+            )
+
+            if fresh_ohlcv is not None and not fresh_ohlcv.empty:
+                # 캐시 업데이트
+                candidate.cache_ohlcv_data(fresh_ohlcv)
+                logger.debug(f"✅ {stock_code} 일봉 데이터 갱신 완료")
+                return fresh_ohlcv
+
+            # 폴백: 캐시된 데이터라도 사용
+            return cached_data
+
+        except Exception as e:
+            logger.error(f"❌ {stock_code} 일봉 데이터 확보 오류: {e}")
+            return candidate.get_ohlcv_data()  # 기존 캐시 반환
+
+    def _should_update_daily_candle_data(self, cached_data: Optional[Any]) -> bool:
+        """일봉 데이터 갱신 필요성 판단"""
+        try:
+            if cached_data is None:
+                return True
+
+            # 🕒 장중에는 1시간마다, 장후에는 하루에 한번 갱신
+            current_time = datetime.now()
+
+            # 장 시간 확인
+            if self._is_trading_time():
+                # 장중: 1시간마다 갱신 (오늘 새로운 캔들 형성 중)
+                return True  # 실제로는 candidate의 마지막 업데이트 시간 체크 필요
+            else:
+                # 장후: 하루에 한번만 갱신
+                return current_time.hour >= 16 and current_time.minute >= 0
+
+        except Exception as e:
+            logger.error(f"일봉 갱신 판단 오류: {e}")
+            return True  # 오류시 갱신
+
+    async def _analyze_pattern_changes(self, candidate: CandleTradeCandidate, stock_code: str,
+                                     current_price: float, ohlcv_data: Any) -> Dict:
+        """🔄 캔들패턴 전환 감지 분석 (핵심!)"""
+        try:
+            # 현재 감지된 패턴들
+            current_patterns = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
+
+            # 기존에 감지된 패턴들 (진입 근거)
+            existing_patterns = candidate.detected_patterns
+
+            analysis = {
+                'has_pattern_change': False,
+                'new_patterns': [],
+                'disappeared_patterns': [],
+                'pattern_reversal_detected': False,
+                'reversal_strength': 0,
+                'action_required': 'none',  # 'immediate_exit', 'caution', 'none'
+                'ohlcv_updated': True
+            }
+
+            if not current_patterns:
+                if existing_patterns:
+                    analysis['disappeared_patterns'] = [p.pattern_type.value for p in existing_patterns]
+                    analysis['has_pattern_change'] = True
+                    analysis['action_required'] = 'caution'
+                return analysis
+
+            # 🔄 패턴 변화 감지
+            current_pattern_types = {p.pattern_type for p in current_patterns}
+            existing_pattern_types = {p.pattern_type for p in existing_patterns} if existing_patterns else set()
+
+            # 새로운 패턴 발견
+            new_pattern_types = current_pattern_types - existing_pattern_types
+            if new_pattern_types:
+                analysis['new_patterns'] = [p.value for p in new_pattern_types]
+                analysis['has_pattern_change'] = True
+
+                # 🚨 패턴 반전 감지 (매우 중요!)
+                reversal_detected, reversal_strength = self._detect_pattern_reversal(
+                    existing_patterns, current_patterns
+                )
+
+                if reversal_detected:
+                    analysis['pattern_reversal_detected'] = True
+                    analysis['reversal_strength'] = reversal_strength
+
+                    # 강한 반전 시그널이면 즉시 조치 필요
+                    if reversal_strength >= 80:
+                        analysis['action_required'] = 'immediate_exit'
+                        logger.warning(f"🚨 {stock_code} 강한 패턴 반전 감지! 즉시 매도 검토 필요")
+                    elif reversal_strength >= 60:
+                        analysis['action_required'] = 'caution'
+                        logger.info(f"⚠️ {stock_code} 패턴 반전 징후 감지")
+
+            # 사라진 패턴
+            disappeared_pattern_types = existing_pattern_types - current_pattern_types
+            if disappeared_pattern_types:
+                analysis['disappeared_patterns'] = [p.value for p in disappeared_pattern_types]
+                analysis['has_pattern_change'] = True
+
+            return analysis
+
+        except Exception as e:
+            logger.error(f"❌ 패턴 변화 분석 오류: {e}")
+            return {'has_pattern_change': False, 'action_required': 'none', 'ohlcv_updated': False}
+
+    def _detect_pattern_reversal(self, existing_patterns: List, current_patterns: List) -> Tuple[bool, int]:
+        """패턴 반전 감지"""
+        try:
+            if not existing_patterns or not current_patterns:
+                return False, 0
+
+            # 기존 패턴의 방향성 (상승/하락)
+            existing_bullish = any(p.pattern_type in [
+                PatternType.HAMMER, PatternType.INVERTED_HAMMER,
+                PatternType.BULLISH_ENGULFING, PatternType.MORNING_STAR
+            ] for p in existing_patterns)
+
+            # 현재 패턴의 방향성
+            current_bearish = any(p.pattern_type in [
+                PatternType.BEARISH_ENGULFING, PatternType.EVENING_STAR,
+                PatternType.FALLING_THREE_METHODS
+            ] for p in current_patterns)
+
+            # 상승 → 하락 반전
+            if existing_bullish and current_bearish:
+                strongest_bearish = max([p for p in current_patterns if p.pattern_type in [
+                    PatternType.BEARISH_ENGULFING, PatternType.EVENING_STAR
+                ]], key=lambda x: x.strength, default=None)
+
+                if strongest_bearish:
+                    return True, strongest_bearish.strength
+
+            return False, 0
+
+        except Exception as e:
+            logger.error(f"패턴 반전 감지 오류: {e}")
+            return False, 0
+
+    async def _analyze_daily_candle_patterns(self, stock_code: str, current_price: float, ohlcv_data: Any) -> Dict:
+        """일봉 기준 캔들 패턴 분석 (기존 analyze_current_patterns 개선)"""
+        try:
+            # 기존 로직 재사용하되, 일봉 관점 강화
+            base_result = await self.analyze_current_patterns(stock_code, current_price, ohlcv_data)
+
+            # 🆕 일봉 캔들패턴 특화 정보 추가
+            if base_result.get('patterns'):
+                strongest_pattern = max(base_result['patterns'], key=lambda p: p.strength)
+
+                # 패턴 완성도 계산 (오늘 캔들이 패턴을 더 강화하는지)
+                pattern_completion = self._calculate_pattern_completion(strongest_pattern, ohlcv_data)
+
+                base_result.update({
+                    'pattern_completion_rate': pattern_completion,
+                    'daily_candle_strength': self._calculate_daily_candle_strength(ohlcv_data),
+                    'pattern_reliability': self._assess_pattern_reliability(strongest_pattern, ohlcv_data)
+                })
+
+            return base_result
+
+        except Exception as e:
+            logger.error(f"❌ 일봉 패턴 분석 오류: {e}")
+            return {'signal': 'neutral', 'strength': 0, 'patterns': []}
+
+    def _calculate_pattern_completion(self, pattern, ohlcv_data) -> float:
+        """패턴 완성도 계산 (0~1)"""
+        try:
+            # 오늘 캔들이 패턴을 더 확실하게 만드는지 평가
+            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 3:
+                return 0.5
+
+            # 간단한 완성도: 최근 3일 캔들의 일관성
+            recent_candles = ohlcv_data.head(3)
+
+            # 상승 패턴의 경우: 고가가 점진적으로 올라가는지
+            if pattern.pattern_type in [PatternType.HAMMER, PatternType.BULLISH_ENGULFING]:
+                highs = [float(row.get('stck_hgpr', 0)) for _, row in recent_candles.iterrows()]
+                if len(highs) >= 2:
+                    return 0.8 if highs[0] > highs[1] else 0.4
+
+            return 0.6  # 기본 완성도
+
+        except Exception as e:
+            logger.error(f"패턴 완성도 계산 오류: {e}")
+            return 0.5
+
+    def _calculate_daily_candle_strength(self, ohlcv_data) -> float:
+        """오늘 캔들의 강도 계산"""
+        try:
+            if ohlcv_data is None or ohlcv_data.empty:
+                return 0.0
+
+            today_candle = ohlcv_data.iloc[0]
+            open_price = float(today_candle.get('stck_oprc', 0))
+            close_price = float(today_candle.get('stck_clpr', 0))
+            high_price = float(today_candle.get('stck_hgpr', 0))
+            low_price = float(today_candle.get('stck_lwpr', 0))
+
+            if high_price <= low_price:
+                return 0.0
+
+            # 실체 비율 (몸통/전체 범위)
+            body_size = abs(close_price - open_price)
+            total_range = high_price - low_price
+            body_ratio = body_size / total_range if total_range > 0 else 0
+
+            return min(1.0, body_ratio * 1.5)  # 0~1 범위로 정규화
+
+        except Exception as e:
+            logger.error(f"일봉 강도 계산 오류: {e}")
+            return 0.0
+
+    def _assess_pattern_reliability(self, pattern, ohlcv_data) -> float:
+        """패턴 신뢰도 평가 (거래량, 위치 등 고려)"""
+        try:
+            base_reliability = pattern.confidence
+
+            # 🔍 거래량 확인 (패턴 + 거래량 증가 = 신뢰도 상승)
+            volume_factor = self._calculate_volume_factor(ohlcv_data)
+
+            # 🔍 가격 위치 확인 (지지/저항 근처 패턴 = 신뢰도 상승)
+            position_factor = self._calculate_position_factor(ohlcv_data)
+
+            # 종합 신뢰도 (최대 0.95)
+            adjusted_reliability = min(0.95, base_reliability * volume_factor * position_factor)
+
+            return adjusted_reliability
+
+        except Exception as e:
+            logger.error(f"패턴 신뢰도 평가 오류: {e}")
+            return pattern.confidence if pattern else 0.5
+
+    def _calculate_volume_factor(self, ohlcv_data) -> float:
+        """거래량 요인 계산"""
+        try:
+            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 5:
+                return 1.0
+
+            # 최근 5일 평균 거래량 대비 오늘 거래량
+            recent_volumes = []
+            for _, row in ohlcv_data.head(5).iterrows():
+                volume = int(row.get('acml_vol', 0))
+                if volume > 0:
+                    recent_volumes.append(volume)
+
+            if len(recent_volumes) < 2:
+                return 1.0
+
+            today_volume = recent_volumes[0]
+            avg_volume = sum(recent_volumes[1:]) / len(recent_volumes[1:])
+
+            volume_ratio = today_volume / avg_volume if avg_volume > 0 else 1.0
+
+            # 거래량 2배 이상 = 1.2배 신뢰도, 절반 이하 = 0.8배 신뢰도
+            if volume_ratio >= 2.0:
+                return 1.2
+            elif volume_ratio >= 1.5:
+                return 1.1
+            elif volume_ratio <= 0.5:
+                return 0.8
+            else:
+                return 1.0
+
+        except Exception as e:
+            logger.error(f"거래량 요인 계산 오류: {e}")
+            return 1.0
+
+    def _calculate_position_factor(self, ohlcv_data) -> float:
+        """가격 위치 요인 계산 (지지/저항 근처)"""
+        try:
+            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 20:
+                return 1.0
+
+            # 20일 고가/저가 범위에서의 현재 위치
+            recent_data = ohlcv_data.head(20)
+            current_price = float(ohlcv_data.iloc[0].get('stck_clpr', 0))
+
+            highs = [float(row.get('stck_hgpr', 0)) for _, row in recent_data.iterrows()]
+            lows = [float(row.get('stck_lwpr', 0)) for _, row in recent_data.iterrows()]
+
+            max_high = max(highs)
+            min_low = min(lows)
+
+            if max_high <= min_low:
+                return 1.0
+
+            # 상대적 위치 (0~1)
+            relative_position = (current_price - min_low) / (max_high - min_low)
+
+            # 지지선(0.1~0.3) 또는 저항선(0.7~0.9) 근처에서 패턴이 나타나면 신뢰도 증가
+            if 0.1 <= relative_position <= 0.3 or 0.7 <= relative_position <= 0.9:
+                return 1.15  # 15% 신뢰도 증가
+            else:
+                return 1.0
+
+        except Exception as e:
+            logger.error(f"가격 위치 요인 계산 오류: {e}")
+            return 1.0
+
+    def _analyze_candle_exit_conditions(self, candidate: CandleTradeCandidate, current_price: float, pattern_change_analysis: Dict) -> Dict:
         """🎯 매도 조건 분석 (진입한 종목용)"""
         try:
             # 기본 매도 조건들
             should_exit = False
             exit_reasons = []
+
+            # 🚨 패턴 반전 감지시 즉시 매도
+            if pattern_change_analysis.get('action_required') == 'immediate_exit':
+                should_exit = True
+                exit_reasons.append('강한 패턴 반전 감지')
+                return {
+                    'signal': 'strong_sell',
+                    'should_exit': should_exit,
+                    'exit_reasons': exit_reasons,
+                    'pattern_reversal_exit': True
+                }
 
             # 🆕 패턴별 설정 가져오기
             target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(candidate)
@@ -333,6 +1006,10 @@ class CandleAnalyzer:
                 should_exit = True
                 exit_reasons.append(f'{max_hours}시간 청산')
 
+            # 4. 패턴 변화 주의 (caution 레벨)
+            if pattern_change_analysis.get('action_required') == 'caution':
+                exit_reasons.append('패턴 변화 주의')
+
             signal = 'strong_sell' if should_exit else 'hold'
 
             return {
@@ -345,23 +1022,39 @@ class CandleAnalyzer:
             logger.debug(f"매도 조건 분석 오류: {e}")
             return {'signal': 'hold', 'should_exit': False, 'exit_reasons': []}
 
-    def _analyze_entry_conditions_simple(self, candidate: CandleTradeCandidate, current_price: float) -> Dict:
-        """🎯 진입 조건 간단 분석 (관찰 중인 종목용)"""
+    def _analyze_candle_entry_conditions(self, candidate: CandleTradeCandidate, current_price: float, current_pattern_signals: Dict) -> Dict:
+        """🎯 캔들패턴 기반 진입 조건 분석 (관찰 중인 종목용)"""
         try:
             # 기본 진입 조건 체크
             can_enter = True
             entry_reasons = []
 
-            # 가격대 체크
+            # 1. 가격대 체크
             if not (self.config['min_price'] <= current_price <= self.config['max_price']):
                 can_enter = False
             else:
                 entry_reasons.append('가격대 적정')
 
-            # 거래 시간 체크
+            # 2. 거래 시간 체크
             if self._is_trading_time():
                 entry_reasons.append('거래 시간')
             else:
+                can_enter = False
+
+            # 3. 🆕 패턴 신호 강도 체크
+            pattern_strength = current_pattern_signals.get('strength', 0)
+            if pattern_strength >= 70:
+                entry_reasons.append(f'강한 패턴 신호 ({pattern_strength})')
+            elif pattern_strength >= 50:
+                entry_reasons.append(f'적정 패턴 신호 ({pattern_strength})')
+            else:
+                can_enter = False
+
+            # 4. 🆕 패턴 신뢰도 체크
+            pattern_reliability = current_pattern_signals.get('pattern_reliability', 0.0)
+            if pattern_reliability >= 0.7:
+                entry_reasons.append(f'높은 패턴 신뢰도 ({pattern_reliability:.2f})')
+            elif pattern_reliability < 0.5:
                 can_enter = False
 
             signal = 'buy_ready' if can_enter else 'wait'
@@ -369,53 +1062,79 @@ class CandleAnalyzer:
             return {
                 'signal': signal,
                 'can_enter': can_enter,
-                'entry_reasons': entry_reasons
+                'entry_reasons': entry_reasons,
+                'pattern_strength': pattern_strength,
+                'pattern_reliability': pattern_reliability
             }
 
         except Exception as e:
             logger.debug(f"진입 조건 분석 오류: {e}")
             return {'signal': 'wait', 'can_enter': False, 'entry_reasons': []}
 
-    def _calculate_comprehensive_signal(self, pattern_signals: Dict, technical_signals: Dict,
-                                      time_signals: Dict, risk_signals: Dict, position_signals: Dict,
-                                      focus_on_exit: bool = False) -> Tuple[TradeSignal, int]:
-        """🧮 종합 신호 계산"""
+    def _calculate_candle_focused_signal(self, current_pattern_signals: Dict, pattern_change_analysis: Dict,
+                                         technical_harmony: float, pattern_time_signals: Dict,
+                                         pattern_risk_signals: Dict, position_signals: Dict,
+                                         focus_on_exit: bool = False) -> Tuple[TradeSignal, int]:
+        """🧮 캔들패턴 중심의 종합 신호 계산"""
         try:
-            # 가중치 설정
+            # 🚨 패턴 반전 감지시 즉시 매도 (최우선)
+            if pattern_change_analysis.get('action_required') == 'immediate_exit':
+                return TradeSignal.STRONG_SELL, 95
+
+            # 가중치 설정 (캔들패턴 중심)
             if focus_on_exit:
-                # 매도 신호 중심
+                # 매도 신호 중심 - 패턴 반전이 중요
                 weights = {
-                    'risk': 0.4,        # 리스크 조건이 가장 중요
-                    'position': 0.3,    # 포지션 분석
-                    'time': 0.2,        # 시간 조건
-                    'technical': 0.1,   # 기술적 지표
-                    'pattern': 0.0      # 패턴은 매도시 덜 중요
+                    'pattern_change': 0.4,   # 패턴 변화가 가장 중요
+                    'risk': 0.3,            # 리스크 조건
+                    'position': 0.2,        # 포지션 분석
+                    'time': 0.1,            # 시간 조건
+                    'pattern': 0.0          # 현재 패턴은 덜 중요 (변화가 더 중요)
                 }
             else:
-                # 매수 신호 중심
+                # 매수 신호 중심 - 패턴과 조화성이 중요
                 weights = {
-                    'pattern': 0.4,     # 패턴이 가장 중요
-                    'technical': 0.3,   # 기술적 지표
-                    'position': 0.2,    # 진입 조건
-                    'risk': 0.1,        # 리스크 조건
-                    'time': 0.0         # 시간은 덜 중요
+                    'pattern': 0.4,         # 현재 패턴이 가장 중요
+                    'technical_harmony': 0.25,  # 패턴-기술지표 조화성
+                    'position': 0.2,        # 진입 조건
+                    'risk': 0.1,            # 리스크 조건
+                    'time': 0.05           # 시간은 덜 중요
                 }
 
             # 각 신호의 점수 계산 (0~100)
-            pattern_score = self._get_signal_score(pattern_signals.get('signal', 'neutral'), 'pattern')
-            technical_score = self._get_signal_score(technical_signals.get('signal', 'neutral'), 'technical')
-            time_score = self._get_signal_score(time_signals.get('signal', 'normal'), 'time')
-            risk_score = self._get_signal_score(risk_signals.get('signal', 'neutral'), 'risk')
+            pattern_score = self._get_signal_score(current_pattern_signals.get('signal', 'neutral'), 'pattern')
+
+            # 🔧 technical_harmony는 float이므로 0~100 스케일로 변환
+            technical_score = technical_harmony * 100 if isinstance(technical_harmony, (int, float)) else 50
+
+            time_score = self._get_signal_score(pattern_time_signals.get('signal', 'normal'), 'time')
+            risk_score = self._get_signal_score(pattern_risk_signals.get('signal', 'neutral'), 'risk')
             position_score = self._get_signal_score(position_signals.get('signal', 'wait'), 'position')
 
+            # 패턴 변화 점수
+            if pattern_change_analysis.get('action_required') == 'caution':
+                pattern_change_score = 70  # 주의 레벨
+            elif pattern_change_analysis.get('has_pattern_change'):
+                pattern_change_score = 60  # 일반적인 변화
+            else:
+                pattern_change_score = 50  # 변화 없음
+
             # 가중 평균 계산
-            total_score = (
-                pattern_score * weights['pattern'] +
-                technical_score * weights['technical'] +
-                time_score * weights['time'] +
-                risk_score * weights['risk'] +
-                position_score * weights['position']
-            )
+            if focus_on_exit:
+                total_score = (
+                    pattern_change_score * weights['pattern_change'] +
+                    risk_score * weights['risk'] +
+                    position_score * weights['position'] +
+                    time_score * weights['time']
+                )
+            else:
+                total_score = (
+                    pattern_score * weights['pattern'] +
+                    technical_score * weights['technical_harmony'] +
+                    position_score * weights['position'] +
+                    risk_score * weights['risk'] +
+                    time_score * weights['time']
+                )
 
             # 신호 결정
             if focus_on_exit:
@@ -436,7 +1155,7 @@ class CandleAnalyzer:
                     return TradeSignal.HOLD, int(total_score)
 
         except Exception as e:
-            logger.debug(f"종합 신호 계산 오류: {e}")
+            logger.debug(f"캔들패턴 중심 신호 계산 오류: {e}")
             return TradeSignal.HOLD, 50
 
     def _get_signal_score(self, signal: str, signal_type: str) -> float:
@@ -458,7 +1177,8 @@ class CandleAnalyzer:
             elif signal_type == 'risk':
                 scores = {
                     'target_reached': 90, 'stop_loss': 90, 'profit_target': 85,
-                    'loss_limit': 85, 'profit_zone': 60, 'loss_zone': 40, 'neutral': 50
+                    'loss_limit': 85, 'profit_zone': 60, 'loss_zone': 40, 'neutral': 50,
+                    'pattern_risk_high': 90, 'pattern_risk_medium': 60
                 }
             elif signal_type == 'position':
                 scores = {
@@ -546,11 +1266,11 @@ class CandleAnalyzer:
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
         """🆕 패턴별 시간 청산 조건 체크"""
         try:
-            if not position.performance.entry_time:
+            if not position.performance or not position.performance.entry_time:
                 return False
 
             # 보유 시간 계산
-            holding_time = datetime.now() - position.performance.entry_time
+            holding_time = datetime.now(self.korea_tz) - position.performance.entry_time
             max_holding = timedelta(hours=max_hours)
 
             # 패턴별 최대 보유시간 초과시 청산
@@ -574,7 +1294,7 @@ class CandleAnalyzer:
             return False
 
         except Exception as e:
-            logger.error(f"패턴별 시간 청산 체크 오류: {e}")
+            logger.error(f"❌ {position.stock_code} 패턴별 시간 청산 체크 오류: {e}")
             return False
 
     def _is_trading_time(self) -> bool:
@@ -705,3 +1425,190 @@ class CandleAnalyzer:
         except Exception as e:
             logger.error(f"진입 우선순위 계산 오류: {e}")
             return 50
+
+    async def _basic_risk_analysis_only(self, candidate: CandleTradeCandidate, current_price: float, focus_on_exit: bool) -> Optional[Dict]:
+        """🔧 패턴 분석 불가시 기본 리스크 관리만 수행"""
+        try:
+            # 기본 리스크 조건만 분석
+            risk_signals = self.analyze_risk_conditions(candidate, current_price)
+            time_signals = self.analyze_time_conditions(candidate)
+
+            # 매도 조건만 체크 (패턴 없이)
+            if focus_on_exit:
+                if risk_signals.get('signal') in ['target_reached', 'stop_loss', 'loss_limit']:
+                    final_signal = TradeSignal.SELL
+                    signal_strength = 70
+                else:
+                    final_signal = TradeSignal.HOLD
+                    signal_strength = 50
+            else:
+                final_signal = TradeSignal.HOLD
+                signal_strength = 30  # 패턴 없으면 낮은 신호
+
+            return {
+                'new_signal': final_signal,
+                'signal_strength': signal_strength,
+                'price_change_pct': 0.0,
+                'analysis_type': 'basic_risk_only',
+                'pattern_analysis_failed': True,
+                'risk_signals': risk_signals,
+                'time_signals': time_signals,
+                'analysis_time': datetime.now()
+            }
+
+        except Exception as e:
+            logger.error(f"❌ 기본 리스크 분석 오류: {e}")
+            return None
+
+    async def _analyze_pattern_technical_harmony(self, stock_code: str, current_price: float,
+                                               ohlcv_data: Any, current_pattern_signals: Dict) -> float:
+        """📈 패턴과 기술적 지표의 조화성 분석"""
+        try:
+            # 기존 기술적 지표 분석
+            technical_signals = await self.analyze_technical_indicators(stock_code, current_price, ohlcv_data)
+
+            pattern_signal = current_pattern_signals.get('signal', 'neutral')
+            technical_signal = technical_signals.get('signal', 'neutral')
+            rsi = technical_signals.get('rsi', 50.0)
+
+            # 조화성 점수 계산 (0.0 ~ 1.0)
+            harmony_score = 0.5  # 기본값
+
+            # 패턴과 기술지표가 같은 방향
+            if pattern_signal == 'bullish' and technical_signal in ['oversold_bullish', 'oversold']:
+                harmony_score = 0.9  # 매우 좋은 조화
+            elif pattern_signal == 'bullish' and rsi < 50:
+                harmony_score = 0.7  # 좋은 조화
+            elif pattern_signal == 'bearish' and technical_signal in ['overbought_bearish', 'overbought']:
+                harmony_score = 0.9  # 매우 좋은 조화
+            elif pattern_signal == 'bearish' and rsi > 50:
+                harmony_score = 0.7  # 좋은 조화
+
+            # 상반된 신호
+            elif pattern_signal == 'bullish' and rsi > 70:
+                harmony_score = 0.3  # 조화 부족 (상승패턴 + 과매수)
+            elif pattern_signal == 'bearish' and rsi < 30:
+                harmony_score = 0.3  # 조화 부족 (하락패턴 + 과매도)
+
+            return harmony_score
+
+        except Exception as e:
+            logger.error(f"❌ 패턴-기술지표 조화성 분석 오류: {e}")
+            return 0.5
+
+    def _analyze_candle_pattern_timing(self, candidate: CandleTradeCandidate) -> Dict:
+        """⏰ 캔들패턴 시간 조건 분석 (일봉 기준)"""
+        try:
+            current_time = datetime.now(self.korea_tz)
+
+            # 거래 시간 체크
+            trading_hours = self._is_trading_time()
+
+            # 패턴 형성 시간 분석
+            pattern_timing_score = 0.5  # 기본값
+
+            # 현재 시간을 naive datetime으로도 준비 (시간대 비교용)
+            current_time_naive = datetime.now()
+
+            # 장 시작 1시간 이내 = 좋은 타이밍
+            if trading_hours and current_time_naive.hour == 9:
+                pattern_timing_score = 0.8
+            # 장 중반 = 보통 타이밍
+            elif trading_hours and 10 <= current_time_naive.hour <= 14:
+                pattern_timing_score = 0.6
+            # 장 마감 1시간 전 = 주의 필요
+            elif trading_hours and current_time_naive.hour >= 14:
+                pattern_timing_score = 0.4
+
+            # 보유 시간 분석 (진입한 종목의 경우)
+            holding_duration = None
+            time_pressure = 'none'
+
+            if (candidate.status == CandleStatus.ENTERED and
+                candidate.performance and
+                candidate.performance.entry_time):
+
+                holding_duration = current_time - candidate.performance.entry_time
+                max_holding = timedelta(hours=candidate.risk_management.max_holding_hours)
+
+                if holding_duration >= max_holding * 0.8:  # 80% 경과
+                    time_pressure = 'high'
+                elif holding_duration >= max_holding * 0.5:  # 50% 경과
+                    time_pressure = 'medium'
+                else:
+                    time_pressure = 'low'
+
+            # 시간 기반 신호
+            if not trading_hours:
+                signal = 'closed_market'
+            elif time_pressure == 'high':
+                signal = 'time_exit'
+            elif time_pressure == 'medium':
+                signal = 'time_caution'
+            else:
+                signal = 'normal'
+
+            return {
+                'signal': signal,
+                'trading_hours': trading_hours,
+                'holding_duration': str(holding_duration) if holding_duration else None,
+                'time_pressure': time_pressure,
+                'pattern_timing_score': pattern_timing_score
+            }
+
+        except Exception as e:
+            logger.debug(f"❌ {candidate.stock_code} 캔들패턴 시간 조건 분석 오류: {e}")
+            return {'signal': 'normal', 'trading_hours': True, 'time_pressure': 'none', 'pattern_timing_score': 0.5}
+
+    def _analyze_pattern_specific_risks(self, candidate: CandleTradeCandidate, current_price: float, current_pattern_signals: Dict) -> Dict:
+        """💰 패턴별 특화 리스크 조건 분석"""
+        try:
+            # 기본 리스크 분석
+            base_risk = self.analyze_risk_conditions(candidate, current_price)
+
+            # 패턴별 추가 리스크 요소
+            pattern_risk_adjustments = []
+
+            # 패턴 완성도가 낮으면 리스크 증가
+            pattern_completion = current_pattern_signals.get('pattern_completion_rate', 0.5)
+            if pattern_completion < 0.4:
+                pattern_risk_adjustments.append('낮은 패턴 완성도')
+
+            # 패턴 신뢰도가 낮으면 리스크 증가
+            pattern_reliability = current_pattern_signals.get('pattern_reliability', 0.5)
+            if pattern_reliability < 0.6:
+                pattern_risk_adjustments.append('낮은 패턴 신뢰도')
+
+            # 일봉 강도가 약하면 리스크 증가
+            daily_strength = current_pattern_signals.get('daily_candle_strength', 0.5)
+            if daily_strength < 0.3:
+                pattern_risk_adjustments.append('약한 일봉 강도')
+
+            # 종합 리스크 레벨 조정
+            base_risk_level = base_risk.get('risk_level', 'medium')
+
+            if len(pattern_risk_adjustments) >= 2:
+                adjusted_risk_level = 'high_risk'
+                signal = 'pattern_risk_high'
+            elif len(pattern_risk_adjustments) == 1:
+                adjusted_risk_level = 'medium_risk'
+                signal = 'pattern_risk_medium'
+            else:
+                adjusted_risk_level = base_risk_level
+                signal = base_risk.get('signal', 'neutral')
+
+            result = base_risk.copy()
+            result.update({
+                'signal': signal,
+                'risk_level': adjusted_risk_level,
+                'pattern_risk_adjustments': pattern_risk_adjustments,
+                'pattern_completion': pattern_completion,
+                'pattern_reliability': pattern_reliability,
+                'daily_strength': daily_strength
+            })
+
+            return result
+
+        except Exception as e:
+            logger.debug(f"패턴별 리스크 조건 분석 오류: {e}")
+            return {'signal': 'neutral', 'risk_level': 'medium', 'pattern_risk_adjustments': []}
