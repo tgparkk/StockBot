@@ -259,7 +259,7 @@ class CandleTradeManager:
     async def setup_existing_holdings_monitoring(self):
         """기존 보유 종목 웹소켓 모니터링 설정 - 메인 컨트롤러"""
         try:
-            logger.info("📊 기존 보유 종목 웹소켓 모니터링 설정 시작")
+            logger.debug("📊 기존 보유 종목 웹소켓 모니터링 설정 시작")
 
             # 1. 기존 보유 종목 조회
             existing_stocks = await self._fetch_existing_holdings()
@@ -267,7 +267,7 @@ class CandleTradeManager:
                 logger.info("📊 보유 종목이 없습니다.")
                 return True
 
-            logger.info(f"📈 보유 종목 {len(existing_stocks)}개 발견")
+            logger.debug(f"📈 보유 종목 {len(existing_stocks)}개 발견")
 
             # 2. 각 종목별 처리
             subscription_success_count = 0
@@ -276,12 +276,12 @@ class CandleTradeManager:
             for i, stock_info in enumerate(existing_stocks):
                 try:
                     stock_code = stock_info.get('stock_code', 'unknown')
-                    #stock_name = stock_info.get('stock_name', 'unknown')
-                    #logger.info(f"🔍 종목 {i+1}/{len(existing_stocks)} 처리 시작: {stock_code}({stock_name})")
+                    stock_name = stock_info.get('stock_name', 'unknown')
+                    logger.debug(f"🔍 종목 {i+1}/{len(existing_stocks)} 처리 시작: {stock_code}({stock_name})")
 
                     success_sub, success_add = await self._process_single_holding(stock_info)
 
-                    logger.info(f"🔍 종목 {i+1} 처리 결과: 구독={success_sub}, 추가={success_add}")
+                    logger.debug(f"🔍 종목 {i+1} 처리 결과: 구독={success_sub}, 추가={success_add}")
 
                     if success_sub:
                         subscription_success_count += 1
@@ -723,11 +723,12 @@ class CandleTradeManager:
 
             if actual_buy_time:
                 # 실제 매수 시간을 찾은 경우
+                candidate.performance.entry_time = actual_buy_time
                 candidate.performance.buy_execution_time = actual_buy_time
                 candidate.metadata['buy_execution_time_estimated'] = False
                 candidate.metadata['buy_execution_time_source'] = 'kis_api_order_history'
                 candidate.metadata['original_buy_execution_time'] = actual_buy_time.isoformat()
-                logger.info(f"✅ {candidate.stock_code} 실제 매수 시간 조회 성공: {actual_buy_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.debug(f"✅ {candidate.stock_code} 실제 매수 시간 조회 성공: {actual_buy_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 return
 
             # 2. 실제 매수 기록을 찾지 못한 경우에만 추정 시간 사용 (폴백)

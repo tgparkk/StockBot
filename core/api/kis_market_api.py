@@ -755,7 +755,7 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
     }
 
     try:
-        logger.info("💰 주식잔고조회 API 호출")
+        logger.debug("💰 주식잔고조회 API 호출")
         res = kis._url_fetch(url, tr_id, tr_cont, params)
 
         if res and res.isOK():
@@ -783,13 +783,13 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
                     'raw_summary': summary  # 원본 데이터 보관
                 }
 
-                logger.info(f"✅ 계좌요약: 💰매수가능={account_summary['dnca_tot_amt']:,}원, "
+                logger.debug(f"✅ 계좌요약: 💰매수가능={account_summary['dnca_tot_amt']:,}원, "
                            f"총평가액={account_summary['tot_evlu_amt']:,}원, "
                            f"평가손익={account_summary['evlu_pfls_smtl_amt']:+,}원")
 
             if output1_data:
                 balance_df = pd.DataFrame(output1_data)
-                logger.info(f"✅ 주식잔고조회 성공: {len(balance_df)}개 종목")
+                logger.debug(f"✅ 주식잔고조회 성공: {len(balance_df)}개 종목")
                 return balance_df, account_summary
             else:
                 logger.info("📊 보유 종목 없음")
@@ -873,7 +873,7 @@ def get_account_balance() -> Optional[Dict]:
             'inquiry_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         })
 
-        logger.info(f"💰 계좌요약: {len(stocks)}개 종목, 총 {total_value:,}원, "
+        logger.debug(f"💰 계좌요약: {len(stocks)}개 종목, 총 {total_value:,}원, "
                    f"손익 {total_profit_loss:+,}원 ({base_info['total_profit_loss_rate']:+.2f}%), "
                    f"💰매수가능={base_info['available_amount']:,}원")
 

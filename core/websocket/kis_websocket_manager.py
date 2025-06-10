@@ -395,7 +395,7 @@ class KISWebSocketManager:
             if not self.subscription_manager.can_subscribe(stock_code):
                 current_count = self.subscription_manager.get_subscription_count()
                 max_count = self.subscription_manager.MAX_STOCKS
-                logger.warning(f"❌ 구독 불가 - 한계 도달: {current_count}/{max_count} (종목: {stock_code})")
+                #logger.warning(f"❌ 구독 불가 - 한계 도달: {current_count}/{max_count} (종목: {stock_code})")
                 return False
 
             # 새로운 구독 시도
