@@ -40,7 +40,7 @@ class MarketScanner:
         self.korea_tz = candle_trade_manager.korea_tz
 
         self._last_scan_time: Optional[datetime] = None
-        self._scan_interval = 60  # 1분
+        self._scan_interval = 30  # 30초
 
         logger.info("✅ MarketScanner 초기화 완료")
 

@@ -56,7 +56,7 @@ class CandleTradeManager:
 
         # 내부 상태
         self._last_scan_time: Optional[datetime] = None  # datetime 타입으로 명시
-        self._scan_interval = 60  # 1분
+        self._scan_interval = 30  # 30초
         self.is_running = False
 
         # 실행 상태
@@ -67,11 +67,12 @@ class CandleTradeManager:
 
         # ========== 설정값 ==========
         self.config = {
-            # 기본 스캔 설정
-            'scan_interval_seconds': 60,      # 1분마다 스캔
-            'max_positions': 15,                # 최대 포지션 수
-            'max_scan_stocks': 50,              # 스캔할 최대 종목 수
-            'risk_per_trade': 0.02,           # 거래당 리스크 2%
+            # 🆕 캔들패턴 최적화 스캔 설정
+            'scan_interval_seconds': 1800,     # 🎯 30분마다 새로운 종목 스캔 (일봉 특성 반영)
+            'signal_evaluation_interval': 30,  # 🎯 30초마다 기존 종목 신호 재평가
+            'max_positions': 15,               # 최대 포지션 수
+            'max_scan_stocks': 50,             # 스캔할 최대 종목 수
+            'risk_per_trade': 0.02,            # 거래당 리스크 2%
             'pattern_confidence_threshold': 0.6,  # 패턴 신뢰도 임계값
             'volume_threshold': 1.5,           # 거래량 임계값
 
@@ -97,46 +98,93 @@ class CandleTradeManager:
             'base_priority_multiplier': 0.5,   # 기본 우선순위 배수
             'max_single_investment_ratio': 0.4, # 단일 종목 최대 투자 비율 (40%)
 
-            # 리스크 관리 설정 (캔들패턴에 맞게 조정)
-            'max_position_size_pct': 30,       # 최대 포지션 크기 (%)
-            'default_stop_loss_pct': 2.0,      # 기본 손절 비율 (%) - 2%로 조정
-            'default_target_profit_pct': 2.0,  # 기본 목표 수익률 (%) - 2%로 조정 (캔들패턴은 더 큰 목표)
-            'max_holding_hours': 48,           # 최대 보유 시간 - 48시간(2일)로 확장
+            # 🎯 캔들패턴 최적화 리스크 관리 설정
+            'max_position_size_pct': 25,       # 최대 포지션 크기 (%) - 25%로 조정
+            'default_stop_loss_pct': 2.5,      # 기본 손절 비율 (%) - 2.5%로 조정
+            'default_target_profit_pct': 3.0,  # 기본 목표 수익률 (%) - 3%로 상향
+            'max_holding_hours': 72,           # 최대 보유 시간 - 72시간(3일)로 확장
 
-            # 🆕 최소 보유시간 설정 (캔들패턴 전략에 맞게 하루 기준)
-            'min_holding_minutes': 1440,       # 최소 보유시간 24시간(1440분) - 캔들패턴은 최소 하루
-            'emergency_stop_loss_pct': 5.0,    # 긴급 손절 기준 (최소 보유시간 무시) - 5%로 확대
+            # 🎯 캔들패턴 최적화 최소 보유시간 설정
+            'min_holding_minutes': 1440,       # 최소 보유시간 24시간(1440분) - 일봉 패턴 특성
+            'emergency_stop_loss_pct': 6.0,    # 긴급 손절 기준 - 6%로 확대 (패턴 무효화)
             'min_holding_override_conditions': {
-                'high_profit_target': 3.0,     # 3% 이상 수익시 즉시 매도 허용
+                'high_profit_target': 4.0,     # 🎯 4% 이상 수익시 즉시 매도 허용 (목표 상향)
                 'market_crash': -7.0,          # 시장 급락시 (-7%) 최소시간 무시
                 'individual_limit_down': -15.0, # 개별 종목 큰 하락시 (-15%) 즉시 매도
+                'pattern_reversal': True,       # 🆕 패턴 반전 감지시 최소시간 무시
             },
 
-            # 패턴별 세부 목표 설정 (캔들패턴 이론에 맞게 하루 이상 보유)
+            # 🎯 캔들패턴별 최적화 세부 목표 설정
             'pattern_targets': {
-                'hammer': {'target': 3.0, 'stop': 2.0, 'max_hours': 48, 'min_minutes': 1440},           # 망치형: 최소 1일
-                'inverted_hammer': {'target': 2.5, 'stop': 2.0, 'max_hours': 36, 'min_minutes': 1440},  # 역망치형: 최소 1일
-                'bullish_engulfing': {'target': 3.0, 'stop': 2.5, 'max_hours': 48, 'min_minutes': 1440}, # 장악형: 최소 1일
-                'morning_star': {'target': 3.25, 'stop': 2.5, 'max_hours': 72, 'min_minutes': 1440},     # 샛별형: 최소 1일 (강한 패턴)
-                'rising_three': {'target': 3.5, 'stop': 3.0, 'max_hours': 96, 'min_minutes': 1440},    # 삼법형: 최소 1일 (지속성 패턴)
-                'doji': {'target': 2.0, 'stop': 1.5, 'max_hours': 24, 'min_minutes': 720},             # 도지: 최소 12시간 (신중한 패턴)
+                # 🔨 망치형 계열 (반전 신호)
+                'hammer': {
+                    'target': 3.5, 'stop': 2.5, 'max_hours': 48, 'min_minutes': 1440,
+                    'description': '망치형: 강한 매수 신호, 적정 보유'
+                },
+                'inverted_hammer': {
+                    'target': 3.0, 'stop': 2.5, 'max_hours': 36, 'min_minutes': 1440,
+                    'description': '역망치형: 중간 신호, 조심스러운 접근'
+                },
+
+                # 🏛️ 장악형 계열 (강력한 신호)
+                'bullish_engulfing': {
+                    'target': 4.0, 'stop': 2.5, 'max_hours': 60, 'min_minutes': 1440,
+                    'description': '상승장악형: 매우 강한 신호, 적극적 목표'
+                },
+                'bearish_engulfing': {
+                    'target': 0.0, 'stop': 1.0, 'max_hours': 6, 'min_minutes': 60,
+                    'description': '하락장악형: 매도 신호, 빠른 청산'
+                },
+
+                # ⭐ 별형 계열 (최고 신뢰도)
+                'morning_star': {
+                    'target': 4.5, 'stop': 2.5, 'max_hours': 96, 'min_minutes': 1440,
+                    'description': '샛별형: 최고 신뢰도, 큰 목표와 긴 보유'
+                },
+                'evening_star': {
+                    'target': 0.0, 'stop': 1.0, 'max_hours': 6, 'min_minutes': 60,
+                    'description': '저녁별형: 강한 매도 신호, 즉시 청산'
+                },
+
+                # 📈 추세 지속형 (장기 보유)
+                'rising_three_methods': {
+                    'target': 5.0, 'stop': 3.5, 'max_hours': 120, 'min_minutes': 2880,  # 2일 최소
+                    'description': '상승삼법: 추세 지속, 가장 큰 목표와 긴 보유'
+                },
+                'falling_three_methods': {
+                    'target': 0.0, 'stop': 1.5, 'max_hours': 12, 'min_minutes': 120,
+                    'description': '하락삼법: 하락 지속, 빠른 청산'
+                },
+
+                # ✚ 도지형 (중립/전환)
+                'doji': {
+                    'target': 2.0, 'stop': 1.5, 'max_hours': 12, 'min_minutes': 360,   # 6시간 최소
+                    'description': '도지: 중립 신호, 짧은 보유와 작은 목표'
+                },
             },
 
-            # 시간 기반 청산 설정 (캔들패턴에 맞게 조정)
+            # 🎯 캔들패턴 최적화 시간 기반 청산 설정
             'time_exit_rules': {
-                'profit_exit_hours': 24,        # 24시간 후 수익중이면 청산 고려
-                'min_profit_for_time_exit': 2.0,  # 시간 청산 최소 수익률 2%
+                'profit_exit_hours': 36,        # 🎯 36시간 후 수익중이면 청산 고려 (1.5일)
+                'min_profit_for_time_exit': 2.5,  # 시간 청산 최소 수익률 2.5%
                 'market_close_exit_minutes': 30,  # 장 마감 30분 전 청산
-                'overnight_avoid': False,      # 오버나이트 포지션 허용 (캔들패턴은 하루 이상 보유)
+                'overnight_avoid': False,      # 오버나이트 포지션 허용 (캔들패턴 특성)
+                'weekend_gap_risk': True,      # 🆕 주말 갭 리스크 고려
+                'pattern_strength_multiplier': { # 🆕 패턴 강도별 시간 조정
+                    'high': 1.5,    # 강한 패턴은 1.5배 더 보유
+                    'medium': 1.0,  # 보통 패턴은 기본 시간
+                    'low': 0.7      # 약한 패턴은 0.7배로 단축
+                }
             },
 
             # 🆕 매수체결시간 기반 캔들전략 설정
             'execution_time_strategy': {
                 'use_execution_time': True,     # 매수체결시간 활용 여부
                 'min_holding_from_execution': 1440,  # 체결시간 기준 최소 보유시간 (24시간)
-                'early_morning_bonus_hours': 2,      # 장 시작 2시간 내 매수시 추가 보유시간
-                'late_trading_penalty_hours': -4,    # 장 종료 전 매수시 보유시간 단축
+                'early_morning_bonus_hours': 4,      # 🎯 장 시작 4시간 내 매수시 추가 보유시간
+                'late_trading_penalty_hours': -6,    # 🎯 장 종료 전 매수시 보유시간 단축
                 'weekend_gap_consideration': True,    # 주말 갭 고려
+                'friday_afternoon_caution': True,    # 🆕 금요일 오후 매수 주의
             },
 
             # 🆕 투자금액 계산 설정
@@ -148,6 +196,43 @@ class CandleTradeManager:
                 'max_portfolio_limit': 3_000_000, # 평가액 기준 최대 제한 (300만원)
                 'default_investment': 1_000_000,  # 기본 투자 금액 (100만원)
                 'min_investment': 100_000,        # 최소 투자 금액 (10만원)
+            },
+
+            # 🎯 장중 데이터 보조 분석 설정 (최적화)
+            'intraday_analysis': {
+                'enabled': True,                   # 장중 분석 활성화 여부
+                'minute_period': 5,                # 분봉 주기 (분)
+                'lookback_candles': 20,            # 분석할 분봉 개수
+                'volume_surge_threshold': 2.0,     # 거래량 급증 임계값 (배수)
+                'trend_threshold_pct': 0.3,        # 🎯 추세 판단 임계값 0.3% (민감도 조정)
+                'support_resistance_pct': 1.0,     # 지지/저항선 근접 기준 (%)
+                'timing_score_weight': 0.2,        # 🎯 장중 타이밍 점수 가중치 상향
+                'use_for_entry_only': False,       # 진입/청산 모두 사용
+                'excluded_hours': [9, 15],         # 제외할 시간대 (장 시작/마감)
+                'excluded_minutes_start': 15,      # 🎯 장 시작 후 15분 제외 (변동성 대기)
+                'excluded_minutes_end': 15,        # 🎯 장 마감 전 15분 제외 (급변동 회피)
+                'pattern_confirmation_mode': True, # 🆕 패턴 확인용 모드 (보조 역할 강화)
+            },
+
+            # 🆕 스캔 전략 최적화 설정
+            'scan_strategy': {
+                'initial_scan_on_start': True,     # 시작시 초기 스캔
+                'pattern_scan_intervals': {        # 시간별 스캔 빈도
+                    '09:00-10:00': 900,  # 장 시작 1시간: 15분 간격
+                    '10:00-14:00': 1800, # 장중 4시간: 30분 간격
+                    '14:00-15:30': 900,  # 장 마감 1.5시간: 15분 간격
+                },
+                'special_scan_triggers': {         # 특별 스캔 조건
+                    'market_volatility_high': True,   # 시장 변동성 높을 때
+                    'volume_surge_detected': True,    # 거래량 급증 감지시
+                    'new_pattern_formation': True,    # 새로운 패턴 형성시
+                },
+                'batch_processing': {
+                    'enabled': True,
+                    'batch_size': 5,              # 배치 크기
+                    'parallel_processing': True,   # 병렬 처리
+                    'batch_interval_ms': 300,     # 배치 간 간격
+                }
             },
         }
 
@@ -512,7 +597,7 @@ class CandleTradeManager:
     # ========== 메인 실행 루프 ==========
 
     async def start_trading(self):
-        """캔들 기반 매매 시작"""
+        """🕯️ 캔들 기반 매매 시작 - 패턴의 특성에 맞춘 최적화"""
         try:
             logger.info("🕯️ 캔들 기반 매매 시스템 시작")
 
@@ -522,37 +607,54 @@ class CandleTradeManager:
             # 거래일 초기화
             await self._initialize_trading_day()
 
+            # 🆕 캔들패턴 전용 스캔 타이머 초기화
+            self._last_pattern_scan_time = None
+            self._pattern_scan_interval = 1800  # 30분마다 새로운 종목 스캔 (캔들패턴 특성 반영)
+            self._signal_evaluation_interval = 30  # 30초마다 기존 종목 재평가
+
+            # 🎯 초기 패턴 스캔 (시작시 한번)
+            logger.info("🔍 초기 캔들패턴 스캔 시작...")
+            await self._scan_and_detect_patterns()
+            self._last_pattern_scan_time = datetime.now()
+            logger.info("✅ 초기 패턴 스캔 완료")
+
             # 메인 트레이딩 루프 시작
             self.running = True
             self._log_status()
 
             while self.running:
                 try:
-                    # 시장 스캔 및 패턴 감지
-                    await self._scan_and_detect_patterns()
+                    current_time = datetime.now()
 
-                    # 🆕 주기적 신호 재평가 (모든 _all_stocks 종목 대상)
+                    # 🕯️ 1. 새로운 종목 패턴 스캔 (30분 간격 - 캔들패턴 특성 반영)
+                    if self._should_scan_new_patterns(current_time):
+                        logger.info("🔍 정기 캔들패턴 스캔 시작...")
+                        await self._scan_and_detect_patterns()
+                        self._last_pattern_scan_time = current_time
+                        logger.info("✅ 정기 패턴 스캔 완료")
+
+                    # 🔄 2. 기존 종목 신호 재평가 (30초 간격 - 실시간 모니터링)
                     await self._periodic_signal_evaluation()
 
-                    # 진입 기회 평가 = 매수 준비 종목 평가
+                    # 💰 3. 진입 기회 평가 및 매수 실행
                     await self._evaluate_entry_opportunities()
 
-                    # 기존 포지션 관리 - 매도 시그널 체크
+                    # 📈 4. 기존 포지션 관리 - 매도 시그널 체크
                     await self._manage_existing_positions()
 
-                    # 🆕 미체결 주문 관리 (1분마다)
+                    # 🧹 5. 미체결 주문 관리 (1분마다)
                     if hasattr(self, '_last_stale_check_time'):
-                        if (datetime.now() - self._last_stale_check_time).total_seconds() >= 60:
+                        if (current_time - self._last_stale_check_time).total_seconds() >= 60:
                             await self.check_and_cancel_stale_orders()
-                            self._last_stale_check_time = datetime.now()
+                            self._last_stale_check_time = current_time
                     else:
-                        self._last_stale_check_time = datetime.now()
+                        self._last_stale_check_time = current_time
 
-                    # 상태 업데이트
+                    # 📊 6. 상태 업데이트
                     self._log_status()
 
-                    # 스캔 간격 대기 (기본 30초)
-                    await asyncio.sleep(self.scan_interval)
+                    # ⏰ 7. 대기 시간 (기본 30초 - 기존 종목 모니터링 중심)
+                    await asyncio.sleep(self._signal_evaluation_interval)
 
                 except Exception as e:
                     logger.error(f"매매 루프 오류: {e}")
@@ -561,6 +663,42 @@ class CandleTradeManager:
         except Exception as e:
             logger.error(f"캔들 매매 시작 오류: {e}")
             self.running = False
+
+    def _should_scan_new_patterns(self, current_time: datetime) -> bool:
+        """🕯️ 새로운 패턴 스캔 필요 여부 판단 (캔들패턴 특성 반영)"""
+        try:
+            if not self._last_pattern_scan_time:
+                return True  # 첫 스캔
+
+            # 기본 시간 간격 체크 (30분)
+            time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
+            if time_elapsed >= self._pattern_scan_interval:
+                return True
+
+            # 🎯 특별한 상황에서 추가 스캔 (캔들패턴 거래에 중요한 시점들)
+            current_hour = current_time.hour
+            current_minute = current_time.minute
+
+            # 장 시작 후 30분 (09:30) - 갭 상황 체크
+            if current_hour == 9 and current_minute == 30 and time_elapsed >= 600:  # 10분 이상 경과
+                logger.info("🌅 장 시작 후 30분 - 추가 패턴 스캔")
+                return True
+
+            # 점심시간 후 (13:00) - 오후 패턴 변화 체크
+            if current_hour == 13 and current_minute == 0 and time_elapsed >= 600:
+                logger.info("🌞 점심시간 후 - 추가 패턴 스캔")
+                return True
+
+            # 장 마감 1시간 전 (14:30) - 마지막 기회 체크
+            if current_hour == 14 and current_minute == 30 and time_elapsed >= 600:
+                logger.info("🌇 장 마감 1시간 전 - 마지막 패턴 스캔")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"패턴 스캔 판단 오류: {e}")
+            return False
 
     def stop_trading(self):
         """캔들 전략 거래 중지"""
@@ -647,11 +785,11 @@ class CandleTradeManager:
     def _should_time_exit(self, position: CandleTradeCandidate) -> bool:
         """시간 청산 조건 체크 (개선된 버전)"""
         try:
-            if not position.performance.entry_time:
+            if not position.performance or not position.performance.entry_time:
                 return False
 
             # 보유 시간 계산
-            holding_time = datetime.now() - position.performance.entry_time
+            holding_time = datetime.now(self.korea_tz) - position.performance.entry_time
             max_holding = timedelta(hours=position.risk_management.max_holding_hours)
 
             # 1. 최대 보유시간 초과시 무조건 청산
@@ -675,7 +813,7 @@ class CandleTradeManager:
             return False
 
         except Exception as e:
-            logger.error(f"시간 청산 체크 오류: {e}")
+            logger.error(f"❌ {position.stock_code} 시간 청산 체크 오류: {e}")
             return False
 
     def _create_holding_candidate_object(self, stock_code: str, stock_name: str, current_price: float) -> CandleTradeCandidate:

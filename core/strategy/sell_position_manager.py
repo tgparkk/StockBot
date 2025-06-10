@@ -239,11 +239,11 @@ class SellPositionManager:
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
         """🆕 패턴별 시간 청산 조건 체크"""
         try:
-            if not position.performance.entry_time:
+            if not position.performance or not position.performance.entry_time:
                 return False
 
             # 보유 시간 계산
-            holding_time = datetime.now() - position.performance.entry_time
+            holding_time = datetime.now(self.manager.korea_tz) - position.performance.entry_time
             max_holding = timedelta(hours=max_hours)
 
             # 패턴별 최대 보유시간 초과시 청산
@@ -267,7 +267,7 @@ class SellPositionManager:
             return False
 
         except Exception as e:
-            logger.error(f"패턴별 시간 청산 체크 오류: {e}")
+            logger.error(f"❌ {position.stock_code} 패턴별 시간 청산 체크 오류: {e}")
             return False
 
     async def _execute_exit(self, position: CandleTradeCandidate, exit_price: float, reason: str) -> bool:
