@@ -1011,7 +1011,7 @@ class CandlePatternDetector:
     def _calculate_momentum_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """🆕 모멘텀 지표 계산"""
         try:
-                        # 1. RSI (Relative Strength Index) - 14일 기준
+            # 1. RSI (Relative Strength Index) - 14일 기준
             delta = df['close'].diff()
             gain = delta.copy()
             loss = delta.copy()
