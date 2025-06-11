@@ -90,7 +90,7 @@ class CandleStockManager:
                 'status': candidate.status.value
             })
 
-            logger.info(f"✅ 새 종목 추가: {stock_code}({candidate.stock_name}) - {candidate.get_signal_summary()}")
+            logger.debug(f"✅ 새 종목 추가: {stock_code}({candidate.stock_name}) - {candidate.get_signal_summary()}")
             return True
 
         except Exception as e:
@@ -169,8 +169,8 @@ class CandleStockManager:
 
     def get_stocks_by_pattern(self, pattern: PatternType) -> List[CandleTradeCandidate]:
         """패턴별 종목 조회"""
-        return [candidate for candidate in self._all_stocks.values() 
-                for pattern_info in candidate.detected_patterns 
+        return [candidate for candidate in self._all_stocks.values()
+                for pattern_info in candidate.detected_patterns
                 if pattern_info.pattern_type == pattern]
 
     def get_top_buy_candidates(self, limit: int = 10) -> List[CandleTradeCandidate]:
@@ -181,10 +181,10 @@ class CandleStockManager:
                 candidate for candidate in self._all_stocks.values()
                 if candidate.is_ready_for_entry() and candidate.trade_signal in [TradeSignal.STRONG_BUY, TradeSignal.BUY]
             ]
-            
+
             # 진입 우선순위 순으로 정렬 (높은 순)
             candidates.sort(key=lambda c: c.entry_priority, reverse=True)
-            
+
             return candidates[:limit]
 
         except Exception as e:
@@ -199,10 +199,10 @@ class CandleStockManager:
                 candidate for candidate in self._all_stocks.values()
                 if candidate.trade_signal in [TradeSignal.SELL, TradeSignal.STRONG_SELL]
             ]
-            
+
             # 신호 강도 순으로 정렬 (높은 순)
             candidates.sort(key=lambda c: c.signal_strength, reverse=True)
-            
+
             return candidates[:limit]
 
         except Exception as e:
@@ -325,12 +325,12 @@ class CandleStockManager:
             # 🎯 _all_stocks에서 직접 통계 계산
             status_counts = {}
             signal_counts = {}
-            
+
             for candidate in self._all_stocks.values():
                 # 상태별 카운트
                 status_key = candidate.status.value
                 status_counts[status_key] = status_counts.get(status_key, 0) + 1
-                
+
                 # 신호별 카운트
                 signal_key = candidate.trade_signal.value
                 signal_counts[signal_key] = signal_counts.get(signal_key, 0) + 1
