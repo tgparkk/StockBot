@@ -10,6 +10,7 @@ from datetime import datetime
 from .async_data_logger import get_async_logger
 from .order_execution_manager import OrderExecutionManager
 from ..trading.trading_manager import TradingManager
+from collections import defaultdict
 
 logger = setup_logger(__name__)
 
@@ -67,6 +68,15 @@ class TradeExecutor:
         # 중복 신호 방지
         self.last_signals = {}
         self.signal_cooldown = 300  # 5분
+
+        # 🆕 전략별 실행 통계
+        self.strategy_stats = defaultdict(lambda: {
+            'buy_orders': 0, 'sell_orders': 0, 'success_rate': 0.0, 'total_profit': 0.0
+        })
+
+        # 🎯 거래 기록 정책: 체결통보 시점에만 저장 (주문 제출시 저장 안함)
+        logger.info("📋 거래 기록 정책: 체결통보(웹소켓 NOTICE) 시점에만 저장")
+        logger.info("   💰 정확한 체결가/수량으로 기록, 주문 실패시 기록 안함")
 
         logger.info("✅ TradeExecutor 초기화 완료 (간소화 버전)")
 
@@ -142,16 +152,13 @@ class TradeExecutor:
             if order_result is not None and isinstance(order_result, str):
                 order_id = order_result if order_result.strip() else f"order_{int(datetime.now().timestamp() * 1000)}"
 
-                # 📝 거래 기록 저장
-                self._record_buy_trade(stock_code, buy_quantity, buy_price, strategy, signal, {'order_no': order_id})
-
-                # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록
+                # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록 (체결시 거래 기록 저장됨)
                 self.execution_manager.add_pending_order(
                     order_id=order_id, stock_code=stock_code, order_type='BUY',
                     quantity=buy_quantity, price=buy_price, strategy_type=strategy
                 )
 
-                logger.info(f"✅ 매수 주문 성공: {stock_code} (주문번호: {order_id})")
+                logger.info(f"✅ 매수 주문 성공: {stock_code} (주문번호: {order_id}) - 체결 대기 중")
                 return TradeResult(
                     success=True, stock_code=stock_code, order_type='BUY',
                     quantity=buy_quantity, price=buy_price, total_amount=total_amount,
@@ -163,7 +170,7 @@ class TradeExecutor:
                     error_code = order_result.get('error_code', 'UNKNOWN')
                     error_message = order_result.get('error_message', '알 수 없는 오류')
                     detailed_error = order_result.get('detailed_error', f"{error_code}: {error_message}")
-                    
+
                     # 🎯 주문가능금액 초과 오류 특별 처리
                     if 'APBK0952' in error_code or '주문가능금액을 초과' in error_message:
                         logger.error(f"💰 매수 주문 실패: {stock_code} - 주문가능금액 부족 ({detailed_error})")
@@ -171,7 +178,7 @@ class TradeExecutor:
                     else:
                         logger.error(f"❌ 매수 주문 실패: {stock_code} - {detailed_error}")
                         failure_message = f"주문 실패: {detailed_error}"
-                        
+
                 else:
                     # 기존 방식 (None이나 기타 타입)
                     error_reason = f"TradingManager 반환값: {order_result} (타입: {type(order_result)})"
@@ -248,22 +255,13 @@ class TradeExecutor:
             if sell_result and isinstance(sell_result, str):  # 주문번호가 반환되면 성공
                 order_id = sell_result
 
-                # 📝 거래 기록 저장 (임시 포지션 정보)
-                position = {
-                    'strategy_type': strategy,
-                    'stock_name': stock_code,
-                    'buy_price': sell_price
-                }
-                sell_result_dict = {'order_no': order_id, 'status': 'pending'}
-                self._record_sell_trade(stock_code, sell_quantity, sell_price, position, signal, sell_result_dict)
-
-                # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록
+                # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록 (체결시 거래 기록 저장됨)
                 self.execution_manager.add_pending_order(
                     order_id=order_id, stock_code=stock_code, order_type='SELL',
                     quantity=sell_quantity, price=sell_price, strategy_type=strategy
                 )
 
-                logger.info(f"✅ 매도 주문 성공: {stock_code} (주문번호: {order_id})")
+                logger.info(f"✅ 매도 주문 성공: {stock_code} (주문번호: {order_id}) - 체결 대기 중")
                 return TradeResult(
                     success=True, stock_code=stock_code, order_type='SELL',
                     quantity=sell_quantity, price=sell_price, total_amount=total_amount,
@@ -275,7 +273,7 @@ class TradeExecutor:
                     error_code = sell_result.get('error_code', 'UNKNOWN')
                     error_message = sell_result.get('error_message', '알 수 없는 오류')
                     detailed_error = sell_result.get('detailed_error', f"{error_code}: {error_message}")
-                    
+
                     logger.error(f"❌ 매도 주문 실패: {stock_code} - {detailed_error}")
                     failure_message = f"매도 실패: {detailed_error}"
                 else:
@@ -337,10 +335,10 @@ class TradeExecutor:
         try:
             # 0.2% 프리미엄 적용
             target_price = int(current_price * (1 + self.buy_premium))
-            
+
             # 틱 단위 조정
             final_price = self._adjust_to_tick_size(target_price)
-            
+
             # 최대 5% 제한 (현재가의 105% 이하)
             max_buy_price = int(current_price * 1.05)
             final_price = min(final_price, max_buy_price)
@@ -357,10 +355,10 @@ class TradeExecutor:
         try:
             # 0.5% 할인 적용
             target_price = int(current_price * (1 - self.sell_discount))
-            
+
             # 틱 단위 조정
             final_price = self._adjust_to_tick_size(target_price)
-            
+
             # 최소 95% 보장 (현재가의 95% 이상)
             min_sell_price = int(current_price * 0.95)
             final_price = max(final_price, min_sell_price)
@@ -377,16 +375,16 @@ class TradeExecutor:
         try:
             # 안전 여유분 적용 (90%만 사용)
             safe_cash = int(available_cash * 0.9)
-            
+
             if safe_cash < self.min_investment_amount:
                 return 0
 
             # 기본 투자금액 사용
             target_amount = min(self.base_investment_amount, safe_cash, self.max_investment_amount)
-            
+
             # 수량 계산
             quantity = int(target_amount // buy_price) if buy_price > 0 else 0
-            
+
             # 최소 수량 체크
             if quantity * buy_price < self.min_investment_amount:
                 min_quantity = max(1, int(self.min_investment_amount // buy_price))
@@ -435,125 +433,29 @@ class TradeExecutor:
                     return int(holding.get('hldg_qty', 0))
                 if holding.get('stock_code') == stock_code:
                     return int(holding.get('quantity', 0))
-            
+
             return 0
 
         except Exception as e:
             logger.error(f"❌ 보유 수량 확인 오류 ({stock_code}): {e}")
             return 0
 
+    # ========== 🚫 DEPRECATED: 주문시 거래 기록 저장 함수들 ==========
+    # 체결통보 시점(OrderExecutionManager)에서만 거래 기록을 저장하므로 더 이상 사용하지 않음
+
     def _record_buy_trade(self, stock_code: str, quantity: int, buy_price: int,
                          strategy: str, signal: Dict, order_result: Dict):
-        """매수 거래 기록 저장"""
-        try:
-            stock_name = stock_code  # 실제로는 종목명 조회 가능
-            total_amount = quantity * buy_price
-            reason = signal.get('reason', f'{strategy} 신호')
-            strength = signal.get('strength', 0.5)
-
-            trade_id = self.trade_db.record_buy_trade(
-                stock_code=stock_code,
-                stock_name=stock_name,
-                quantity=quantity,
-                price=buy_price,
-                total_amount=total_amount,
-                strategy_type=strategy,
-                order_id=order_result.get('order_no', ''),
-                status='SUCCESS',
-                market_conditions={
-                    'current_price': signal.get('price', buy_price),
-                    'signal_strength': strength,
-                    'reason': reason
-                },
-                notes=f"신호강도: {strength:.2f}, 사유: {reason}"
-            )
-
-            logger.info(f"💾 매수 기록 저장 완료 (ID: {trade_id})")
-
-            # 선정된 종목과 거래 연결
-            if trade_id > 0:
-                try:
-                    self.trade_db.link_trade_to_selected_stock(stock_code, trade_id)
-                except Exception as e:
-                    logger.error(f"선정 종목-거래 연결 오류: {e}")
-
-        except Exception as e:
-            logger.error(f"💾 매수 기록 저장 실패: {e}")
+        """🚫 DEPRECATED: 매수 거래 기록 저장 (체결통보 시점에서만 저장하도록 변경)"""
+        logger.debug(f"⚠️ DEPRECATED: _record_buy_trade 호출됨 - 체결통보 시점에서 저장됩니다")
+        # 주문 제출시에는 기록하지 않고, 체결통보(OrderExecutionManager)에서만 기록
+        pass
 
     def _record_sell_trade(self, stock_code: str, quantity: int, sell_price: int,
                           position: Dict, signal: Dict, sell_result: Dict):
-        """매도 거래 기록 저장"""
-        try:
-            # 매수 거래 ID 찾기
-            buy_trade_id = self.trade_db.find_buy_trade_for_sell(stock_code, quantity)
-
-            # 🆕 포지션에서 전략 타입 직접 사용 (더 이상 복원 로직 불필요)
-            strategy_type = position.get('strategy_type', 'unknown')
-
-            # 수익률 계산
-            buy_price = position.get('buy_price', sell_price)
-            profit_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
-            sell_type = "수동매도"
-            condition_reason = signal.get('reason', '매도 신호')
-
-            trade_id = self.trade_db.record_sell_trade(
-                stock_code=stock_code,
-                stock_name=position.get('stock_name', stock_code),
-                quantity=quantity,
-                price=sell_price,
-                total_amount=quantity * sell_price,
-                strategy_type=strategy_type,  # 🆕 포지션의 전략 타입 직접 사용
-                buy_trade_id=buy_trade_id,
-                order_id=sell_result.get('order_no', ''),
-                status='SUCCESS',
-                market_conditions={
-                    'current_price': signal.get('price', sell_price),
-                    'profit_rate': profit_rate,
-                    'sell_reason': f"{sell_type}: {condition_reason}"
-                },
-                notes=f"매도사유: {sell_type}, 조건: {condition_reason}, 전략: {strategy_type}"
-            )
-            logger.info(f"💾 매도 기록 저장 완료 - 전략: {strategy_type} (ID: {trade_id})")
-
-        except Exception as e:
-            logger.error(f"💾 매도 기록 저장 실패: {e}")
-
-    def _record_auto_sell_trade(self, stock_code: str, quantity: int, sell_price: int,
-                               reason: str, sell_signal: Dict, order_result: str):
-        """자동 매도 거래 기록 저장"""
-        try:
-            # 매수 거래 ID 찾기
-            buy_trade_id = self.trade_db.find_buy_trade_for_sell(stock_code, quantity)
-
-            # 🆕 매도 신호에서 전략 타입 직접 사용 (포지션 매니저에서 전달됨)
-            strategy_type = sell_signal.get('strategy_type', 'unknown')
-
-            # 수익률 계산
-            current_price = sell_signal.get('current_price', sell_price)
-            buy_price = sell_signal.get('buy_price', sell_price)
-            profit_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
-
-            trade_id = self.trade_db.record_sell_trade(
-                stock_code=stock_code,
-                stock_name=sell_signal.get('stock_name', stock_code),
-                quantity=quantity,
-                price=sell_price,
-                total_amount=quantity * sell_price,
-                strategy_type=strategy_type,  # 🆕 신호의 전략 타입 직접 사용
-                buy_trade_id=buy_trade_id,
-                order_id=order_result,
-                status='SUCCESS',
-                market_conditions={
-                    'current_price': current_price,
-                    'profit_rate': profit_rate,
-                    'sell_reason': f"자동매도: {reason}"
-                },
-                notes=f"자동매도 - {reason}, 현재가: {current_price:,}원, 전략: {strategy_type}"
-            )
-            logger.info(f"💾 자동매도 기록 저장 완료 - 전략: {strategy_type} (ID: {trade_id})")
-
-        except Exception as e:
-            logger.error(f"💾 자동매도 기록 저장 실패: {e}")
+        """🚫 DEPRECATED: 매도 거래 기록 저장 (체결통보 시점에서만 저장하도록 변경)"""
+        logger.debug(f"⚠️ DEPRECATED: _record_sell_trade 호출됨 - 체결통보 시점에서 저장됩니다")
+        # 주문 제출시에는 기록하지 않고, 체결통보(OrderExecutionManager)에서만 기록
+        pass
 
     def get_execution_stats(self) -> Dict:
         """주문 실행 통계"""
