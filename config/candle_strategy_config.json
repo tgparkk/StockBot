@@ -28,7 +28,7 @@
     "min_holding_minutes": 1440,
     "emergency_stop_loss_pct": 6.0,
     "min_holding_override_conditions": {
-        "high_profit_target": 4.0,
+        "high_profit_target": 7.0,
         "market_crash": -7.0,
         "individual_limit_down": -15.0,
         "pattern_reversal": true
