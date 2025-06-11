@@ -100,7 +100,7 @@ class CandlePatternDetector:
 
             if filtered_patterns:
                 pattern_names = [p.pattern_type.value for p in filtered_patterns]
-                # logger.info(f"🎯 {stock_code} 패턴 감지: {', '.join(pattern_names)}")
+                logger.debug(f"🎯 {stock_code} 패턴 감지: {', '.join(pattern_names)}")
             else:
                 logger.debug(f"❌ {stock_code} 패턴 감지 실패 - 조건을 만족하는 패턴 없음")
 

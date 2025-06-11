@@ -16,6 +16,45 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+def calculate_business_hours_analyzer(start_time: datetime, end_time: datetime) -> float:
+    """🕒 주말을 제외한 영업시간 계산 (시간 단위) - candle_analyzer용"""
+    try:
+        # 시작시간이 종료시간보다 늦으면 0 반환
+        if start_time >= end_time:
+            return 0.0
+
+        total_hours = 0.0
+        current = start_time
+
+        # 하루씩 계산하면서 주말 제외
+        while current < end_time:
+            # 현재 날짜의 요일 확인 (0=월요일, 6=일요일)
+            weekday = current.weekday()
+
+            # 주말(토요일=5, 일요일=6) 제외
+            if weekday < 5:  # 월~금요일만
+                # 하루의 끝 시간 계산
+                day_end = current.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+                # 이 날에서 계산할 시간 범위
+                day_start = current
+                day_finish = min(day_end, end_time)
+
+                # 이 날의 시간 추가
+                day_hours = (day_finish - day_start).total_seconds() / 3600
+                total_hours += day_hours
+
+            # 다음 날로 이동
+            current = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        return total_hours
+
+    except Exception as e:
+        logger.error(f"❌ 영업시간 계산 오류: {e}")
+        # 오류시 기존 방식으로 폴백
+        return (end_time - start_time).total_seconds() / 3600
+
+
 class CandleAnalyzer:
     """캔들 패턴 및 기술적 지표 분석 전용 클래스"""
 
@@ -139,14 +178,14 @@ class CandleAnalyzer:
             return {'signal': 'neutral', 'rsi': 50.0, 'trend': 'neutral'}
 
     def analyze_time_conditions(self, candidate: CandleTradeCandidate) -> Dict:
-        """⏰ 시간 기반 조건 분석"""
+        """⏰ 시간 기반 조건 분석 (주말 제외)"""
         try:
             current_time = datetime.now(self.korea_tz)
 
             # 거래 시간 체크
             trading_hours = self._is_trading_time()
 
-            # 보유 시간 분석 (진입한 종목의 경우)
+            # 보유 시간 분석 (진입한 종목의 경우, 주말 제외)
             holding_duration = None
             time_pressure = 'none'
 
@@ -154,12 +193,20 @@ class CandleAnalyzer:
                 candidate.performance and
                 candidate.performance.entry_time):
 
-                holding_duration = current_time - candidate.performance.entry_time
-                max_holding = timedelta(hours=candidate.risk_management.max_holding_hours)
+                entry_time = candidate.performance.entry_time
+                # timezone 통일
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=self.korea_tz)
 
-                if holding_duration >= max_holding * 0.8:  # 80% 경과
+                # 🆕 주말을 제외한 보유시간 계산
+                holding_hours = calculate_business_hours_analyzer(entry_time, current_time)
+                holding_duration = f"{holding_hours:.1f}h (주말제외)"
+
+                max_holding_hours = candidate.risk_management.max_holding_hours
+
+                if holding_hours >= max_holding_hours * 0.8:  # 80% 경과
                     time_pressure = 'high'
-                elif holding_duration >= max_holding * 0.5:  # 50% 경과
+                elif holding_hours >= max_holding_hours * 0.5:  # 50% 경과
                     time_pressure = 'medium'
                 else:
                     time_pressure = 'low'
@@ -177,7 +224,7 @@ class CandleAnalyzer:
             return {
                 'signal': signal,
                 'trading_hours': trading_hours,
-                'holding_duration': str(holding_duration) if holding_duration else None,
+                'holding_duration': holding_duration,
                 'time_pressure': time_pressure
             }
 
@@ -346,7 +393,7 @@ class CandleAnalyzer:
 
             # 🆕 분봉 데이터 조회 (5분봉)
             minute_data = await self._get_minute_candle_data(stock_code, period_minutes=5, count=20)
-            if not minute_data or minute_data.empty:
+            if minute_data is None or minute_data.empty:
                 logger.debug(f"📊 {stock_code} 분봉 데이터 조회 실패")
                 return intraday_analysis
 
@@ -420,24 +467,47 @@ class CandleAnalyzer:
     async def _get_minute_candle_data(self, stock_code: str, period_minutes: int = 5, count: int = 20) -> Optional[Any]:
         """분봉 데이터 조회 (KIS API 활용)"""
         try:
-            # 🚨 주의: 실제 KIS API에서 분봉 데이터 조회하는 함수가 있다면 사용
-            # 현재는 예시 구조만 제공
+            # 🆕 KIS API는 당일 분봉만 제공하고 간격 설정이 제한적임
+            # 현재는 기본 당일 분봉 데이터만 조회 (추후 개선 예정)
+            from ..api.kis_market_api import get_inquire_time_itemchartprice
 
-            # 예시: get_inquire_minute_itemchartprice 같은 API가 있다고 가정
-            # from ..api.kis_market_api import get_inquire_minute_itemchartprice
-            #
-            # minute_data = get_inquire_minute_itemchartprice(
-            #     stock_code=stock_code,
-            #     period_minutes=period_minutes,
-            #     count=count
-            # )
+            logger.debug(f"📊 {stock_code} 당일 분봉 데이터 조회 시작 (최대 {count}개)")
 
-            # 🔧 현재는 None 반환 (실제 API 구현 필요)
-            logger.debug(f"📊 {stock_code} {period_minutes}분봉 데이터 조회 요청 (API 구현 필요)")
-            return None
+            # KIS API 호출 - 당일 분봉 데이터
+            minute_data = get_inquire_time_itemchartprice(
+                output_dv="2",              # 분봉 데이터 배열 (output2)
+                div_code="J",               # 조건시장분류코드 (J: 주식)
+                itm_no=stock_code,          # 입력종목코드
+                input_hour=None,            # 입력시간1 (None시 현재시간)
+                past_data_yn="Y",           # 과거데이터포함여부
+                etc_cls_code=""             # 기타구분코드 (공백)
+            )
+
+            if minute_data is not None and not minute_data.empty:
+                # count 개수만큼 제한
+                limited_data = minute_data.head(count)
+                logger.debug(f"✅ {stock_code} 당일 분봉 데이터 조회 성공: {len(limited_data)}개")
+
+                # 🔍 데이터 구조 확인 (디버깅용)
+                if len(limited_data) > 0:
+                    first_row = limited_data.iloc[0]
+                    # KIS API의 실제 컬럼명 사용
+                    time_info = first_row.get('stck_cntg_hour', first_row.get('stck_bsop_date', 'N/A'))
+                    close_price = first_row.get('stck_clpr', 'N/A')
+                    volume = first_row.get('cntg_vol', first_row.get('acml_vol', 'N/A'))
+
+                    logger.debug(f"📊 첫 번째 분봉 데이터 샘플: 시간={time_info} "
+                               f"종가={close_price}원 거래량={volume}")
+
+                return limited_data
+            else:
+                logger.debug(f"⚠️ {stock_code} 당일 분봉 데이터 조회 결과 없음")
+                return None
 
         except Exception as e:
-            logger.debug(f"분봉 데이터 조회 오류 ({stock_code}): {e}")
+            logger.debug(f"❌ {stock_code} 분봉 데이터 조회 오류: {e}")
+            # 🔧 분봉 데이터 조회 실패시에도 장중 분석은 계속 진행
+            # (일봉 기반 분석으로 폴백 가능)
             return None
 
     def _analyze_minute_trend(self, minute_data: Any, current_price: float) -> str:
@@ -446,8 +516,15 @@ class CandleAnalyzer:
             if minute_data is None or minute_data.empty or len(minute_data) < 5:
                 return 'neutral'
 
-            # 최근 5개 분봉의 종가 추세 확인
-            recent_closes = [float(row.get('close', 0)) for _, row in minute_data.head(5).iterrows()]
+            # 최근 5개 분봉의 종가 추세 확인 (KIS API 컬럼명 사용)
+            recent_closes = []
+            for _, row in minute_data.head(5).iterrows():
+                try:
+                    close_price = float(row.get('stck_clpr', 0))
+                    if close_price > 0:
+                        recent_closes.append(close_price)
+                except (ValueError, TypeError):
+                    continue
 
             if len(recent_closes) < 3:
                 return 'neutral'
@@ -470,9 +547,24 @@ class CandleAnalyzer:
             if minute_data is None or minute_data.empty or len(minute_data) < 10:
                 return False
 
-            # 최근 3개 분봉 vs 이전 7개 분봉 거래량 비교
-            recent_volumes = [int(row.get('volume', 0)) for _, row in minute_data.head(3).iterrows()]
-            previous_volumes = [int(row.get('volume', 0)) for _, row in minute_data.iloc[3:10].iterrows()]
+            # 최근 3개 분봉 vs 이전 7개 분봉 거래량 비교 (KIS API 컬럼명 사용)
+            recent_volumes = []
+            for _, row in minute_data.head(3).iterrows():
+                try:
+                    volume = int(row.get('cntg_vol', row.get('acml_vol', 0)))
+                    if volume > 0:
+                        recent_volumes.append(volume)
+                except (ValueError, TypeError):
+                    continue
+
+            previous_volumes = []
+            for _, row in minute_data.iloc[3:10].iterrows():
+                try:
+                    volume = int(row.get('cntg_vol', row.get('acml_vol', 0)))
+                    if volume > 0:
+                        previous_volumes.append(volume)
+                except (ValueError, TypeError):
+                    continue
 
             if not recent_volumes or not previous_volumes:
                 return False
@@ -1264,32 +1356,54 @@ class CandleAnalyzer:
             return 3.0, 3.0, 24, False
 
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
-        """🆕 패턴별 시간 청산 조건 체크"""
+        """🆕 패턴별 시간 청산 조건 체크 (개선된 버전 + 주말 제외)"""
         try:
             if not position.performance or not position.performance.entry_time:
                 return False
 
-            # 보유 시간 계산
-            holding_time = datetime.now(self.korea_tz) - position.performance.entry_time
-            max_holding = timedelta(hours=max_hours)
+            # 🆕 보유 시간 계산 (주말 제외)
+            current_time = datetime.now(self.korea_tz)
+            entry_time = position.performance.entry_time
 
-            # 패턴별 최대 보유시간 초과시 청산
-            if holding_time >= max_holding:
-                logger.info(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_time}")
+            # timezone 통일
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=self.korea_tz)
+
+            holding_hours = calculate_business_hours_analyzer(entry_time, current_time)
+
+            # 패턴별 최대 보유시간 초과시 청산 (영업일 기준)
+            if holding_hours >= max_hours:
+                logger.info(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_hours:.1f}h (주말제외)")
                 return True
+
+            # 🔧 현재 수익률 재계산 (정확성 보장)
+            current_price = position.current_price
+            entry_price = position.performance.entry_price
+
+            if not entry_price or entry_price <= 0:
+                logger.debug(f"⚠️ {position.stock_code} 진입가 정보 없음 - 시간 청산 불가")
+                return False
+
+            # 🆕 실시간 수익률 계산
+            current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
             # 새로운 시간 기반 청산 규칙 적용 (선택적)
             time_rules = self.config.get('time_exit_rules', {})
 
-            # 수익 중 시간 청산 (패턴별 시간의 절반 후)
+            # 🔧 수익 중 시간 청산 (패턴별 시간의 절반 후, 영업일 기준)
             profit_exit_hours = max_hours // 2  # 패턴별 시간의 절반
-            min_profit = time_rules.get('min_profit_for_time_exit', 0.5) / 100
+            min_profit = time_rules.get('min_profit_for_time_exit', 1.0) / 100  # 🔧 기본값 1.0%
 
-            if (holding_time >= timedelta(hours=profit_exit_hours) and
-                position.performance.pnl_pct and
-                position.performance.pnl_pct >= min_profit):
-                logger.info(f"⏰ {position.stock_code} 패턴별 시간 기반 수익 청산: {holding_time}")
+            if (holding_hours >= profit_exit_hours and
+                current_pnl_pct >= min_profit):  # 🔧 실시간 계산된 수익률 사용
+                logger.info(f"⏰ {position.stock_code} 패턴별 시간 기반 수익 청산: {holding_hours:.1f}h "
+                           f"(실제수익률: {current_pnl_pct:+.2f}%, 기준: {min_profit*100:.1f}%, 주말제외)")
                 return True
+
+            # 🆕 손실 상황에서는 시간 청산 차단 (추가 안전장치)
+            if current_pnl_pct < 0:
+                logger.debug(f"🛡️ {position.stock_code} 손실 상황 - 시간 청산 차단 (수익률: {current_pnl_pct:+.2f}%)")
+                return False
 
             return False
 
