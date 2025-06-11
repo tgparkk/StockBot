@@ -348,9 +348,12 @@ class SellPositionManager:
                     order_no = getattr(result, 'order_no', None)
                     position.set_pending_order(order_no or f"sell_unknown_{datetime.now().strftime('%H%M%S')}", 'sell')
 
-                    logger.info(f"📉 매도 주문 제출 성공: {position.stock_code} "
-                               f"현재가{exit_price:,.0f}원 → 주문가{safe_sell_price:,.0f}원 "
-                               f"(주문번호: {order_no})")
+                    # 🆕 현재가와 주문가 명확히 구분하여 로깅
+                    logger.info(f"📉 매도 주문 제출 성공: {position.stock_code}")
+                    logger.info(f"   💰 현재가: {exit_price:,.0f}원 (매도 조건 체크 기준)")
+                    logger.info(f"   📝 주문가: {safe_sell_price:,.0f}원 (실제 주문 제출가)")
+                    logger.info(f"   🆔 주문번호: {order_no}")
+                    logger.info(f"   📋 매도사유: {reason}")
 
                     # 🎯 중요: 매도 주문 제출시에는 update_candidate() 호출하지 않음
                     # 실제 체결은 웹소켓에서 확인 후 handle_execution_confirmation에서 처리됨
@@ -368,17 +371,17 @@ class SellPositionManager:
             return False
 
     def _calculate_safe_sell_price(self, current_price: float, reason: str) -> int:
-        """안전한 매도가 계산 (틱 단위 맞춤)"""
+        """안전한 매도가 계산 (틱 단위 맞춤) - 개선된 버전"""
         try:
-            # 매도 이유별 할인율 적용
+            # 매도 이유별 할인율 적용 (목표가 도달시 할인 최소화)
             if reason == "손절":
                 discount_pct = 0.008  # 0.8% 할인 (빠른 체결 우선)
             elif reason in ["목표가 도달", "익절"]:
-                discount_pct = 0.003  # 0.3% 할인 (적당한 체결)
+                discount_pct = 0.002  # 🎯 0.2% 할인으로 최소화 (수익 보호)
             elif reason == "시간 청산":
                 discount_pct = 0.005  # 0.5% 할인 (중간 속도)
             else:
-                discount_pct = 0.005  # 기본 0.5% 할인
+                discount_pct = 0.003  # 기본 0.3% 할인
 
             # 할인된 가격 계산
             target_price = int(current_price * (1 - discount_pct))
@@ -387,11 +390,15 @@ class SellPositionManager:
             tick_unit = self._get_tick_unit(target_price)
             safe_price = (target_price // tick_unit) * tick_unit
 
-            # 최소 가격 보정 (너무 낮으면 안됨)
-            min_price = int(current_price * 0.97)  # 현재가의 97% 이상
+            # 🆕 목표가 도달시 최소 가격 보정 강화 (현재가의 99% 이상)
+            if reason in ["목표가 도달", "익절"]:
+                min_price = int(current_price * 0.99)  # 현재가의 99% 이상
+            else:
+                min_price = int(current_price * 0.97)  # 기본 97% 이상
+
             safe_price = max(safe_price, min_price)
 
-            logger.debug(f"💰 매도가 계산: 현재가{current_price:,.0f}원 → 주문가{safe_price:,.0f}원 "
+            logger.debug(f"💰 매도가 계산 (개선): 현재가{current_price:,.0f}원 → 주문가{safe_price:,.0f}원 "
                         f"({reason}, 할인{discount_pct*100:.1f}%)")
 
             return safe_price

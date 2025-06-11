@@ -277,14 +277,25 @@ class CandleTradeManager:
         logger.info("✅ CandleTradeManager 초기화 완료")
 
     def _register_order_timeout_callback(self):
-        """🆕 주문 타임아웃 콜백 등록"""
+        """🆕 주문 타임아웃 콜백 등록 및 웹소켓 연결 강화"""
         try:
             if (hasattr(self.trade_executor, 'execution_manager') and
                 self.trade_executor.execution_manager):
 
                 # 타임아웃 콜백 함수 등록
                 self.trade_executor.execution_manager.add_execution_callback(self._handle_order_timeout)
-                logger.info("✅ 주문 타임아웃 콜백 등록 완료")
+
+                # 🆕 웹소켓 매니저에 execution_manager 설정
+                if self.websocket_manager and hasattr(self.websocket_manager, 'message_handler'):
+                    if hasattr(self.websocket_manager.message_handler, 'set_execution_manager'):
+                        self.websocket_manager.message_handler.set_execution_manager(self.trade_executor.execution_manager)
+                        logger.info("✅ 웹소켓 매니저에 OrderExecutionManager 설정 완료")
+                    else:
+                        # 직접 설정 시도
+                        self.websocket_manager.message_handler.execution_manager = self.trade_executor.execution_manager
+                        logger.info("✅ 웹소켓 매니저에 OrderExecutionManager 직접 설정 완료")
+
+                logger.info("✅ 주문 타임아웃 콜백 등록 및 웹소켓 연결 완료")
             else:
                 logger.warning("⚠️ OrderExecutionManager 없음 - 타임아웃 콜백 등록 실패")
         except Exception as e:
@@ -640,7 +651,7 @@ class CandleTradeManager:
                     await self._evaluate_entry_opportunities()
 
                     # 📈 4. 기존 포지션 관리 - 매도 시그널 체크
-                    await self._manage_existing_positions()
+                    await self.sell_manager.manage_existing_positions()
 
                     # 🧹 5. 미체결 주문 관리 (1분마다)
                     if hasattr(self, '_last_stale_check_time'):
@@ -1083,7 +1094,7 @@ class CandleTradeManager:
     # ========== 🆕 체결 확인 처리 ==========
 
     async def handle_execution_confirmation(self, execution_data):
-        """🎯 웹소켓 체결 통보 처리 - 매수/매도 체결 확인 후 상태 업데이트"""
+        """🎯 웹소켓 체결 통보 처리 - 매수/매도 체결 확인 후 상태 업데이트 (개선된 버전)"""
         try:
             # 🚨 타입 안전성 검사 (문자열로 전달된 경우 처리)
             if isinstance(execution_data, str):
@@ -1108,10 +1119,12 @@ class CandleTradeManager:
                 return
 
             if not stock_code or not order_type:
-                logger.warning(f"⚠️ 체결 통보 데이터 부족: {execution_data}")
+                logger.warning(f"⚠️ 체결 통보 데이터 부족: stock_code={stock_code}, order_type={order_type}")
                 return
 
-            logger.info(f"🎯 체결 확인: {stock_code} {order_type} {executed_quantity}주 {executed_price:,.0f}원 (주문번호: {order_no})")
+            # 🆕 체결가 정보 로깅 강화
+            logger.info(f"🎯 체결 확인 (상세): {stock_code} {order_type} {executed_quantity}주 {executed_price:,.0f}원 "
+                       f"(주문번호: {order_no})")
 
             # _all_stocks에서 해당 종목 찾기
             candidate = self.stock_manager._all_stocks.get(stock_code)
@@ -1132,6 +1145,9 @@ class CandleTradeManager:
 
         except Exception as e:
             logger.error(f"❌ 체결 확인 처리 오류: {e}")
+            # 🆕 상세 오류 정보 로깅
+            import traceback
+            logger.error(f"❌ 체결 확인 처리 상세 오류:\n{traceback.format_exc()}")
 
     async def _handle_buy_execution(self, candidate: CandleTradeCandidate, executed_price: float,
                                   executed_quantity: int, order_no: str, execution_data: Dict):

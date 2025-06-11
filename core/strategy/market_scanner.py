@@ -123,7 +123,7 @@ class MarketScanner:
                 if batch_end < len(unique_candidates):
                     await asyncio.sleep(0.3)  # 300ms 대기
 
-            logger.info(f"🎯 {market_name} 패턴 감지: {pattern_found_count}개 종목")
+            logger.debug(f"🎯 {market_name} 패턴 감지: {pattern_found_count}개 종목")
 
         except Exception as e:
             logger.error(f"시장 {market} 스캔 오류: {e}")

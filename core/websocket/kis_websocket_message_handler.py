@@ -4,7 +4,7 @@ KIS 웹소켓 메시지 처리 전담 클래스
 """
 import asyncio
 import json
-from typing import Dict, Callable, TYPE_CHECKING
+from typing import Dict, Callable, TYPE_CHECKING, Optional
 from datetime import datetime
 from enum import Enum
 from utils.logger import setup_logger
@@ -282,66 +282,133 @@ class KISWebSocketMessageHandler:
         return self.stats.copy()
 
     async def _handle_execution_notice_direct(self, decrypted_data: str):
-        """🎯 체결통보 직접 처리 - OrderExecutionManager 연동"""
+        """🔔 체결통보 직접 처리 - CandleTradeManager 연동 강화"""
         try:
-            # 🔍 OrderExecutionManager 찾기
-            execution_manager = self._find_execution_manager()
-            if not execution_manager:
-                logger.warning("⚠️ OrderExecutionManager를 찾을 수 없음 - 체결통보 처리 불가")
-                return
+            logger.debug(f"📨 체결통보 직접 처리 시작")
 
-            # 🎯 체결통보 데이터 구조 생성
-            notice_data = {
-                'data': decrypted_data,  # KIS에서 복호화된 '^' 구분 데이터
+            # 체결통보 데이터 준비
+            execution_data = {
+                'raw_data': decrypted_data,
                 'timestamp': datetime.now(),
-                'source': 'kis_websocket_direct'
+                'parsed_success': False
             }
 
-            # 🚀 OrderExecutionManager로 직접 전달
-            logger.info(f"🎯 체결통보 직접 처리: {decrypted_data[:100]}...")
-            await execution_manager.handle_execution_notice(notice_data)
-
-            # 🎯 CandleTradeManager의 _all_stocks 상태 업데이트도 처리
-            if self.candle_trade_manager:
-                logger.info("🔄 CandleTradeManager _all_stocks 상태 업데이트 처리")
-                
-                # 🚨 올바른 형식으로 데이터 전달 (decrypted_data는 문자열이므로 딕셔너리로 래핑)
-                execution_data = {
-                    'raw_data': decrypted_data,
-                    'timestamp': datetime.now(),
-                    'source': 'kis_websocket'
-                }
-                
-                # OrderExecutionManager에서 파싱된 데이터가 있으면 사용
+            # 🆕 OrderExecutionManager 체결통보 처리 시도
+            execution_manager = self._find_execution_manager()
+            if execution_manager and hasattr(execution_manager, 'handle_execution_notice'):
                 try:
-                    if execution_manager and hasattr(execution_manager, '_parse_notice_data'):
-                        parsed_execution = execution_manager._parse_notice_data(decrypted_data)
-                        if parsed_execution:
-                            # 파싱 성공시 주요 정보 추가
-                            execution_data.update({
-                                'stock_code': parsed_execution.get('stock_code', ''),
-                                'order_type': parsed_execution.get('order_type', ''),
-                                'executed_quantity': parsed_execution.get('executed_quantity', 0),
-                                'executed_price': parsed_execution.get('executed_price', 0),
-                                'order_no': parsed_execution.get('order_id', ''),
-                                'parsed_success': True
-                            })
-                            logger.debug(f"✅ 체결통보 파싱 성공: {parsed_execution.get('stock_code')} {parsed_execution.get('order_type')}")
-                        else:
-                            execution_data['parsed_success'] = False
+                    logger.debug("🔔 OrderExecutionManager로 체결통보 처리 시도")
+                    # 웹소켓 체결통보를 OrderExecutionManager로 전달
+                    websocket_notice_data = {
+                        'data': decrypted_data,
+                        'timestamp': datetime.now(),
+                        'source': 'websocket'
+                    }
+
+                    success = await execution_manager.handle_execution_notice(websocket_notice_data)
+                    if success:
+                        logger.info("✅ OrderExecutionManager 체결통보 처리 성공")
+                        execution_data['parsed_success'] = True
+                        # OrderExecutionManager에서 처리했으면 추가 파싱 시도
+                        try:
+                            parsed_data = execution_manager._parse_notice_data(websocket_notice_data)
+                            if parsed_data:
+                                execution_data.update(parsed_data)
+                                logger.debug("📋 OrderExecutionManager 파싱 데이터 추가 완료")
+                        except Exception as parse_error:
+                            logger.debug(f"파싱 데이터 추가 실패: {parse_error}")
                     else:
-                        logger.debug("OrderExecutionManager가 없거나 파싱 함수 없음")
-                        execution_data['parsed_success'] = False
+                        logger.debug("📋 OrderExecutionManager 체결통보 처리 실패 또는 해당사항 없음")
+
                 except Exception as e:
-                    logger.debug(f"파싱된 데이터 추출 실패: {e}")
-                    execution_data['parsed_success'] = False
-                
+                    logger.debug(f"OrderExecutionManager 처리 오류: {e}")
+            else:
+                logger.debug("💡 OrderExecutionManager가 없거나 handle_execution_notice 메소드 없음")
+
+            # 🎯 CandleTradeManager 체결 확인 처리 (모든 경우에 실행)
+            if self.candle_trade_manager and hasattr(self.candle_trade_manager, 'handle_execution_confirmation'):
+                logger.debug("🎯 CandleTradeManager 체결 확인 처리 시작")
+
+                # 🆕 체결통보 기본 파싱 시도 (OrderExecutionManager가 없거나 실패한 경우)
+                if not execution_data.get('parsed_success', False):
+                    try:
+                        # 간단한 체결통보 파싱 시도
+                        parsed_info = self._parse_execution_notice_simple(decrypted_data)
+                        if parsed_info:
+                            execution_data.update(parsed_info)
+                            execution_data['parsed_success'] = True
+                            logger.debug("📋 간단 파싱으로 체결통보 처리 성공")
+                        else:
+                            logger.debug("📋 간단 파싱도 실패 - 원본 데이터로 진행")
+                    except Exception as simple_parse_error:
+                        logger.debug(f"간단 파싱 실패: {simple_parse_error}")
+
                 await self.candle_trade_manager.handle_execution_confirmation(execution_data)
             else:
                 logger.debug("💡 CandleTradeManager가 설정되지 않음 - _all_stocks 업데이트 생략")
 
         except Exception as e:
             logger.error(f"❌ 체결통보 직접 처리 오류: {e}")
+
+    def _parse_execution_notice_simple(self, decrypted_data: str) -> Optional[Dict]:
+        """🆕 간단한 체결통보 파싱 (기본 정보 추출)"""
+        try:
+            if not decrypted_data or not isinstance(decrypted_data, str):
+                return None
+
+            # '^' 구분자로 필드 분리
+            parts = decrypted_data.split('^')
+
+            if len(parts) < 20:
+                return None
+
+            # 안전한 인덱스 접근
+            def safe_get(index: int, default: str = '') -> str:
+                return parts[index] if index < len(parts) else default
+
+            # 체결여부 확인 (가장 중요!)
+            execution_yn = safe_get(13)  # CNTG_YN
+            if execution_yn != '2':
+                return None  # 체결통보가 아님
+
+            # 기본 정보 추출
+            stock_code = safe_get(8)      # 종목코드
+            order_id = safe_get(2)        # 주문번호
+            buy_sell_code = safe_get(4)   # 매매구분
+            executed_quantity = safe_get(9)   # 체결수량
+            executed_price = safe_get(10)     # 체결단가
+
+            # 매매구분 변환
+            if buy_sell_code == '01':
+                order_type = 'SELL'
+            elif buy_sell_code == '02':
+                order_type = 'BUY'
+            else:
+                order_type = 'UNKNOWN'
+
+            # 숫자 변환
+            try:
+                executed_quantity = int(executed_quantity) if executed_quantity else 0
+                executed_price = int(executed_price) if executed_price else 0
+            except (ValueError, TypeError):
+                return None
+
+            if executed_quantity <= 0 or executed_price <= 0:
+                return None
+
+            return {
+                'stock_code': stock_code,
+                'order_no': order_id,
+                'order_type': order_type,
+                'executed_quantity': executed_quantity,
+                'executed_price': executed_price,
+                'execution_time': safe_get(11),  # 체결시간
+                'parsed_success': True
+            }
+
+        except Exception as e:
+            logger.debug(f"간단 파싱 오류: {e}")
+            return None
 
     def _find_execution_manager(self):
         """OrderExecutionManager 인스턴스 찾기"""
