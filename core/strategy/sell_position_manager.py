@@ -15,6 +15,50 @@ from .candle_trade_candidate import CandleTradeCandidate, CandleStatus, RiskMana
 logger = setup_logger(__name__)
 
 
+def calculate_business_hours(start_time: datetime, end_time: datetime) -> float:
+    """🕒 주말을 제외한 영업시간 계산 (시간 단위)"""
+    try:
+        # 시작시간이 종료시간보다 늦으면 0 반환
+        if start_time >= end_time:
+            return 0.0
+
+        total_hours = 0.0
+        current = start_time
+
+        # 하루씩 계산하면서 주말 제외
+        while current < end_time:
+            # 현재 날짜의 요일 확인 (0=월요일, 6=일요일)
+            weekday = current.weekday()
+
+            # 주말(토요일=5, 일요일=6) 제외
+            if weekday < 5:  # 월~금요일만
+                # 하루의 끝 시간 계산
+                day_end = current.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+                # 이 날에서 계산할 시간 범위
+                day_start = current
+                day_finish = min(day_end, end_time)
+
+                # 이 날의 시간 추가
+                day_hours = (day_finish - day_start).total_seconds() / 3600
+                total_hours += day_hours
+
+            # 다음 날로 이동
+            current = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        return total_hours
+
+    except Exception as e:
+        logger.error(f"❌ 영업시간 계산 오류: {e}")
+        # 오류시 기존 방식으로 폴백
+        return (end_time - start_time).total_seconds() / 3600
+
+
+def calculate_business_minutes(start_time: datetime, end_time: datetime) -> float:
+    """🕒 주말을 제외한 영업시간 계산 (분 단위)"""
+    return calculate_business_hours(start_time, end_time) * 60
+
+
 class SellPositionManager:
     """매도 포지션 관리 및 매도 실행 관리자"""
 
@@ -58,36 +102,20 @@ class SellPositionManager:
     async def _manage_single_position(self, position: CandleTradeCandidate):
         """개별 포지션 관리"""
         try:
-            # 🕐 거래 시간 체크 (매도 시간 제한)
-            # current_time = datetime.now().time()
-            # trading_start = datetime.strptime(self.manager.config['trading_start_time'], '%H:%M').time()
-            # trading_end = datetime.strptime(self.manager.config['trading_end_time'], '%H:%M').time()
-
-            # is_trading_time = trading_start <= current_time <= trading_end
-            # if not is_trading_time:
-            #     logger.debug(f"⏰ {position.stock_code} 거래 시간 외 - 매도 대기 중")
-
-            # 최신 가격 조회
-            # from ..api.kis_market_api import get_inquire_price
-            # current_data = get_inquire_price("J", position.stock_code)
-
-            # if current_data is None or current_data.empty:
-            #     return
-
-            # current_price = float(current_data.iloc[0].get('stck_prpr', 0))
-            # if current_price <= 0:
-            #     logger.warning(f"⚠️ {position.stock_code} 잘못된 현재가: {current_price}")
-            #     return
-
-            # # 포지션 정보 업데이트
-            # position.update_price(current_price)
-
             # 📊 매도 조건 체크
             should_exit = False
             exit_reason = ""
 
             # 🆕 실시간 캔들 패턴 재분석 (DB 의존 제거)
             target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(position)
+
+            # 🆕 패턴 정보 추출 (로깅용)
+            original_pattern = None
+            if position.detected_patterns and len(position.detected_patterns) > 0:
+                strongest_pattern = max(position.detected_patterns, key=lambda p: p.strength)
+                original_pattern = strongest_pattern.pattern_type.value
+            elif 'original_pattern_type' in position.metadata:
+                original_pattern = position.metadata['original_pattern_type']
 
             # 🆕 최소 보유시간 체크 (노이즈 거래 방지)
             min_holding_check = self._check_min_holding_time(position, stop_loss_pct)
@@ -109,10 +137,13 @@ class SellPositionManager:
                 should_exit = True
                 exit_reason = "목표가 도달"
 
-            # 3. 시간 청산 체크 (패턴별)
+            # 3. 시간 청산 체크 (패턴별 max_hours 우선 사용)
             elif self._should_time_exit_pattern_based(position, max_hours):
                 should_exit = True
                 exit_reason = "시간 청산"
+                # 🎯 Morning Star 패턴의 경우 특별 로깅
+                if pattern_based and original_pattern and 'morning_star' in str(original_pattern).lower():
+                    logger.info(f"⭐ {position.stock_code} Morning Star 패턴 96시간 보유 완료 - 시간 청산")
 
             # 🆕 동적 추적 손절 업데이트 (손절가가 계속 조정됨)
             if position.performance.entry_price:
@@ -120,27 +151,28 @@ class SellPositionManager:
 
             # 매도 실행
             if should_exit:
-                logger.info(f"📉 {position.stock_code} 매도 조건 충족: {exit_reason} "
-                           f"(수익률: {position.performance.pnl_pct:+.2f}%)")
+                # 🔧 실시간 수익률 재계산하여 정확한 로깅
+                current_price = position.current_price
+                entry_price = position.performance.entry_price
+                if entry_price and entry_price > 0:
+                    real_pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                    logger.info(f"📉 {position.stock_code} 매도 조건 충족: {exit_reason} "
+                               f"(실제수익률: {real_pnl_pct:+.2f}%, 현재가: {current_price:,.0f}원)")
+                else:
+                    logger.info(f"📉 {position.stock_code} 매도 조건 충족: {exit_reason} "
+                               f"(수익률계산불가, 현재가: {current_price:,.0f}원)")
                 await self._execute_exit(position, position.current_price, exit_reason)
 
         except Exception as e:
             logger.error(f"개별 포지션 관리 오류 ({position.stock_code}): {e}")
 
     def _get_pattern_based_target(self, position: CandleTradeCandidate) -> Tuple[float, float, int, bool]:
-        """🎯 캔들 패턴별 수익률 목표, 손절, 시간 설정 결정"""
+        """🎯 캔들 패턴별 수익률 목표, 손절, 시간 설정 결정 (패턴 우선)"""
         try:
             # 🔍 디버깅: 각 조건 값 확인
             restored_from_db = position.metadata.get('restored_from_db', False)
             original_entry_source = position.metadata.get('original_entry_source')
             detected_patterns_count = len(position.detected_patterns)
-
-            # logger.info(f"🔍 {position.stock_code} 캔들 전략 확인:")
-            # logger.info(f"   - restored_from_db: {restored_from_db}")
-            # logger.info(f"   - original_entry_source: {original_entry_source}")
-            # logger.info(f"   - detected_patterns 개수: {detected_patterns_count}")
-            # logger.info(f"   - is_existing_holding: {position.metadata.get('is_existing_holding', False)}")
-            # logger.info(f"   - pattern_analysis_success: {position.metadata.get('pattern_analysis_success', None)}")
 
             # 1. 캔들 전략으로 매수한 종목인지 확인
             is_candle_strategy = (
@@ -148,8 +180,6 @@ class SellPositionManager:
                 original_entry_source == 'candle_strategy' or  # 캔들 전략 매수
                 detected_patterns_count > 0  # 패턴 정보가 있음
             )
-
-            # logger.info(f"   - is_candle_strategy 최종 결과: {is_candle_strategy}")
 
             if not is_candle_strategy:
                 # 수동/앱 매수 종목: 큰 수익/손실 허용 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
@@ -210,7 +240,7 @@ class SellPositionManager:
                 original_pattern = strongest_pattern.pattern_type.value
                 logger.debug(f"📊 {position.stock_code} 기존 패턴 정보 활용: {original_pattern}")
 
-            # 3. 패턴별 목표, 손절, 시간 설정 적용
+            # 3. 🎯 패턴별 설정이 RiskManagement보다 우선 적용
             if original_pattern:
                 # 패턴명을 소문자로 변환하여 config에서 조회
                 pattern_key = original_pattern.lower().replace('_', '_')
@@ -219,10 +249,22 @@ class SellPositionManager:
                 if pattern_config:
                     target_pct = pattern_config['target']
                     stop_pct = pattern_config['stop']
-                    max_hours = pattern_config['max_hours']
+                    max_hours = pattern_config['max_hours']  # 🎯 패턴별 시간이 RiskManagement보다 우선
 
-                    # logger.debug(f"📊 {position.stock_code} 패턴 '{original_pattern}' - "
-                    #             f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
+                    # 🆕 morning_star 패턴 특별 로깅
+                    if pattern_key == 'morning_star':
+                        logger.info(f"⭐ {position.stock_code} Morning Star 패턴 감지: "
+                                   f"목표{target_pct}%, 손절{stop_pct}%, 96시간(4일) 보유")
+
+                        # 🎯 RiskManagement의 max_holding_hours 무시하고 패턴 설정 우선 적용
+                        if position.risk_management and position.risk_management.max_holding_hours != 96:
+                            logger.info(f"📝 {position.stock_code} RiskManagement 시간 설정 재정의: "
+                                       f"{position.risk_management.max_holding_hours}h → 96h (Morning Star 우선)")
+                            # RiskManagement 값도 업데이트
+                            position.risk_management.max_holding_hours = 96
+
+                    logger.debug(f"📊 {position.stock_code} 패턴 '{original_pattern}' - "
+                                f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
                     return target_pct, stop_pct, max_hours, True
                 else:
                     return 3.0, 3.0, 12, True
@@ -237,32 +279,54 @@ class SellPositionManager:
             return 3.0, 3.0, 24, False
 
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
-        """🆕 패턴별 시간 청산 조건 체크"""
+        """🆕 패턴별 시간 청산 조건 체크 (개선된 버전 + 주말 제외)"""
         try:
             if not position.performance or not position.performance.entry_time:
                 return False
 
-            # 보유 시간 계산
-            holding_time = datetime.now(self.manager.korea_tz) - position.performance.entry_time
-            max_holding = timedelta(hours=max_hours)
+            # 🆕 보유 시간 계산 (주말 제외)
+            current_time = datetime.now(self.manager.korea_tz)
+            entry_time = position.performance.entry_time
 
-            # 패턴별 최대 보유시간 초과시 청산
-            if holding_time >= max_holding:
-                logger.info(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_time}")
+            # timezone 통일
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=self.manager.korea_tz)
+
+            holding_hours = calculate_business_hours(entry_time, current_time)
+
+            # 패턴별 최대 보유시간 초과시 청산 (영업일 기준)
+            if holding_hours >= max_hours:
+                logger.info(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_hours:.1f}h (주말제외)")
                 return True
+
+            # 🔧 현재 수익률 재계산 (정확성 보장)
+            current_price = position.current_price
+            entry_price = position.performance.entry_price
+
+            if not entry_price or entry_price <= 0:
+                logger.debug(f"⚠️ {position.stock_code} 진입가 정보 없음 - 시간 청산 불가")
+                return False
+
+            # 🆕 실시간 수익률 계산
+            current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
 
             # 새로운 시간 기반 청산 규칙 적용 (선택적)
             time_rules = self.manager.config.get('time_exit_rules', {})
 
-            # 수익 중 시간 청산 (패턴별 시간의 절반 후)
+            # 🔧 수익 중 시간 청산 (패턴별 시간의 절반 후, 영업일 기준)
             profit_exit_hours = max_hours // 2  # 패턴별 시간의 절반
-            min_profit = time_rules.get('min_profit_for_time_exit', 0.5) / 100
+            min_profit = time_rules.get('min_profit_for_time_exit', 1.0) / 100  # 🔧 기본값 1.0%
 
-            if (holding_time >= timedelta(hours=profit_exit_hours) and
-                position.performance.pnl_pct and
-                position.performance.pnl_pct >= min_profit):
-                logger.info(f"⏰ {position.stock_code} 패턴별 시간 기반 수익 청산: {holding_time}")
+            if (holding_hours >= profit_exit_hours and
+                current_pnl_pct >= min_profit):  # 🔧 실시간 계산된 수익률 사용
+                logger.info(f"⏰ {position.stock_code} 패턴별 시간 기반 수익 청산: {holding_hours:.1f}h "
+                           f"(실제수익률: {current_pnl_pct:+.2f}%, 기준: {min_profit*100:.1f}%, 주말제외)")
                 return True
+
+            # 🆕 손실 상황에서는 시간 청산 차단 (추가 안전장치)
+            if current_pnl_pct < 0:
+                logger.debug(f"🛡️ {position.stock_code} 손실 상황 - 시간 청산 차단 (수익률: {current_pnl_pct:+.2f}%)")
+                return False
 
             return False
 
@@ -835,7 +899,7 @@ class SellPositionManager:
             logger.error(f"조정 이력 정리 오류: {e}")
 
     def _check_min_holding_time(self, position: CandleTradeCandidate, stop_loss_pct: float) -> Dict:
-        """🆕 최소 보유시간 체크 (매수체결시간 기반 + 캔들전략 설정)"""
+        """🆕 최소 보유시간 체크 (매수체결시간 기반 + 캔들전략 설정 + 주말 제외)"""
         try:
             # 🎯 매수체결시간 우선 사용, 없으면 entry_time 사용
             reference_time = position.performance.buy_execution_time or position.performance.entry_time
@@ -851,10 +915,9 @@ class SellPositionManager:
             if reference_time.tzinfo is None:
                 reference_time = reference_time.replace(tzinfo=self.manager.korea_tz)
 
-            # 현재 보유 시간 계산 (매수체결시간 기준)
-            holding_time = current_time - reference_time
-            holding_minutes = holding_time.total_seconds() / 60
-            holding_hours = holding_minutes / 60
+            # 🆕 현재 보유 시간 계산 (주말 제외)
+            holding_hours = calculate_business_hours(reference_time, current_time)
+            holding_minutes = holding_hours * 60
 
             # 1. 긴급 상황 체크 (최소 보유시간 무시)
             emergency_check = self._check_emergency_conditions(position)
@@ -871,29 +934,30 @@ class SellPositionManager:
                 # 기존 패턴 기반 최소시간
                 adjusted_min_minutes = self._get_pattern_min_holding_time(position)
 
-            # 3. 최소 보유시간 체크
+            # 3. 최소 보유시간 체크 (영업일 기준)
             if holding_minutes < adjusted_min_minutes:
                 remaining_minutes = adjusted_min_minutes - holding_minutes
                 remaining_hours = remaining_minutes / 60
 
                 time_source = "체결시간" if position.performance.buy_execution_time else "진입시간"
-                logger.debug(f"⏰ {position.stock_code} 최소 보유시간 미달 ({time_source} 기준): "
+                logger.debug(f"⏰ {position.stock_code} 최소 보유시간 미달 ({time_source} 기준, 주말제외): "
                            f"{holding_hours:.1f}시간/{adjusted_min_minutes/60:.1f}시간 "
                            f"(남은시간: {remaining_hours:.1f}시간)")
 
                 return {
                     'can_exit': False,
-                    'reason': f'min_holding_time_execution_based',
-                    'detail': f'{holding_hours:.1f}h/{adjusted_min_minutes/60:.1f}h 보유 ({time_source})',
+                    'reason': f'min_holding_time_business_days',
+                    'detail': f'{holding_hours:.1f}h/{adjusted_min_minutes/60:.1f}h 보유 ({time_source}, 주말제외)',
                     'remaining_hours': remaining_hours,
-                    'time_source': time_source
+                    'time_source': time_source,
+                    'business_hours_only': True
                 }
 
             # 4. 최소 보유시간 충족
             time_source = "체결시간" if position.performance.buy_execution_time else "진입시간"
-            logger.debug(f"✅ {position.stock_code} 최소 보유시간 충족 ({time_source} 기준): "
+            logger.debug(f"✅ {position.stock_code} 최소 보유시간 충족 ({time_source} 기준, 주말제외): "
                        f"{holding_hours:.1f}시간 (기준: {adjusted_min_minutes/60:.1f}시간)")
-            return {'can_exit': True, 'reason': 'min_time_satisfied', 'time_source': time_source}
+            return {'can_exit': True, 'reason': 'min_time_satisfied', 'time_source': time_source, 'business_hours_only': True}
 
         except Exception as e:
             logger.error(f"❌ 최소 보유시간 체크 오류 ({position.stock_code}): {e}")

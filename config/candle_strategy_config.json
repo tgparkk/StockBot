@@ -1,0 +1,167 @@
+{
+    "// 🎯 캔들패턴 전략 설정 파일": "외부에서 수정 가능한 거래 설정",
+    "scan_interval_seconds": 1800,
+    "signal_evaluation_interval": 30,
+    "max_positions": 15,
+    "max_scan_stocks": 50,
+    "risk_per_trade": 0.02,
+    "pattern_confidence_threshold": 0.6,
+    "volume_threshold": 1.5,
+    "min_volume_ratio": 2.0,
+    "trading_start_time": "09:00",
+    "trading_end_time": "15:20",
+    "min_price": 1000,
+    "max_price": 500000,
+    "min_daily_volume": 5000000000,
+    "rsi_oversold_threshold": 30,
+    "rsi_overbought_threshold": 70,
+    "max_day_change_pct": 15.0,
+    "max_signal_age_seconds": 300,
+    "min_order_interval_seconds": 300,
+    "max_priority_multiplier": 1.5,
+    "base_priority_multiplier": 0.5,
+    "max_single_investment_ratio": 0.4,
+    "max_position_size_pct": 25,
+    "default_stop_loss_pct": 2.5,
+    "default_target_profit_pct": 3.0,
+    "max_holding_hours": 72,
+    "min_holding_minutes": 1440,
+    "emergency_stop_loss_pct": 6.0,
+    "min_holding_override_conditions": {
+        "high_profit_target": 4.0,
+        "market_crash": -7.0,
+        "individual_limit_down": -15.0,
+        "pattern_reversal": true
+    },
+    "pattern_targets": {
+        "// 🎯 Morning Star 패턴 특별 설정": "96시간(4일) 보유로 큰 수익 추구",
+        "morning_star": {
+            "target": 4.5,
+            "stop": 2.5,
+            "max_hours": 96,
+            "min_minutes": 1440,
+            "description": "샛별형: 최고 신뢰도, 96시간(4일) 보유로 큰 목표 추구"
+        },
+        "hammer": {
+            "target": 3.5,
+            "stop": 2.5,
+            "max_hours": 48,
+            "min_minutes": 1440,
+            "description": "망치형: 강한 매수 신호, 적정 보유"
+        },
+        "inverted_hammer": {
+            "target": 3.0,
+            "stop": 2.5,
+            "max_hours": 36,
+            "min_minutes": 1440,
+            "description": "역망치형: 중간 신호, 조심스러운 접근"
+        },
+        "bullish_engulfing": {
+            "target": 4.0,
+            "stop": 2.5,
+            "max_hours": 60,
+            "min_minutes": 1440,
+            "description": "상승장악형: 매우 강한 신호, 적극적 목표"
+        },
+        "bearish_engulfing": {
+            "target": 0.0,
+            "stop": 1.0,
+            "max_hours": 6,
+            "min_minutes": 60,
+            "description": "하락장악형: 매도 신호, 빠른 청산"
+        },
+        "evening_star": {
+            "target": 0.0,
+            "stop": 1.0,
+            "max_hours": 6,
+            "min_minutes": 60,
+            "description": "저녁별형: 강한 매도 신호, 즉시 청산"
+        },
+        "rising_three_methods": {
+            "target": 5.0,
+            "stop": 3.5,
+            "max_hours": 120,
+            "min_minutes": 2880,
+            "description": "상승삼법: 추세 지속, 가장 큰 목표와 긴 보유"
+        },
+        "falling_three_methods": {
+            "target": 0.0,
+            "stop": 1.5,
+            "max_hours": 12,
+            "min_minutes": 120,
+            "description": "하락삼법: 하락 지속, 빠른 청산"
+        },
+        "doji": {
+            "target": 2.0,
+            "stop": 1.5,
+            "max_hours": 12,
+            "min_minutes": 360,
+            "description": "도지: 중립 신호, 짧은 보유와 작은 목표"
+        }
+    },
+    "time_exit_rules": {
+        "profit_exit_hours": 36,
+        "min_profit_for_time_exit": 1.0,
+        "market_close_exit_minutes": 30,
+        "overnight_avoid": false,
+        "weekend_gap_risk": true,
+        "pattern_strength_multiplier": {
+            "high": 1.5,
+            "medium": 1.0,
+            "low": 0.7
+        }
+    },
+    "execution_time_strategy": {
+        "use_execution_time": true,
+        "min_holding_from_execution": 1440,
+        "early_morning_bonus_hours": 4,
+        "late_trading_penalty_hours": -6,
+        "weekend_gap_consideration": true,
+        "friday_afternoon_caution": true
+    },
+    "investment_calculation": {
+        "available_amount_ratio": 0.9,
+        "cash_usage_ratio": 0.8,
+        "portfolio_usage_ratio": 0.2,
+        "min_cash_threshold": 500000,
+        "max_portfolio_limit": 3000000,
+        "default_investment": 1000000,
+        "min_investment": 100000
+    },
+    "intraday_analysis": {
+        "enabled": true,
+        "minute_period": 5,
+        "lookback_candles": 20,
+        "volume_surge_threshold": 2.0,
+        "trend_threshold_pct": 0.3,
+        "support_resistance_pct": 1.0,
+        "timing_score_weight": 0.2,
+        "use_for_entry_only": false,
+        "excluded_hours": [
+            9,
+            15
+        ],
+        "excluded_minutes_start": 15,
+        "excluded_minutes_end": 15,
+        "pattern_confirmation_mode": true
+    },
+    "scan_strategy": {
+        "initial_scan_on_start": true,
+        "pattern_scan_intervals": {
+            "09:00-10:00": 900,
+            "10:00-14:00": 1800,
+            "14:00-15:30": 900
+        },
+        "special_scan_triggers": {
+            "market_volatility_high": true,
+            "volume_surge_detected": true,
+            "new_pattern_formation": true
+        },
+        "batch_processing": {
+            "enabled": true,
+            "batch_size": 5,
+            "parallel_processing": true,
+            "batch_interval_ms": 300
+        }
+    }
+}

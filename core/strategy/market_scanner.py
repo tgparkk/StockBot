@@ -49,7 +49,7 @@ class MarketScanner:
         try:
             current_time = datetime.now()
 
-            #logger.info("🔍 매수 후보 종목 스캔 시작")
+            logger.debug("🔍 매수 후보 종목 스캔 시작")
 
             # 시장별 스캔
             markets = ['0001', '1001']  # 코스피, 코스닥
@@ -57,7 +57,7 @@ class MarketScanner:
                 await self.scan_market_for_patterns(market)
 
             self._last_scan_time = current_time
-            #logger.info("✅ 종목 스캔 완료")
+            logger.debug("✅ 종목 스캔 완료")
 
         except Exception as e:
             logger.error(f"종목 스캔 오류: {e}")
@@ -121,7 +121,7 @@ class MarketScanner:
 
                 # 배치 간 간격 (API 부하 방지)
                 if batch_end < len(unique_candidates):
-                    await asyncio.sleep(0.3)  # 300ms 대기
+                    await asyncio.sleep(0.5)  # 500ms 대기
 
             logger.debug(f"🎯 {market_name} 패턴 감지: {pattern_found_count}개 종목")
 
@@ -318,7 +318,7 @@ class MarketScanner:
                 else:
                     logger.warning(f"⚠️ {stock_code} 웹소켓 구독 오류: {ws_error}")
 
-            logger.info(f"✅ {stock_code}({stock_name}) 패턴 감지: {strongest_pattern.pattern_type.value} "
+            logger.info(f"✅ {stock_code}({stock_name}) 패턴 감지: {strongest_pattern.description} 흐름: {strongest_pattern.pattern_type.value} "
                        f"신뢰도:{strongest_pattern.confidence:.2f} "
                        f"강도:{strongest_pattern.strength}점")
 
