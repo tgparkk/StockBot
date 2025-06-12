@@ -3,6 +3,7 @@
 거시적/세부적 시장 상황을 분석하여 매매 전략에 활용
 """
 import asyncio
+import json
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
@@ -108,7 +109,16 @@ class MarketConditionAnalyzer:
         self.last_update = None
         self.market_data = None
         self.analysis_result = None
-        self.update_interval = 300  # 5분마다 업데이트
+        
+        # 설정 파일에서 update_interval_seconds 값을 읽어옴
+        try:
+            with open('config/candle_strategy_config.json', 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                self.update_interval = config.get('market_condition_adjustments', {}).get('update_interval_seconds', 300)
+                logger.info(f"✅ 시장 상황 업데이트 주기 설정: {self.update_interval}초")
+        except Exception as e:
+            logger.warning(f"⚠️ 설정 파일 읽기 실패, 기본값(300초) 사용: {e}")
+            self.update_interval = 300  # 기본값 5분
 
     def should_update(self) -> bool:
         """업데이트가 필요한지 확인"""
