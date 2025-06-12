@@ -289,57 +289,10 @@ class SellPositionManager:
             return 3.0, 3.0, 24, False
 
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
-        """🆕 패턴별 시간 청산 조건 체크 (개선된 버전 + 주말 제외)"""
+        """🆕 패턴별 시간 청산 조건 체크 - CandleAnalyzer로 위임"""
         try:
-            if not position.performance or not position.performance.entry_time:
-                return False
-
-            # 🆕 보유 시간 계산 (주말 제외)
-            current_time = datetime.now(self.manager.korea_tz)
-            entry_time = position.performance.entry_time
-
-            # timezone 통일
-            if entry_time.tzinfo is None:
-                entry_time = entry_time.replace(tzinfo=self.manager.korea_tz)
-
-            holding_hours = calculate_business_hours(entry_time, current_time)
-
-            # 패턴별 최대 보유시간 초과시 청산 (영업일 기준)
-            if holding_hours >= max_hours:
-                logger.info(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_hours:.1f}h (주말제외)")
-                return True
-
-            # 🔧 현재 수익률 재계산 (정확성 보장)
-            current_price = position.current_price
-            entry_price = position.performance.entry_price
-
-            if not entry_price or entry_price <= 0:
-                logger.debug(f"⚠️ {position.stock_code} 진입가 정보 없음 - 시간 청산 불가")
-                return False
-
-            # 🆕 실시간 수익률 계산
-            current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
-
-            # 새로운 시간 기반 청산 규칙 적용 (선택적)
-            time_rules = self.manager.config.get('time_exit_rules', {})
-
-            # 🔧 수익 중 시간 청산 (패턴별 시간의 절반 후, 영업일 기준)
-            profit_exit_hours = max_hours // 2  # 패턴별 시간의 절반
-            min_profit = time_rules.get('min_profit_for_time_exit', 1.0) / 100  # 🔧 기본값 1.0%
-
-            if (holding_hours >= profit_exit_hours and
-                current_pnl_pct >= min_profit):  # 🔧 실시간 계산된 수익률 사용
-                logger.info(f"⏰ {position.stock_code} 패턴별 시간 기반 수익 청산: {holding_hours:.1f}h "
-                           f"(실제수익률: {current_pnl_pct:+.2f}%, 기준: {min_profit*100:.1f}%, 주말제외)")
-                return True
-
-            # 🆕 손실 상황에서는 시간 청산 차단 (추가 안전장치)
-            if current_pnl_pct < 0:
-                logger.debug(f"🛡️ {position.stock_code} 손실 상황 - 시간 청산 차단 (수익률: {current_pnl_pct:+.2f}%)")
-                return False
-
-            return False
-
+            # CandleAnalyzer의 동일한 함수로 위임
+            return self.manager.candle_analyzer._should_time_exit_pattern_based(position, max_hours)
         except Exception as e:
             logger.error(f"❌ {position.stock_code} 패턴별 시간 청산 체크 오류: {e}")
             return False

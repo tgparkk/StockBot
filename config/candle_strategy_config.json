@@ -1,7 +1,7 @@
 {
     "// 🎯 캔들패턴 전략 설정 파일": "외부에서 수정 가능한 거래 설정",
     "scan_interval_seconds": 60,
-    "signal_evaluation_interval": 30,
+    "signal_evaluation_interval": 10,
     "max_positions": 50,
     "max_scan_stocks": 80,
     "risk_per_trade": 0.02,

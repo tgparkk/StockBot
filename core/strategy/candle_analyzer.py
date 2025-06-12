@@ -282,14 +282,15 @@ class CandleAnalyzer:
             logger.debug(f"리스크 조건 분석 오류: {e}")
             return {'signal': 'neutral', 'risk_level': 'medium'}
 
-    async def comprehensive_signal_analysis(self, candidate: CandleTradeCandidate, focus_on_exit: bool = False) -> Optional[Dict]:
+    async def comprehensive_signal_analysis(self, candidate: CandleTradeCandidate, focus_on_exit: bool = False, current_data: Optional[Any] = None) -> Optional[Dict]:
         """🔍 캔들패턴 거래 관점의 종합 신호 분석"""
         try:
             stock_code = candidate.stock_code
 
-            # 1. 최신 가격 정보 조회
-            from ..api.kis_market_api import get_inquire_price
-            current_data = get_inquire_price("J", stock_code)
+            # 1. 최신 가격 정보 (파라미터로 받거나 API 조회)
+            if current_data is None:
+                from ..api.kis_market_api import get_inquire_price
+                current_data = get_inquire_price("J", stock_code)
 
             if current_data is None or current_data.empty:
                 return None
@@ -391,11 +392,11 @@ class CandleAnalyzer:
             minute_data = await self._get_minute_candle_data(stock_code, period_minutes=5, count=10)
             if minute_data is not None and not minute_data.empty:
                 intraday_analysis['valid'] = True
-                
+
                 # 거래량 급증 감지만 수행
                 volume_surge = self._detect_volume_surge(minute_data)
                 intraday_analysis['volume_surge'] = volume_surge
-                
+
                 if volume_surge:
                     logger.info(f"📈 {stock_code} 거래량 급증 감지 - 패턴 확정 가능성 높음")
 
@@ -925,7 +926,7 @@ class CandleAnalyzer:
             # 3. 🆕 패턴 신호 강도 체크 (config에서 임계값 가져오기)
             pattern_strength = current_pattern_signals.get('strength', 0)
             min_pattern_strength = self.config.get('trading_thresholds', {}).get('min_pattern_strength', 70)
-            
+
             if pattern_strength >= min_pattern_strength:
                 entry_reasons.append(f'강한 패턴 신호 ({pattern_strength})')
             elif pattern_strength >= min_pattern_strength * 0.8:  # 80% 수준까지 허용
@@ -936,7 +937,7 @@ class CandleAnalyzer:
             # 4. 🆕 패턴 신뢰도 체크 (config에서 임계값 가져오기)
             pattern_reliability = current_pattern_signals.get('pattern_reliability', 0.0)
             min_pattern_confidence = self.config.get('trading_thresholds', {}).get('min_pattern_confidence', 0.65)
-            
+
             if pattern_reliability >= min_pattern_confidence:
                 entry_reasons.append(f'높은 패턴 신뢰도 ({pattern_reliability:.2f})')
             elif pattern_reliability < min_pattern_confidence * 0.8:  # 80% 수준 미만은 차단
@@ -1034,7 +1035,7 @@ class CandleAnalyzer:
                 # 매수 신호 (config에서 임계값 가져오기)
                 min_buy_signal_score = self.config.get('trading_thresholds', {}).get('min_buy_signal_score', 70)
                 min_strong_buy_score = self.config.get('trading_thresholds', {}).get('min_strong_buy_score', 85)
-                
+
                 if total_score >= min_strong_buy_score:
                     return TradeSignal.STRONG_BUY, int(total_score)
                 elif total_score >= min_buy_signal_score:
@@ -1169,7 +1170,7 @@ class CandleAnalyzer:
 
             # 패턴별 최대 보유시간 초과시 청산 (영업일 기준)
             if holding_hours >= max_hours:
-                logger.info(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_hours:.1f}h (주말제외)")
+                logger.debug(f"⏰ {position.stock_code} 패턴별 최대 보유시간({max_hours}h) 초과 청산: {holding_hours:.1f}h (주말제외)")
                 return True
 
             # 🔧 현재 수익률 재계산 (정확성 보장)
