@@ -164,16 +164,16 @@ class KISRestAPIManager:
 
     def get_today_orders(self, include_filled: bool = True) -> List[Dict]:
         """당일 주문 내역 조회
-        
+
         Args:
             include_filled: True면 전체(체결+미체결), False면 미체결만
         """
         # 미체결만 조회할 경우 CCLD_DVSN='02' 사용
         ccld_dvsn = "00" if include_filled else "02"  # 00:전체, 02:미체결
-        
+
         # 당일 날짜
         today = datetime.now().strftime("%Y%m%d")
-        
+
         # 직접 파라미터를 지정하여 호출
         result = order_api.get_inquire_daily_ccld_lst(
             dv="01",                    # 3개월 이내
@@ -184,14 +184,14 @@ class KISRestAPIManager:
 
         if result is not None and not result.empty:
             orders = result.to_dict('records')
-            
+
             # 미체결만 필요한 경우 필터링
             if not include_filled:
                 orders = [
-                    order for order in orders 
+                    order for order in orders
                     if int(order.get('rmn_qty', 0)) > 0 and order.get('cncl_yn', 'N') != 'Y'
                 ]
-            
+
             logger.info(f"📋 당일 주문 조회: 전체 {len(result)}건, 반환 {len(orders)}건 ({'전체' if include_filled else '미체결만'})")
             return orders
         else:

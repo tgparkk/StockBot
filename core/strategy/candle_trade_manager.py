@@ -111,6 +111,85 @@ class CandleTradeManager:
 
         logger.info("✅ CandleTradeManager 초기화 완료")
 
+
+    # ========== 메인 실행 루프 ==========
+    async def start_trading(self):
+        """🕯️ 캔들 기반 매매 시작 - 패턴의 특성에 맞춘 최적화"""
+        try:
+            logger.info("🕯️ 캔들 기반 매매 시스템 시작")
+
+            # 기존 보유 종목 웹소켓 모니터링 설정
+            await self.setup_existing_holdings_monitoring()
+
+            # 거래일 초기화
+            await self._initialize_trading_day()
+
+            # 🆕 캔들패턴 전용 스캔 타이머 초기화
+            self._last_pattern_scan_time = None
+            self._pattern_scan_interval = self.scan_interval
+            self._signal_evaluation_interval = self.signal_evaluation_interval
+
+            # 🎯 초기 패턴 스캔 (시작시 한번)
+            logger.info("🔍 초기 캔들패턴 스캔 시작...")
+            await self._scan_and_detect_patterns()
+            self._last_pattern_scan_time = datetime.now()
+            logger.info("✅ 초기 패턴 스캔 완료")
+
+            # 메인 트레이딩 루프 시작
+            self.is_running = True
+            self._log_status()
+
+            while self.is_running:
+                try:
+                    current_time = datetime.now()
+
+                    # 🕯️ 1. 새로운 종목 패턴 스캔 (30분 간격 - 캔들패턴 특성 반영)
+                    if self._should_scan_new_patterns(current_time):
+                        logger.info("🔍 정기 캔들패턴 스캔 시작...")
+                        await self._scan_and_detect_patterns()
+                        self._last_pattern_scan_time = current_time
+                        logger.info("✅ 정기 패턴 스캔 완료")
+
+                    # 🔄 2. 기존 종목 신호 재평가 (30초 간격 - 실시간 모니터링)
+                    await self._periodic_signal_evaluation()
+
+                    # 💰 3. 진입 기회 평가 및 매수 실행
+                    await self.buy_evaluator.evaluate_entry_opportunities()
+
+                    # 📈 4. 기존 포지션 관리 - 매도 시그널 체크
+                    await self.sell_manager.manage_existing_positions()
+                    self.sell_manager.cleanup_adjustment_history()
+
+                    # 🧹 5. 미체결 주문 관리 (1분마다)
+                    if hasattr(self, '_last_stale_check_time'):
+                        if (current_time - self._last_stale_check_time).total_seconds() >= 60:
+                            await self.check_and_cancel_stale_orders()
+                            self._last_stale_check_time = current_time
+                    else:
+                        self._last_stale_check_time = current_time
+
+                    # 🧹 6. EXITED 종목 정리 (5분마다)
+                    if hasattr(self, '_last_cleanup_time'):
+                        if (current_time - self._last_cleanup_time).total_seconds() >= 300:  # 5분
+                            await self.cleanup_exited_positions()
+                            self._last_cleanup_time = current_time
+                    else:
+                        self._last_cleanup_time = current_time
+
+                    # 📊 7. 상태 업데이트
+                    self._log_status()
+
+                    # ⏰ 8. 대기 시간 (기본 30초 - 기존 종목 모니터링 중심)
+                    await asyncio.sleep(self._signal_evaluation_interval)
+
+                except Exception as e:
+                    logger.error(f"매매 루프 오류: {e}")
+                    await asyncio.sleep(10)  # 오류시 10초 대기 후 재시도
+
+        except Exception as e:
+            logger.error(f"캔들 매매 시작 오류: {e}")
+            self.is_running = False
+
     def _load_trading_config(self) -> Dict:
         """🆕 거래 설정 로드 (외부 파일 우선, 폴백 기본값)"""
         try:
@@ -126,7 +205,7 @@ class CandleTradeManager:
                 return external_config
 
             # 2. 폴백: 기본 설정 반환
-            logger.info("⚠️ 외부 설정 파일 없음 - 기본 설정 사용")
+            logger.warning("⚠️ 외부 설정 파일 없음 - 기본 설정 사용")
             return {}  # 빈 딕셔너리 반환 (기본값들은 get() 메소드로 처리)
 
         except Exception as e:
@@ -160,13 +239,13 @@ class CandleTradeManager:
         except Exception as e:
             logger.error(f"❌ 타임아웃 콜백 등록 오류: {e}")
 
-    def _handle_order_timeout(self, timeout_data: Dict, execution_info: Dict = None):
+    def _handle_order_timeout(self, timeout_data: Dict, execution_info: Optional[Dict] = None):
         """🆕 주문 타임아웃 처리 - 종목 상태 복원"""
         try:
             # 정상 체결 콜백인 경우 무시 (타임아웃 전용 함수)
             if execution_info is not None:
                 return  # 정상 체결 시에는 처리하지 않음
-                
+
             if timeout_data.get('action') != 'order_timeout':
                 return  # 타임아웃 이벤트가 아님
 
@@ -358,15 +437,15 @@ class CandleTradeManager:
                 logger.info(f"✅ {stock_code} _all_stocks에 기존 보유 종목으로 추가 완료")
 
                 # 4. 캔들 패턴 분석
-                #logger.debug(f"🔍 {stock_code} 캔들 패턴 분석 시작...")
+                logger.debug(f"🔍 {stock_code} 캔들 패턴 분석 시작...")
                 candle_analysis_result = await self._analyze_existing_holding_patterns(stock_code, stock_name, current_price)
 
                 # 5. 리스크 관리 설정 (패턴 분석 결과 반영)
-                #logger.debug(f"🔍 {stock_code} 리스크 관리 설정 중...")
+                logger.debug(f"🔍 {stock_code} 리스크 관리 설정 중...")
                 self.sell_manager.setup_holding_risk_management(existing_candidate, buy_price, current_price, candle_analysis_result)
 
                 # 6. 메타데이터 설정
-                #logger.debug(f"🔍 {stock_code} 메타데이터 설정 중...")
+                logger.debug(f"🔍 {stock_code} 메타데이터 설정 중...")
                 self._setup_holding_metadata(existing_candidate, candle_analysis_result)
 
                 # 6. 🆕 기존 보유 종목 매수 시간 추정 설정
@@ -464,87 +543,6 @@ class CandleTradeManager:
             logger.error(f"패턴 신호 생성 오류: {e}")
             return TradeSignal.HOLD, 0
 
-    # ==========================================
-    # 기존 메서드들 유지...
-    # ==========================================
-
-    # ========== 메인 실행 루프 ==========
-
-    async def start_trading(self):
-        """🕯️ 캔들 기반 매매 시작 - 패턴의 특성에 맞춘 최적화"""
-        try:
-            logger.info("🕯️ 캔들 기반 매매 시스템 시작")
-
-            # 기존 보유 종목 웹소켓 모니터링 설정
-            await self.setup_existing_holdings_monitoring()
-
-            # 거래일 초기화
-            await self._initialize_trading_day()
-
-            # 🆕 캔들패턴 전용 스캔 타이머 초기화
-            self._last_pattern_scan_time = None
-            self._pattern_scan_interval = 60   # 1분마다 새로운 종목 스캔 (급등 기회 놓치지 않기 위해 단축)
-            self._signal_evaluation_interval = 30  # 30초마다 기존 종목 재평가
-
-            # 🎯 초기 패턴 스캔 (시작시 한번)
-            logger.info("🔍 초기 캔들패턴 스캔 시작...")
-            await self._scan_and_detect_patterns()
-            self._last_pattern_scan_time = datetime.now()
-            logger.info("✅ 초기 패턴 스캔 완료")
-
-            # 메인 트레이딩 루프 시작
-            self.is_running = True
-            self._log_status()
-
-            while self.is_running:
-                try:
-                    current_time = datetime.now()
-
-                    # 🕯️ 1. 새로운 종목 패턴 스캔 (30분 간격 - 캔들패턴 특성 반영)
-                    if self._should_scan_new_patterns(current_time):
-                        logger.info("🔍 정기 캔들패턴 스캔 시작...")
-                        await self._scan_and_detect_patterns()
-                        self._last_pattern_scan_time = current_time
-                        logger.info("✅ 정기 패턴 스캔 완료")
-
-                    # 🔄 2. 기존 종목 신호 재평가 (30초 간격 - 실시간 모니터링)
-                    await self._periodic_signal_evaluation()
-
-                    # 💰 3. 진입 기회 평가 및 매수 실행
-                    await self._evaluate_entry_opportunities()
-
-                    # 📈 4. 기존 포지션 관리 - 매도 시그널 체크
-                    await self.sell_manager.manage_existing_positions()
-
-                    # 🧹 5. 미체결 주문 관리 (1분마다)
-                    if hasattr(self, '_last_stale_check_time'):
-                        if (current_time - self._last_stale_check_time).total_seconds() >= 60:
-                            await self.check_and_cancel_stale_orders()
-                            self._last_stale_check_time = current_time
-                    else:
-                        self._last_stale_check_time = current_time
-
-                    # 🧹 6. EXITED 종목 정리 (5분마다)
-                    if hasattr(self, '_last_cleanup_time'):
-                        if (current_time - self._last_cleanup_time).total_seconds() >= 300:  # 5분
-                            await self.cleanup_exited_positions()
-                            self._last_cleanup_time = current_time
-                    else:
-                        self._last_cleanup_time = current_time
-
-                    # 📊 7. 상태 업데이트
-                    self._log_status()
-
-                    # ⏰ 8. 대기 시간 (기본 30초 - 기존 종목 모니터링 중심)
-                    await asyncio.sleep(self._signal_evaluation_interval)
-
-                except Exception as e:
-                    logger.error(f"매매 루프 오류: {e}")
-                    await asyncio.sleep(10)  # 오류시 10초 대기 후 재시도
-
-        except Exception as e:
-            logger.error(f"캔들 매매 시작 오류: {e}")
-            self.is_running = False
 
     def _should_scan_new_patterns(self, current_time: datetime) -> bool:
         """🕯️ 새로운 패턴 스캔 필요 여부 판단 (캔들패턴 특성 반영)"""
@@ -561,7 +559,7 @@ class CandleTradeManager:
             if time_elapsed >= 300:  # 5분 이상 경과
                 # 현재 보유 종목 중 급등 종목이 있으면 시장에 다른 급등주도 있을 가능성
                 for candidate in self.stock_manager._all_stocks.values():
-                    if (candidate.status == CandleStatus.ENTERED and 
+                    if (candidate.status == CandleStatus.ENTERED and
                         candidate.performance and candidate.performance.pnl_pct and
                         candidate.performance.pnl_pct >= 5.0):  # 5% 이상 수익
                         logger.info("🚀 급등 종목 감지 - 추가 패턴 스캔 실행")
@@ -619,28 +617,6 @@ class CandleTradeManager:
         except Exception as e:
             logger.debug(f"매도 조건 확인 오류: {e}")
             return False
-
-    # ========== 진입 기회 평가 ==========
-    # 진입 기회 평가 = 매수 준비 종목 평가
-    async def _evaluate_entry_opportunities(self):
-        """진입 기회 평가 및 매수 실행 - BuyOpportunityEvaluator에 위임"""
-        try:
-            await self.buy_evaluator.evaluate_entry_opportunities()
-        except Exception as e:
-            logger.error(f"❌ 진입 기회 평가 오류: {e}")
-
-    # ========== 포지션 관리 ==========
-
-    async def _manage_existing_positions(self):
-        """기존 포지션 관리 (손절/익절/추적손절) - SellPositionManager에 위임"""
-        try:
-            await self.sell_manager.manage_existing_positions()
-
-            # 🧹 주기적으로 조정 이력 정리 (1시간마다)
-            self.sell_manager.cleanup_adjustment_history()
-
-        except Exception as e:
-            logger.error(f"❌ 포지션 관리 오류: {e}")
 
     # ========== 보조 함수들 ==========
 
@@ -948,7 +924,7 @@ class CandleTradeManager:
                 stock_code for stock_code, candidate in self.stock_manager._all_stocks.items()
                 if candidate.status == CandleStatus.EXITED
             ]
-            
+
             cleanup_count = 0
             for stock_code in exited_stocks:
                 try:
@@ -957,19 +933,19 @@ class CandleTradeManager:
                     profit_info = ""
                     if candidate.performance and candidate.performance.pnl_pct is not None:
                         profit_info = f" (수익률: {candidate.performance.pnl_pct:+.2f}%)"
-                    
+
                     # _all_stocks에서 제거
                     del self.stock_manager._all_stocks[stock_code]
                     cleanup_count += 1
-                    
+
                     logger.debug(f"🧹 {stock_code} EXITED 종목 제거 완료{profit_info}")
-                    
+
                 except Exception as e:
                     logger.warning(f"⚠️ {stock_code} EXITED 종목 제거 실패: {e}")
-            
+
             if cleanup_count > 0:
                 logger.info(f"🧹 EXITED 종목 정리 완료: {cleanup_count}개 제거 (메모리 절약)")
-                
+
         except Exception as e:
             logger.error(f"❌ EXITED 종목 정리 오류: {e}")
 
@@ -1178,15 +1154,9 @@ class CandleTradeManager:
             if watching_candidates:
                 logger.debug(f"📊 관찰 중인 종목 재평가: {len(watching_candidates)}개")
 
-                # 1-1. 신호(TradeSignal) 업데이트
-                signal_updated = await self._batch_update_signals_for_watching_stocks(watching_candidates)
-                #logger.debug(f"✅ 관찰 종목 신호 업데이트: {signal_updated}개")
-
-                # 1-2. 상태(CandleStatus) 전환 검토
-                status_changed = await self._batch_evaluate_status_transitions(watching_candidates)
-                #logger.debug(f"✅ 관찰 종목 상태 전환: {status_changed}개")
-
-                watch_updated = signal_updated + status_changed
+                # 🆕 통합된 신호 업데이트 및 상태 전환 처리
+                watch_updated = await self._batch_evaluate_watching_stocks(watching_candidates)
+                logger.debug(f"✅ 관찰 종목 처리 완료: {watch_updated}개")
 
             # 🎯 2. 진입한 종목들 재평가 (매도 신호 중심)
             if entered_candidates:
@@ -1197,20 +1167,53 @@ class CandleTradeManager:
         except Exception as e:
             logger.error(f"주기적 신호 재평가 오류: {e}")
 
-    async def _batch_update_signals_for_watching_stocks(self, candidates: List[CandleTradeCandidate]) -> int:
-        """관찰 중인 종목들 신호(TradeSignal) 업데이트"""
+    async def _batch_evaluate_watching_stocks(self, candidates: List[CandleTradeCandidate]) -> int:
+        """🆕 관찰 중인 종목들 통합 처리 - 신호 업데이트 및 상태 전환"""
         try:
-            updated_count = 0
+            signal_updated_count = 0
+            status_changed_count = 0
 
-            # API 호출 제한을 위해 5개씩 배치 처리
-            batch_size = 5
-            for i in range(0, len(candidates), batch_size):
-                batch = candidates[i:i + batch_size]
+            # 🔧 매수 신호 재평가가 필요한 모든 상태 포함 (WATCHING, SCANNING, BUY_READY)
+            eligible_candidates = [
+                c for c in candidates
+                if c.status in [CandleStatus.WATCHING, CandleStatus.SCANNING, CandleStatus.BUY_READY]
+            ]
 
+            if not eligible_candidates:
+                logger.debug(f"📊 매수 신호 재평가 대상 없음 (입력: {len(candidates)}개)")
+                return 0
+
+            logger.info(f"🔍 관찰 종목 통합 처리 대상: {len(eligible_candidates)}개 (WATCHING/SCANNING/BUY_READY)")
+
+            # 🆕 Step 1: 배치별 가격 정보 조회 (API 호출 최적화)
+            batch_size = 10
+            current_data_dict = {}  # 종목별 current_data 저장
+
+            for i in range(0, len(eligible_candidates), batch_size):
+                batch = eligible_candidates[i:i + batch_size]
+
+                # 🎯 배치 시작 시 가격 정보 조회
                 for candidate in batch:
                     try:
-                        # 다각도 종합 분석 수행
-                        analysis_result = await self.candle_analyzer.comprehensive_signal_analysis(candidate)
+                        from ..api.kis_market_api import get_inquire_price
+                        current_data = get_inquire_price("J", candidate.stock_code)
+                        if current_data is not None and not current_data.empty:
+                            current_data_dict[candidate.stock_code] = current_data
+                    except Exception as e:
+                        logger.debug(f"가격 조회 오류 ({candidate.stock_code}): {e}")
+                        continue
+
+                # 🎯 Step 2: 신호(TradeSignal) 업데이트 (current_data 활용)
+                for candidate in batch:
+                    try:
+                        stock_current_data = current_data_dict.get(candidate.stock_code)
+                        if stock_current_data is None:
+                            continue
+
+                        # 다각도 종합 분석 수행 (current_data 전달)
+                        analysis_result = await self.candle_analyzer.comprehensive_signal_analysis(
+                            candidate, current_data=stock_current_data
+                        )
 
                         if analysis_result and self._should_update_signal(candidate, analysis_result):
                             # 신호 업데이트
@@ -1225,64 +1228,65 @@ class CandleTradeManager:
                             # stock_manager 업데이트
                             self.stock_manager.update_candidate(candidate)
 
-                            #logger.info(f"🔄 {candidate.stock_code} 신호 업데이트: "
-                            #           f"{old_signal.value} → {candidate.trade_signal.value} "
-                            #           f"(강도:{candidate.signal_strength})")
-                            updated_count += 1
+                            logger.debug(f"🔄 {candidate.stock_code} 신호 업데이트: "
+                                       f"{old_signal.value} → {candidate.trade_signal.value} "
+                                       f"(강도:{candidate.signal_strength})")
+                            signal_updated_count += 1
 
                     except Exception as e:
-                        logger.debug(f"종목 재평가 오류 ({candidate.stock_code}): {e}")
+                        logger.debug(f"종목 신호 재평가 오류 ({candidate.stock_code}): {e}")
                         continue
 
                 # API 호출 간격 조절
-                if i + batch_size < len(candidates):
+                if i + batch_size < len(eligible_candidates):
                     await asyncio.sleep(0.5)  # 0.5초 대기
 
-            return updated_count
+            # 🎯 Step 3: 상태(CandleStatus) 전환 검토 (current_data_dict 전달)
+            status_changed_count = await self.buy_evaluator.evaluate_watching_stocks_for_entry(
+                eligible_candidates, current_data_dict
+            )
+
+            # 결과 로깅
+            if signal_updated_count > 0:
+                logger.debug(f"✅ 신호 업데이트: {signal_updated_count}개 종목")
+            if status_changed_count > 0:
+                logger.info(f"🎯 BUY_READY 전환: {status_changed_count}개 종목")
+
+            return signal_updated_count + status_changed_count
 
         except Exception as e:
-            logger.error(f"관찰 종목 신호 업데이트 오류: {e}")
-            return 0
-
-    async def _batch_evaluate_status_transitions(self, candidates: List[CandleTradeCandidate]) -> int:
-        """관찰 중인 종목들 상태(CandleStatus) 전환 검토"""
-        try:
-            # 🔧 매수 신호 재평가가 필요한 모든 상태 포함 (WATCHING, SCANNING, BUY_READY)
-            eligible_candidates = [
-                c for c in candidates
-                if c.status in [CandleStatus.WATCHING, CandleStatus.SCANNING, CandleStatus.BUY_READY]
-            ]
-
-            if not eligible_candidates:
-                logger.debug(f"📊 매수 신호 재평가 대상 없음 (입력: {len(candidates)}개)")
-                return 0
-
-            logger.info(f"🔍 매수 신호 재평가 대상: {len(eligible_candidates)}개 (WATCHING/SCANNING/BUY_READY)")
-
-            # 매수 신호 재평가 및 상태 전환 검토 (BuyOpportunityEvaluator 위임)
-            buy_ready_count = await self.buy_evaluator.evaluate_watching_stocks_for_entry(eligible_candidates)
-            if buy_ready_count > 0:
-                logger.info(f"🎯 BUY_READY 전환: {buy_ready_count}개 종목")
-
-            return buy_ready_count
-
-        except Exception as e:
-            logger.error(f"상태 전환 검토 오류: {e}")
+            logger.error(f"관찰 종목 통합 처리 오류: {e}")
             return 0
 
     async def _batch_evaluate_entered_stocks(self, candidates: List[CandleTradeCandidate]) -> int:
-        """진입한 종목들 배치 재평가 (매도 신호 중심) - 5개씩 병렬 처리"""
+        """진입한 종목들 배치 재평가 (매도 신호 중심) - current_data 최적화"""
         try:
             updated_count = 0
-            batch_size = 5
+            batch_size = 10
 
-            # 5개씩 배치로 나누어 병렬 처리
+            # 5개씩 배치로 나누어 처리
             for i in range(0, len(candidates), batch_size):
                 batch = candidates[i:i + batch_size]
 
-                # 배치 내 모든 종목을 동시에 분석
+                # 🆕 배치 시작 시 가격 정보 조회
+                current_data_dict = {}
+                for candidate in batch:
+                    try:
+                        from ..api.kis_market_api import get_inquire_price
+                        current_data = get_inquire_price("J", candidate.stock_code)
+                        if current_data is not None and not current_data.empty:
+                            current_data_dict[candidate.stock_code] = current_data
+                    except Exception as e:
+                        logger.debug(f"가격 조회 오류 ({candidate.stock_code}): {e}")
+                        continue
+
+                # 배치 내 모든 종목을 동시에 분석 (current_data 전달)
                 analysis_tasks = [
-                    self.candle_analyzer.comprehensive_signal_analysis(candidate, focus_on_exit=True)
+                    self.candle_analyzer.comprehensive_signal_analysis(
+                        candidate,
+                        focus_on_exit=True,
+                        current_data=current_data_dict.get(candidate.stock_code)
+                    )
                     for candidate in batch
                 ]
 
@@ -1321,7 +1325,7 @@ class CandleTradeManager:
 
                 # 배치 간 짧은 간격 (API 부하 방지)
                 if i + batch_size < len(candidates):
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.5)
 
             return updated_count
 
@@ -1523,12 +1527,12 @@ class CandleTradeManager:
 
                 # 🆕 정정취소가능주문조회로 정확한 주문조직번호 획득
                 from ..api.kis_order_api import get_inquire_psbl_rvsecncl_lst
-                
+
                 try:
                     cancelable_orders = get_inquire_psbl_rvsecncl_lst()
                     ord_orgno = ""
                     ord_dvsn = "01"  # 기본값
-                    
+
                     if cancelable_orders is not None and not cancelable_orders.empty:
                         # 해당 주문번호 찾기
                         for _, order in cancelable_orders.iterrows():
@@ -1537,13 +1541,13 @@ class CandleTradeManager:
                                 ord_dvsn = order.get('ord_dvsn', '01')
                                 logger.debug(f"📋 {candidate.stock_code} 매수 주문정보 획득: 조직번호={ord_orgno}, 구분={ord_dvsn}")
                                 break
-                    
+
                     if not ord_orgno:
                         logger.warning(f"⚠️ {candidate.stock_code} 매수 주문조직번호 획득 실패 - 상태만 복원")
                         candidate.clear_pending_order('buy')
                         candidate.status = CandleStatus.BUY_READY
                         return
-                        
+
                 except Exception as e:
                     logger.error(f"❌ {candidate.stock_code} 정정취소가능주문조회 오류: {e}")
                     candidate.clear_pending_order('buy')
@@ -1588,12 +1592,12 @@ class CandleTradeManager:
 
                 # 🆕 정정취소가능주문조회로 정확한 주문조직번호 획득
                 from ..api.kis_order_api import get_inquire_psbl_rvsecncl_lst
-                
+
                 try:
                     cancelable_orders = get_inquire_psbl_rvsecncl_lst()
                     ord_orgno = ""
                     ord_dvsn = "01"  # 기본값
-                    
+
                     if cancelable_orders is not None and not cancelable_orders.empty:
                         # 해당 주문번호 찾기
                         for _, order in cancelable_orders.iterrows():
@@ -1602,13 +1606,13 @@ class CandleTradeManager:
                                 ord_dvsn = order.get('ord_dvsn', '01')
                                 logger.debug(f"📋 {candidate.stock_code} 매도 주문정보 획득: 조직번호={ord_orgno}, 구분={ord_dvsn}")
                                 break
-                    
+
                     if not ord_orgno:
                         logger.warning(f"⚠️ {candidate.stock_code} 매도 주문조직번호 획득 실패 - 상태만 복원")
                         candidate.clear_pending_order('sell')
                         candidate.status = CandleStatus.ENTERED
                         return
-                        
+
                 except Exception as e:
                     logger.error(f"❌ {candidate.stock_code} 정정취소가능주문조회 오류: {e}")
                     candidate.clear_pending_order('sell')

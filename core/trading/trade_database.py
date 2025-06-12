@@ -1469,13 +1469,18 @@ class TradeDatabase:
                 existing = cursor.fetchone()
                 if existing:
                     # 기존 기록 업데이트
+                    # 🆕 한국시간 사용
+                    from datetime import datetime, timezone, timedelta
+                    korea_tz = timezone(timedelta(hours=9))
+                    current_time_kr = datetime.now(korea_tz).strftime('%Y-%m-%d %H:%M:%S')
+
                     cursor.execute("""
                         UPDATE candle_candidates SET
                             current_price = ?, pattern_strength = ?,
                             entry_reason = ?, risk_score = ?,
                             target_price = ?, stop_loss_price = ?,
                             rsi_value = ?, macd_value = ?, volume_ratio = ?,
-                            price_change_rate = ?, updated_at = CURRENT_TIMESTAMP
+                            price_change_rate = ?, updated_at = ?
                         WHERE id = ?
                     """, (
                         current_price, pattern_strength, entry_reason, risk_score,
@@ -1484,11 +1489,17 @@ class TradeDatabase:
                         technical_data.get('macd_value'),
                         technical_data.get('volume_ratio'),
                         technical_data.get('price_change_rate'),
+                        current_time_kr,
                         existing[0]
                     ))
                     return existing[0]
                 else:
                     # 새 기록 생성
+                    # 🆕 한국시간 사용
+                    from datetime import datetime, timezone, timedelta
+                    korea_tz = timezone(timedelta(hours=9))
+                    current_time_kr = datetime.now(korea_tz).strftime('%Y-%m-%d %H:%M:%S')
+
                     cursor.execute("""
                         INSERT INTO candle_candidates (
                             stock_code, stock_name, detected_at, current_price,
@@ -1496,9 +1507,9 @@ class TradeDatabase:
                             entry_signal, entry_reason, risk_score,
                             target_price, stop_loss_price,
                             rsi_value, macd_value, volume_ratio, price_change_rate
-                        ) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        stock_code, stock_name, current_price,
+                        stock_code, stock_name, current_time_kr, current_price,
                         pattern_type, pattern_strength, signal_strength,
                         signal_strength, entry_reason, risk_score,
                         target_price, stop_loss_price,
@@ -1530,6 +1541,11 @@ class TradeDatabase:
                     'resistance_level': additional_data.get('resistance_level')
                 }, ensure_ascii=False)
 
+                # 🆕 한국시간 사용
+                from datetime import datetime, timezone, timedelta
+                korea_tz = timezone(timedelta(hours=9))
+                current_time_kr = datetime.now(korea_tz).strftime('%Y-%m-%d %H:%M:%S')
+
                 cursor.execute("""
                     INSERT INTO candle_trades (
                         candidate_id, trade_type, stock_code, stock_name,
@@ -1538,12 +1554,13 @@ class TradeDatabase:
                         market_condition, timestamp,
                         entry_price, profit_loss, profit_rate, hold_duration,
                         stop_loss_triggered, target_achieved, trailing_stop_triggered
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     candidate_id, trade_type, stock_code, stock_name,
                     quantity, price, total_amount, order_id,
                     decision_reason, pattern_matched, technical_signals,
                     additional_data.get('market_condition', 'NORMAL'),
+                    current_time_kr,
                     additional_data.get('entry_price'),
                     additional_data.get('profit_loss', 0),
                     additional_data.get('profit_rate', 0.0),
@@ -1559,17 +1576,17 @@ class TradeDatabase:
                 if trade_type == 'ENTRY':
                     cursor.execute("""
                         UPDATE candle_candidates SET
-                            status = 'ENTERED', executed_at = CURRENT_TIMESTAMP,
-                            updated_at = CURRENT_TIMESTAMP
+                            status = 'ENTERED', executed_at = ?,
+                            updated_at = ?
                         WHERE id = ?
-                    """, (candidate_id,))
+                    """, (current_time_kr, current_time_kr, candidate_id))
                 elif trade_type == 'EXIT':
                     cursor.execute("""
                         UPDATE candle_candidates SET
                             status = 'EXITED', exit_reason = ?,
-                            updated_at = CURRENT_TIMESTAMP
+                            updated_at = ?
                         WHERE id = ?
-                    """, (decision_reason, candidate_id))
+                    """, (decision_reason, current_time_kr, candidate_id))
 
                 return trade_id
 
@@ -1586,15 +1603,20 @@ class TradeDatabase:
 
                 candle_data_json = json.dumps(candle_data, ensure_ascii=False)
 
+                # 🆕 한국시간 사용
+                from datetime import datetime, timezone, timedelta
+                korea_tz = timezone(timedelta(hours=9))
+                current_time_kr = datetime.now(korea_tz).strftime('%Y-%m-%d %H:%M:%S')
+
                 cursor.execute("""
                     INSERT INTO candle_patterns (
                         stock_code, analysis_time, pattern_name, pattern_type,
                         confidence_score, strength, candle_data,
                         volume_analysis, trend_analysis, support_resistance,
                         predicted_direction, predicted_price_range, success_probability
-                    ) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    stock_code, pattern_name, pattern_type,
+                    stock_code, current_time_kr, pattern_name, pattern_type,
                     confidence_score, strength, candle_data_json,
                     analysis_data.get('volume_analysis'),
                     analysis_data.get('trend_analysis'),
@@ -1619,14 +1641,19 @@ class TradeDatabase:
 
                 scan_config_json = json.dumps(scan_config or {}, ensure_ascii=False)
 
+                # 🆕 한국시간 사용
+                from datetime import datetime, timezone, timedelta
+                korea_tz = timezone(timedelta(hours=9))
+                current_time_kr = datetime.now(korea_tz).strftime('%Y-%m-%d %H:%M:%S')
+
                 cursor.execute("""
                     INSERT INTO market_scans (
                         scan_time, market_type, scan_duration,
                         total_stocks_scanned, candidates_found, patterns_detected,
                         market_sentiment, volatility_level, scan_config
-                    ) VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    market_type, scan_duration,
+                    current_time_kr, market_type, scan_duration,
                     total_stocks_scanned, candidates_found, patterns_detected,
                     market_sentiment, volatility_level, scan_config_json
                 ))
@@ -1648,6 +1675,11 @@ class TradeDatabase:
                 reasons_json = json.dumps(recommendation_reasons, ensure_ascii=False)
                 technical_json = json.dumps(analysis_data.get('technical_indicators', {}), ensure_ascii=False)
 
+                # 🆕 한국시간 사용
+                from datetime import datetime, timezone, timedelta
+                korea_tz = timezone(timedelta(hours=9))
+                current_time_kr = datetime.now(korea_tz).strftime('%Y-%m-%d %H:%M:%S')
+
                 cursor.execute("""
                     INSERT INTO existing_holdings_analysis (
                         stock_code, stock_name, analysis_time,
@@ -1656,9 +1688,9 @@ class TradeDatabase:
                         recommendation, recommendation_reasons, risk_level,
                         current_pattern, pattern_strength, technical_indicators,
                         suggested_action, target_sell_price, stop_loss_price
-                    ) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    stock_code, stock_name,
+                    stock_code, stock_name, current_time_kr,
                     quantity, avg_price, current_price,
                     total_value, profit_loss, profit_rate,
                     recommendation, reasons_json, risk_level,
