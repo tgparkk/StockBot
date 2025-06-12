@@ -185,5 +185,54 @@
         "min_pattern_confidence": 0.65,
         "max_daily_trades": 5,
         "comment": "매수 신호 생성 임계값 설정"
+    },
+    "market_condition_adjustments": {
+        "comment": "시장 상황에 따른 매매 전략 조정",
+        "bull_market": {
+            "entry_threshold_multiplier": 0.8,
+            "position_size_multiplier": 1.2,
+            "pattern_weight_bonus": 10,
+            "max_positions_bonus": 5,
+            "description": "상승장: 더 적극적 진입"
+        },
+        "bear_market": {
+            "entry_threshold_multiplier": 1.3,
+            "position_size_multiplier": 0.7,
+            "pattern_weight_penalty": -15,
+            "max_positions_reduction": -10,
+            "description": "하락장: 보수적 진입"
+        },
+        "neutral_market": {
+            "entry_threshold_multiplier": 1.0,
+            "position_size_multiplier": 1.0,
+            "pattern_weight_bonus": 0,
+            "max_positions_bonus": 0,
+            "description": "중립장: 기본 설정"
+        },
+        "high_volatility": {
+            "stop_loss_tighter": 0.7,
+            "target_profit_wider": 1.3,
+            "position_size_reduction": 0.8,
+            "description": "고변동성: 손절 강화, 목표 확대"
+        },
+        "low_volatility": {
+            "stop_loss_relaxed": 1.2,
+            "target_profit_normal": 1.0,
+            "position_size_normal": 1.0,
+            "description": "저변동성: 일반적 설정"
+        },
+        "foreign_buying": {
+            "bullish_pattern_bonus": 15,
+            "entry_confidence_bonus": 0.1,
+            "description": "외국인 매수: 상승 패턴 가중치 증가"
+        },
+        "foreign_selling": {
+            "bearish_pattern_awareness": true,
+            "entry_caution_multiplier": 1.2,
+            "quick_exit_trigger": true,
+            "description": "외국인 매도: 신중한 진입, 빠른 청산"
+        },
+        "update_interval_seconds": 300,
+        "enable_market_condition_logging": true
     }
 }

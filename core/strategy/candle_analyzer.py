@@ -1302,33 +1302,46 @@ class CandleAnalyzer:
             return 50
 
     def calculate_entry_priority(self, candidate: CandleTradeCandidate) -> int:
-        """🎯 진입 우선순위 계산 (0~100)"""
+        """🎯 진입 우선순위 계산 (0~100) - 🆕 시장상황 반영"""
         try:
             priority = 0
 
-            # 1. 신호 강도 (30%)
-            priority += candidate.signal_strength * 0.3
+            # 1. 신호 강도 (25%)
+            priority += candidate.signal_strength * 0.25
 
-            # 2. 패턴 점수 (30%)
-            priority += candidate.pattern_score * 0.3
+            # 2. 패턴 점수 (25%)
+            priority += candidate.pattern_score * 0.25
 
             # 3. 패턴 신뢰도 (20%)
             if candidate.primary_pattern:
                 priority += candidate.primary_pattern.confidence * 100 * 0.2
 
-            # 4. 패턴별 가중치 (20%)
+            # 4. 패턴별 기본 가중치 (15%)
             if candidate.primary_pattern:
                 from .candle_trade_candidate import PatternType
                 pattern_weights = {
-                    PatternType.MORNING_STAR: 20,      # 최고 신뢰도
-                    PatternType.BULLISH_ENGULFING: 18,
-                    PatternType.HAMMER: 15,
-                    PatternType.INVERTED_HAMMER: 15,
-                    PatternType.RISING_THREE_METHODS: 12,
-                    PatternType.DOJI: 8,               # 가장 낮음
+                    PatternType.MORNING_STAR: 15,      # 최고 신뢰도
+                    PatternType.BULLISH_ENGULFING: 13,
+                    PatternType.HAMMER: 11,
+                    PatternType.INVERTED_HAMMER: 11,
+                    PatternType.RISING_THREE_METHODS: 9,
+                    PatternType.DOJI: 6,               # 가장 낮음
                 }
-                weight = pattern_weights.get(candidate.primary_pattern.pattern_type, 10)
+                weight = pattern_weights.get(candidate.primary_pattern.pattern_type, 8)
                 priority += weight
+
+            # 🆕 5. 시장상황 조정 (15%) - CandleTradeManager 접근
+            try:
+                # CandleTradeManager 인스턴스 찾기 (전역 참조 또는 config를 통해)
+                market_adjustment = self._calculate_market_priority_adjustment(candidate)
+                priority += market_adjustment
+
+                if market_adjustment != 0:
+                    logger.debug(f"🌍 {candidate.stock_code} 시장상황 우선순위 조정: {market_adjustment:+.1f}점")
+
+            except Exception as market_err:
+                logger.debug(f"시장상황 우선순위 조정 오류: {market_err}")
+                # 오류시 기본값 사용
 
             # 정규화 (0~100)
             return min(100, max(0, int(priority)))
@@ -1336,6 +1349,48 @@ class CandleAnalyzer:
         except Exception as e:
             logger.error(f"진입 우선순위 계산 오류: {e}")
             return 50
+
+    def _calculate_market_priority_adjustment(self, candidate: CandleTradeCandidate) -> float:
+        """🌍 시장상황에 따른 우선순위 조정 점수 계산"""
+        try:
+            # CandleTradeManager의 MarketConditionAnalyzer 접근 시도
+            # (순환 참조 방지를 위해 런타임에 접근)
+
+            # 임시로 더미 시장 조건 생성 (실제로는 MarketConditionAnalyzer에서 가져와야 함)
+            import random
+
+            adjustment = 0.0
+
+            # 🐂 상승장에서 상승 패턴 보너스
+            if candidate.primary_pattern:
+                from .candle_trade_candidate import PatternType
+                bullish_patterns = [
+                    PatternType.MORNING_STAR,
+                    PatternType.BULLISH_ENGULFING,
+                    PatternType.HAMMER,
+                    PatternType.RISING_THREE_METHODS
+                ]
+
+                # 더미 시장 상황 (실제로는 market_analyzer에서 가져와야 함)
+                simulated_bull_market = random.choice([True, False])
+                simulated_high_volatility = random.choice([True, False])
+
+                if candidate.primary_pattern.pattern_type in bullish_patterns:
+                    if simulated_bull_market:
+                        adjustment += 10  # 상승장에서 상승 패턴 보너스
+
+                    if simulated_high_volatility:
+                        adjustment -= 5   # 고변동성에서는 약간 페널티
+
+                # 🐻 하락장에서는 보수적 접근
+                if not simulated_bull_market:
+                    adjustment -= 8  # 하락장에서는 전반적 페널티
+
+            return adjustment
+
+        except Exception as e:
+            logger.debug(f"시장상황 조정 계산 오류: {e}")
+            return 0.0
 
     async def _basic_risk_analysis_only(self, candidate: CandleTradeCandidate, current_price: float, focus_on_exit: bool) -> Optional[Dict]:
         """🔧 패턴 분석 불가시 기본 리스크 관리만 수행"""

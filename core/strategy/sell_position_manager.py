@@ -65,8 +65,11 @@ class SellPositionManager:
     def __init__(self, candle_trade_manager: 'CandleTradeManager'):
         """
         Args:
-            candle_trade_manager: CandleTradeManager 인스턴스
+            candle_trade_manager: CandleTradeManager 인스턴스 (필수)
         """
+        if not candle_trade_manager:
+            raise ValueError("candle_trade_manager는 필수 인자입니다.")
+
         self.manager = candle_trade_manager
 
         # 🚨 연속 조정 방지를 위한 이력 추적

@@ -102,6 +102,10 @@ class CandleTradeManager:
         from .sell_position_manager import SellPositionManager
         self.sell_manager = SellPositionManager(self)
 
+        # 🆕 시장 상황 분석기 초기화
+        from .market_condition_analyzer import MarketConditionAnalyzer
+        self.market_analyzer = MarketConditionAnalyzer()
+
         # 🆕 주문 타임아웃 콜백 등록 (OrderExecutionManager와 연동)
         self._register_order_timeout_callback()
 
@@ -150,10 +154,14 @@ class CandleTradeManager:
                         self._last_pattern_scan_time = current_time
                         logger.info("✅ 정기 패턴 스캔 완료")
 
-                    # 🔄 2. 기존 종목 신호 재평가 (30초 간격 - 실시간 모니터링)
+                    # 🌍 2. 시장 상황 분석 (5분마다)
+                    if self.market_analyzer.should_update():
+                        await self.market_analyzer.analyze_market_condition()
+
+                    # 🔄 3. 기존 종목 신호 재평가 (30초 간격 - 실시간 모니터링)
                     await self._periodic_signal_evaluation()
 
-                    # 💰 3. 진입 기회 평가 및 매수 실행
+                    # 💰 4. 진입 기회 평가 및 매수 실행 (시장상황 반영)
                     await self.buy_evaluator.evaluate_entry_opportunities()
 
                     # 📈 4. 기존 포지션 관리 - 매도 시그널 체크
@@ -1438,9 +1446,12 @@ class CandleTradeManager:
     # ========== 공개 인터페이스 (간소화) ==========
 
     def get_current_status(self) -> Dict[str, Any]:
-        """현재 상태 조회"""
+        """현재 상태 조회 (🆕 시장상황 포함)"""
         try:
             stats = self.stock_manager.get_summary_stats()
+
+            # 🆕 시장상황 정보 포함
+            market_condition = self.market_analyzer.get_current_condition()
 
             return {
                 'is_running': self.is_running,
@@ -1453,7 +1464,23 @@ class CandleTradeManager:
                 },
                 'market_scanner': self.market_scanner.get_scan_status() if hasattr(self, 'market_scanner') else None,
                 'daily_stats': self.daily_stats,
-                'config': self.config
+                'config': self.config,
+                # 🆕 시장 상황 정보 추가
+                'market_condition': {
+                    'kospi_trend': market_condition.kospi_trend.value,
+                    'kosdaq_trend': market_condition.kosdaq_trend.value,
+                    'kospi_change_pct': market_condition.kospi_change_pct,
+                    'kosdaq_change_pct': market_condition.kosdaq_change_pct,
+                    'volatility': market_condition.volatility.value,
+                    'volume_condition': market_condition.volume_condition.value,
+                    'foreign_flow': market_condition.foreign_flow.value,
+                    'institution_flow': market_condition.institution_flow.value,
+                    'market_strength_score': self.market_analyzer.get_market_strength_score(),
+                    'market_risk_level': self.market_analyzer.get_market_risk_level(),
+                    'last_updated': market_condition.last_updated.strftime('%H:%M:%S'),
+                    'data_quality': market_condition.data_quality,
+                    'confidence_score': market_condition.confidence_score
+                }
             }
 
         except Exception as e:
