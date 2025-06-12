@@ -129,7 +129,7 @@ class BuyOpportunityEvaluator:
                     #           f"가용자금={available_funds:,.0f}원, 최소투자금={min_investment:,.0f}원")
 
                     investment_amount = self._calculate_entry_params(candidate, available_funds, current_positions)
-                    #logger.info(f"💰 {candidate.stock_code} 계산된 투자금액: {investment_amount:,.0f}원")
+                    logger.debug(f"💰 {candidate.stock_code} 계산된 투자금액: {investment_amount:,.0f}원")
 
                     if investment_amount < min_investment:
                         logger.warning(f"⚠️ {candidate.stock_code} 투자금액 부족: {investment_amount:,.0f}원 < {min_investment:,.0f}원")
