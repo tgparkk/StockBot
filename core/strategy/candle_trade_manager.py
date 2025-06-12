@@ -160,9 +160,13 @@ class CandleTradeManager:
         except Exception as e:
             logger.error(f"❌ 타임아웃 콜백 등록 오류: {e}")
 
-    def _handle_order_timeout(self, timeout_data: Dict):
+    def _handle_order_timeout(self, timeout_data: Dict, execution_info: Dict = None):
         """🆕 주문 타임아웃 처리 - 종목 상태 복원"""
         try:
+            # 정상 체결 콜백인 경우 무시 (타임아웃 전용 함수)
+            if execution_info is not None:
+                return  # 정상 체결 시에는 처리하지 않음
+                
             if timeout_data.get('action') != 'order_timeout':
                 return  # 타임아웃 이벤트가 아님
 
@@ -479,7 +483,7 @@ class CandleTradeManager:
 
             # 🆕 캔들패턴 전용 스캔 타이머 초기화
             self._last_pattern_scan_time = None
-            self._pattern_scan_interval = 1800  # 30분마다 새로운 종목 스캔 (캔들패턴 특성 반영)
+            self._pattern_scan_interval = 60   # 1분마다 새로운 종목 스캔 (급등 기회 놓치지 않기 위해 단축)
             self._signal_evaluation_interval = 30  # 30초마다 기존 종목 재평가
 
             # 🎯 초기 패턴 스캔 (시작시 한번)
@@ -520,10 +524,18 @@ class CandleTradeManager:
                     else:
                         self._last_stale_check_time = current_time
 
-                    # 📊 6. 상태 업데이트
+                    # 🧹 6. EXITED 종목 정리 (5분마다)
+                    if hasattr(self, '_last_cleanup_time'):
+                        if (current_time - self._last_cleanup_time).total_seconds() >= 300:  # 5분
+                            await self.cleanup_exited_positions()
+                            self._last_cleanup_time = current_time
+                    else:
+                        self._last_cleanup_time = current_time
+
+                    # 📊 7. 상태 업데이트
                     self._log_status()
 
-                    # ⏰ 7. 대기 시간 (기본 30초 - 기존 종목 모니터링 중심)
+                    # ⏰ 8. 대기 시간 (기본 30초 - 기존 종목 모니터링 중심)
                     await asyncio.sleep(self._signal_evaluation_interval)
 
                 except Exception as e:
@@ -540,10 +552,20 @@ class CandleTradeManager:
             if not self._last_pattern_scan_time:
                 return True  # 첫 스캔
 
-            # 기본 시간 간격 체크 (30분)
+            # 기본 시간 간격 체크 (10분)
             time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
             if time_elapsed >= self._pattern_scan_interval:
                 return True
+
+            # 🆕 급등 감지시 즉시 추가 스캔 (5분 이상 경과시)
+            if time_elapsed >= 300:  # 5분 이상 경과
+                # 현재 보유 종목 중 급등 종목이 있으면 시장에 다른 급등주도 있을 가능성
+                for candidate in self.stock_manager._all_stocks.values():
+                    if (candidate.status == CandleStatus.ENTERED and 
+                        candidate.performance and candidate.performance.pnl_pct and
+                        candidate.performance.pnl_pct >= 5.0):  # 5% 이상 수익
+                        logger.info("🚀 급등 종목 감지 - 추가 패턴 스캔 실행")
+                        return True
 
             # 🎯 특별한 상황에서 추가 스캔 (캔들패턴 거래에 중요한 시점들)
             current_hour = current_time.hour
@@ -912,9 +934,44 @@ class CandleTradeManager:
             logger.debug(f"기존 보유 종목 매도 시그널 체크 오류 ({stock_code}): {e}")
 
     def cleanup_existing_holdings_monitoring(self):
-        """기존 보유 종목 웹소켓 모니터링 정리"""
-        logger.info("🧹 기존 보유 종목 웹소켓 모니터링 정리")
-        self.existing_holdings_callbacks.clear()
+        """기존 보유 종목 모니터링 정리"""
+        try:
+            # 웹소켓 구독 해제는 자동으로 처리됨
+            logger.info("✅ 기존 보유 종목 모니터링 정리 완료")
+        except Exception as e:
+            logger.error(f"기존 보유 종목 모니터링 정리 오류: {e}")
+
+    async def cleanup_exited_positions(self):
+        """🧹 EXITED 상태 종목들을 _all_stocks에서 제거 (메모리 정리)"""
+        try:
+            exited_stocks = [
+                stock_code for stock_code, candidate in self.stock_manager._all_stocks.items()
+                if candidate.status == CandleStatus.EXITED
+            ]
+            
+            cleanup_count = 0
+            for stock_code in exited_stocks:
+                try:
+                    # 메타데이터 보존하여 로깅
+                    candidate = self.stock_manager._all_stocks[stock_code]
+                    profit_info = ""
+                    if candidate.performance and candidate.performance.pnl_pct is not None:
+                        profit_info = f" (수익률: {candidate.performance.pnl_pct:+.2f}%)"
+                    
+                    # _all_stocks에서 제거
+                    del self.stock_manager._all_stocks[stock_code]
+                    cleanup_count += 1
+                    
+                    logger.debug(f"🧹 {stock_code} EXITED 종목 제거 완료{profit_info}")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ {stock_code} EXITED 종목 제거 실패: {e}")
+            
+            if cleanup_count > 0:
+                logger.info(f"🧹 EXITED 종목 정리 완료: {cleanup_count}개 제거 (메모리 절약)")
+                
+        except Exception as e:
+            logger.error(f"❌ EXITED 종목 정리 오류: {e}")
 
     # ========== 🆕 체결 확인 처리 ==========
 
@@ -1014,6 +1071,10 @@ class CandleTradeManager:
             # 7. stock_manager 업데이트
             self.stock_manager.update_candidate(candidate)
 
+            # 🆕 체결 완료 플래그 설정 (중복 처리 방지)
+            candidate.metadata['execution_processed'] = True
+            candidate.metadata['last_execution_update'] = datetime.now().isoformat()
+
             # 8. 통계 업데이트
             self.daily_stats['successful_trades'] = self.daily_stats.get('successful_trades', 0) + 1
 
@@ -1071,6 +1132,11 @@ class CandleTradeManager:
             # 8. stock_manager 업데이트
             self.stock_manager.update_candidate(candidate)
 
+            # 🆕 체결 완료 플래그 설정 (중복 처리 방지)
+            candidate.metadata['execution_processed'] = True
+            candidate.metadata['last_execution_update'] = datetime.now().isoformat()
+            candidate.metadata['final_exit_confirmed'] = True  # 매도 완료 확정
+
             # 9. 통계 업데이트
             if profit_pct > 0:
                 self.daily_stats['successful_trades'] = self.daily_stats.get('successful_trades', 0) + 1
@@ -1091,10 +1157,10 @@ class CandleTradeManager:
     async def _periodic_signal_evaluation(self):
         """🔄 주기적 신호 재평가 - 30초마다 실행"""
         try:
-            # 🎯 현재 모든 종목 상태별 분류 (PENDING_ORDER 제외)
+            # 🎯 현재 모든 종목 상태별 분류 (PENDING_ORDER, EXITED 제외)
             all_candidates = [
                 candidate for candidate in self.stock_manager._all_stocks.values()
-                if candidate.status != CandleStatus.PENDING_ORDER  # 주문 대기 중인 종목 제외
+                if candidate.status not in [CandleStatus.PENDING_ORDER, CandleStatus.EXITED]  # 주문 대기 중이거나 매도 완료된 종목 제외
             ]
 
             if not all_candidates:
@@ -1455,12 +1521,41 @@ class CandleTradeManager:
 
                 logger.warning(f"⏰ {candidate.stock_code} 매수 주문 {minutes_elapsed:.1f}분 미체결 - 취소 시도")
 
+                # 🆕 정정취소가능주문조회로 정확한 주문조직번호 획득
+                from ..api.kis_order_api import get_inquire_psbl_rvsecncl_lst
+                
+                try:
+                    cancelable_orders = get_inquire_psbl_rvsecncl_lst()
+                    ord_orgno = ""
+                    ord_dvsn = "01"  # 기본값
+                    
+                    if cancelable_orders is not None and not cancelable_orders.empty:
+                        # 해당 주문번호 찾기
+                        for _, order in cancelable_orders.iterrows():
+                            if order.get('odno', '') == buy_order_no:
+                                ord_orgno = order.get('ord_orgno', '')
+                                ord_dvsn = order.get('ord_dvsn', '01')
+                                logger.debug(f"📋 {candidate.stock_code} 매수 주문정보 획득: 조직번호={ord_orgno}, 구분={ord_dvsn}")
+                                break
+                    
+                    if not ord_orgno:
+                        logger.warning(f"⚠️ {candidate.stock_code} 매수 주문조직번호 획득 실패 - 상태만 복원")
+                        candidate.clear_pending_order('buy')
+                        candidate.status = CandleStatus.BUY_READY
+                        return
+                        
+                except Exception as e:
+                    logger.error(f"❌ {candidate.stock_code} 정정취소가능주문조회 오류: {e}")
+                    candidate.clear_pending_order('buy')
+                    candidate.status = CandleStatus.BUY_READY
+                    return
+
                 # KIS API를 통한 주문 취소 실행
                 cancel_result = self.kis_api_manager.cancel_order(
                     order_no=buy_order_no,
-                    ord_orgno="",           # 주문조직번호 (공백)
-                    ord_dvsn="01",          # 주문구분 (기본값: 지정가)
-                    qty_all_ord_yn="Y"      # 전량 취소
+                    ord_orgno=ord_orgno,        # 🆕 정확한 주문조직번호 사용
+                    ord_dvsn=ord_dvsn,          # 🆕 정확한 주문구분 사용
+                    qty_all_ord_yn="Y"          # 전량 취소
                 )
 
                 if cancel_result and cancel_result.get('status') == 'success':
@@ -1491,12 +1586,41 @@ class CandleTradeManager:
 
                 logger.warning(f"⏰ {candidate.stock_code} 매도 주문 {minutes_elapsed:.1f}분 미체결 - 취소 시도")
 
+                # 🆕 정정취소가능주문조회로 정확한 주문조직번호 획득
+                from ..api.kis_order_api import get_inquire_psbl_rvsecncl_lst
+                
+                try:
+                    cancelable_orders = get_inquire_psbl_rvsecncl_lst()
+                    ord_orgno = ""
+                    ord_dvsn = "01"  # 기본값
+                    
+                    if cancelable_orders is not None and not cancelable_orders.empty:
+                        # 해당 주문번호 찾기
+                        for _, order in cancelable_orders.iterrows():
+                            if order.get('odno', '') == sell_order_no:
+                                ord_orgno = order.get('ord_orgno', '')
+                                ord_dvsn = order.get('ord_dvsn', '01')
+                                logger.debug(f"📋 {candidate.stock_code} 매도 주문정보 획득: 조직번호={ord_orgno}, 구분={ord_dvsn}")
+                                break
+                    
+                    if not ord_orgno:
+                        logger.warning(f"⚠️ {candidate.stock_code} 매도 주문조직번호 획득 실패 - 상태만 복원")
+                        candidate.clear_pending_order('sell')
+                        candidate.status = CandleStatus.ENTERED
+                        return
+                        
+                except Exception as e:
+                    logger.error(f"❌ {candidate.stock_code} 정정취소가능주문조회 오류: {e}")
+                    candidate.clear_pending_order('sell')
+                    candidate.status = CandleStatus.ENTERED
+                    return
+
                 # KIS API를 통한 주문 취소 실행
                 cancel_result = self.kis_api_manager.cancel_order(
                     order_no=sell_order_no,
-                    ord_orgno="",           # 주문조직번호 (공백)
-                    ord_dvsn="01",          # 주문구분 (기본값: 지정가)
-                    qty_all_ord_yn="Y"      # 전량 취소
+                    ord_orgno=ord_orgno,        # 🆕 정확한 주문조직번호 사용
+                    ord_dvsn=ord_dvsn,          # 🆕 정확한 주문구분 사용
+                    qty_all_ord_yn="Y"          # 전량 취소
                 )
 
                 if cancel_result and cancel_result.get('status') == 'success':

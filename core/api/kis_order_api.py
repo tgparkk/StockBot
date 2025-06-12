@@ -59,9 +59,9 @@ def get_order_cash(ord_dv: str = "", itm_no: str = "", qty: int = 0, unpr: int =
 def get_order_rvsecncl(ord_orgno: str = "", orgn_odno: str = "", ord_dvsn: str = "",
                        rvse_cncl_dvsn_cd: str = "", ord_qty: int = 0, ord_unpr: int = 0,
                        qty_all_ord_yn: str = "", tr_cont: str = "") -> Optional[pd.DataFrame]:
-    """주식주문(정정취소)"""
+    """주식주문(정정취소) - 신 TR ID 사용"""
     url = '/uapi/domestic-stock/v1/trading/order-rvsecncl'
-    tr_id = "TTTC0803U"  # 주식 정정 취소 주문 [모의투자] VTTC0803U
+    tr_id = "TTTC0013U"  # 🆕 신 TR ID (구: TTTC0803U)
 
     if not ord_orgno:
         logger.error("주문조직번호 확인 필요")
@@ -94,7 +94,7 @@ def get_order_rvsecncl(ord_orgno: str = "", orgn_odno: str = "", ord_dvsn: str =
     params = {
         "CANO": kis.getTREnv().my_acct,
         "ACNT_PRDT_CD": kis.getTREnv().my_prod,
-        "KRX_FWDG_ORD_ORGNO": ord_orgno,        # 주문조직번호
+        "KRX_FWDG_ORD_ORGNO": ord_orgno,        # 한국거래소전송주문조직번호
         "ORGN_ODNO": orgn_odno,                 # 원주문번호
         "ORD_DVSN": ord_dvsn,                   # 주문구분
         "RVSE_CNCL_DVSN_CD": rvse_cncl_dvsn_cd, # 정정:01, 취소:02
@@ -349,13 +349,43 @@ async def check_and_cancel_external_orders(kis_api_manager) -> None:
 
 async def cancel_external_order(kis_api_manager, stock_code: str, order_no: str,
                               buy_sell_code: str, remaining_qty: int, product_name: str) -> bool:
-    """🆕 외부 미체결 주문 취소 실행"""
+    """🆕 외부 미체결 주문 취소 실행 (개선된 버전)"""
     try:
-        # KIS API를 통한 주문 취소 실행
+        # 🎯 1단계: 정정취소가능주문조회로 정확한 주문조직번호 획득
+        logger.debug(f"🔍 {stock_code} 정정취소가능주문 조회 중...")
+        
+        cancelable_orders = get_inquire_psbl_rvsecncl_lst()
+        if not cancelable_orders or cancelable_orders.empty:
+            logger.warning(f"⚠️ {stock_code} 정정취소가능주문 조회 결과 없음")
+            return False
+
+        # 해당 주문번호 찾기
+        target_order = None
+        for _, order in cancelable_orders.iterrows():
+            if order.get('odno', '') == order_no:
+                target_order = order
+                break
+
+        if target_order is None:
+            logger.warning(f"⚠️ {stock_code} 주문번호 {order_no} 정정취소가능주문에서 찾을 수 없음")
+            return False
+
+        # 🎯 2단계: 정확한 주문조직번호와 주문구분 획득
+        ord_orgno = target_order.get('ord_orgno', '')  # 주문조직번호
+        ord_dvsn = target_order.get('ord_dvsn', '00')  # 주문구분
+        psbl_qty = int(target_order.get('psbl_qty', 0))  # 정정취소가능수량
+
+        logger.debug(f"📋 {stock_code} 주문정보: 조직번호={ord_orgno}, 구분={ord_dvsn}, 가능수량={psbl_qty}")
+
+        if psbl_qty <= 0:
+            logger.warning(f"⚠️ {stock_code} 정정취소가능수량이 0 - 이미 처리된 주문")
+            return False
+
+        # 🎯 3단계: 주문 취소 실행
         cancel_result = kis_api_manager.cancel_order(
             order_no=order_no,
-            ord_orgno="",           # 주문조직번호 (공백)
-            ord_dvsn="01",          # 주문구분 (기본값: 지정가)
+            ord_orgno=ord_orgno,    # 🆕 정확한 주문조직번호 사용
+            ord_dvsn=ord_dvsn,      # 🆕 정확한 주문구분 사용
             qty_all_ord_yn="Y"      # 전량 취소
         )
 
