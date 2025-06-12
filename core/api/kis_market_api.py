@@ -5,7 +5,7 @@ import time
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from utils.logger import setup_logger
 from . import kis_auth as kis
 
@@ -709,8 +709,150 @@ def get_quote_balance_rank(fid_cond_mrkt_div_code: str = "J",
 
 # 테스트 실행을 위한 예시 함수
 if __name__ == "__main__":
-
     pass
+
+# =============================================================================
+# 🎯 시장상황 분석을 위한 API 함수들
+# =============================================================================
+
+def get_index_data(index_code: str = "0001") -> Optional[Dict[str, Any]]:
+    """
+    국내업종 현재지수 API (TR: FHPUP02100000)
+    코스피/코스닥 지수 정보를 조회합니다.
+
+    Args:
+        index_code: 업종코드 ("0001": 코스피, "1001": 코스닥)
+
+    Returns:
+        Dict: 지수 정보 (지수값, 전일대비율, 거래량 등)
+    """
+    url = '/uapi/domestic-stock/v1/quotations/inquire-index-price'
+    tr_id = "FHPUP02100000"  # 국내업종 현재지수
+
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "U",      # U: 업종
+        "FID_INPUT_ISCD": index_code         # 업종코드 (0001: 코스피, 1001: 코스닥)
+    }
+
+    try:
+        logger.debug(f"📊 지수 정보 조회: {index_code}")
+        res = kis._url_fetch(url, tr_id, "", params)
+
+        if res and res.isOK():
+            body = res.getBody()
+            output_data = getattr(body, 'output', None)
+
+            if output_data:
+                if isinstance(output_data, list) and len(output_data) > 0:
+                    result = output_data[0]
+                else:
+                    result = output_data
+
+                logger.debug(f"✅ {index_code} 지수 조회 성공")
+                return result
+            else:
+                logger.warning(f"⚠️ {index_code} 지수 데이터 없음")
+                return None
+        else:
+            logger.error(f"❌ {index_code} 지수 조회 실패")
+            return None
+
+    except Exception as e:
+        logger.error(f"❌ 지수 조회 오류 ({index_code}): {e}")
+        return None
+
+
+def get_investor_flow_data() -> Optional[Dict[str, Any]]:
+    """
+    외국인/기관 매매종목가집계 API (TR: FHPTJ04400000)
+    외국인과 기관의 순매수/순매도 현황을 조회합니다.
+
+    Returns:
+        Dict: 투자자별 매매 현황 (외국인/기관 순매수금액 등)
+    """
+    url = '/uapi/domestic-stock/v1/quotations/inquire-investor-vsvolume'
+    tr_id = "FHPTJ04400000"  # 외국인/기관 매매종목가집계
+
+    # 현재 날짜 사용
+    current_date = datetime.now().strftime("%Y%m%d")
+
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",      # J: 주식
+        "FID_INPUT_DATE_1": current_date,    # 조회일자
+        "FID_INPUT_ISCD": ""                 # 종목코드 (전체: 공백)
+    }
+
+    try:
+        logger.debug(f"💰 투자자별 매매 현황 조회: {current_date}")
+        res = kis._url_fetch(url, tr_id, "", params)
+
+        if res and res.isOK():
+            body = res.getBody()
+            output1_data = getattr(body, 'output1', None)  # 투자자별 총계
+            output2_data = getattr(body, 'output2', None)  # 종목별 상세
+
+            result = {}
+
+            # output1: 투자자별 총계 (외국인, 기관 등)
+            if output1_data:
+                if isinstance(output1_data, list):
+                    result['investor_summary'] = output1_data
+                else:
+                    result['investor_summary'] = [output1_data]
+
+            # output2: 종목별 상세 (필요시 사용)
+            if output2_data:
+                if isinstance(output2_data, list):
+                    result['stock_details'] = output2_data
+                else:
+                    result['stock_details'] = [output2_data]
+
+            logger.debug("✅ 투자자별 매매 현황 조회 성공")
+            return result
+
+        else:
+            logger.error("❌ 투자자별 매매 현황 조회 실패")
+            return None
+
+    except Exception as e:
+        logger.error(f"❌ 투자자별 매매 현황 오류: {e}")
+        return None
+
+
+def get_market_overview() -> Optional[Dict[str, Any]]:
+    """
+    종합 시장 개요 정보 조회
+    코스피/코스닥 지수와 투자자 동향을 종합적으로 제공합니다.
+
+    Returns:
+        Dict: 종합 시장 정보
+    """
+    try:
+        logger.debug("📊 종합 시장 개요 조회 시작")
+
+        # 코스피 지수 조회
+        kospi_data = get_index_data("0001")
+
+        # 코스닥 지수 조회
+        kosdaq_data = get_index_data("1001")
+
+        # 투자자별 매매 현황 조회
+        investor_data = get_investor_flow_data()
+
+        result = {
+            'kospi': kospi_data,
+            'kosdaq': kosdaq_data,
+            'investor_flows': investor_data,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        logger.debug("✅ 종합 시장 개요 조회 완료")
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ 종합 시장 개요 조회 오류: {e}")
+        return None
+
 
 # =============================================================================
 # 🎯 잔고 및 포지션 조회 API

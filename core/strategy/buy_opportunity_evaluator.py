@@ -358,27 +358,54 @@ class BuyOpportunityEvaluator:
             return False
 
     def _calculate_entry_params(self, candidate: CandleTradeCandidate, available_funds: float, position_count: int) -> float:
-        """개별 종목 투자금액 계산"""
+        """개별 종목 투자금액 계산 (🆕 시장상황 반영)"""
         try:
-            # 우선순위에 따른 투자금액 조정 (우선순위가 높을수록 더 많이 투자)
-            # 🔧 config에서 우선순위 배수 설정 가져오기
+            # 🌍 시장 상황 가져오기
+            market_condition = self.manager.market_analyzer.get_current_condition()
+            market_adjustments = self.manager.config.get('market_condition_adjustments', {})
+
+            # 기본 우선순위 배수 계산
             max_priority_multiplier = self.manager.config.get('max_priority_multiplier', 1.5)
             base_multiplier = self.manager.config.get('base_priority_multiplier', 0.5)
             priority_multiplier = min(max_priority_multiplier, candidate.entry_priority / 100 + base_multiplier)
 
-            # 단일 종목 최대 투자한도 적용
-            max_single_investment_ratio = self.manager.config.get('max_single_investment_ratio', 0.4)
-            max_single_investment = available_funds * max_single_investment_ratio  # config에서 설정된 비율
+            # 🆕 시장 추세에 따른 포지션 크기 조정
+            position_size_multiplier = 1.0
 
-            # 포지션 분산을 위한 조정 (여러 종목에 분산)
-            adjusted_amount = max_single_investment
+            # 상승장/하락장에 따른 조정
+            market_trend = market_condition.get('market_trend', 'neutral_market')
+            if market_trend == 'bull_market':
+                bull_config = market_adjustments.get('bull_market', {})
+                position_size_multiplier = bull_config.get('position_size_multiplier', 1.2)
+                logger.debug(f"🐂 상승장 감지 - 포지션 크기 {position_size_multiplier:.1f}배 조정")
+
+            elif market_trend == 'bear_market':
+                bear_config = market_adjustments.get('bear_market', {})
+                position_size_multiplier = bear_config.get('position_size_multiplier', 0.7)
+                logger.debug(f"🐻 하락장 감지 - 포지션 크기 {position_size_multiplier:.1f}배 축소")
+
+            # 🆕 변동성에 따른 추가 조정
+            volatility_multiplier = 1.0
+            volatility = market_condition.get('volatility', 'low_volatility')
+            if volatility == 'high_volatility':
+                high_vol_config = market_adjustments.get('high_volatility', {})
+                volatility_multiplier = high_vol_config.get('position_size_reduction', 0.8)
+                logger.debug(f"📈 고변동성 - 포지션 크기 {volatility_multiplier:.1f}배 축소")
+
+            # 기본 투자금액 계산
+            max_single_investment_ratio = self.manager.config.get('max_single_investment_ratio', 0.4)
+            base_investment = available_funds * max_single_investment_ratio
+
+            # 🆕 시장상황 종합 반영
+            adjusted_amount = base_investment * position_size_multiplier * volatility_multiplier * priority_multiplier
 
             # 최소/최대 제한 적용
             min_investment = self.manager.config['investment_calculation']['min_investment']
             adjusted_amount = max(min_investment, adjusted_amount)
 
             logger.debug(f"💰 {candidate.stock_code} 투자금액: {adjusted_amount:,.0f}원 "
-                        f"(우선순위:{candidate.entry_priority}, 배수:{priority_multiplier:.2f})")
+                        f"(기본배수:{priority_multiplier:.2f}, 시장조정:{position_size_multiplier:.2f}, "
+                        f"변동성조정:{volatility_multiplier:.2f})")
 
             return adjusted_amount
 
