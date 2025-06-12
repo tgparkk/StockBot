@@ -102,6 +102,16 @@ class SellPositionManager:
     async def _manage_single_position(self, position: CandleTradeCandidate):
         """개별 포지션 관리"""
         try:
+            # 🆕 EXITED나 PENDING_ORDER 상태 종목 스킵 (체결 통보 처리 완료된 종목)
+            if position.status in [CandleStatus.EXITED, CandleStatus.PENDING_ORDER]:
+                logger.debug(f"⏭️ {position.stock_code} {position.status.value} 상태 - 포지션 관리 생략")
+                return
+
+            # 🆕 체결 완료 확인된 종목 스킵 (추가 안전장치)
+            if position.metadata.get('final_exit_confirmed', False):
+                logger.debug(f"⏭️ {position.stock_code} 매도 체결 확인 완료 - 포지션 관리 생략")
+                return
+
             # 📊 매도 조건 체크
             should_exit = False
             exit_reason = ""

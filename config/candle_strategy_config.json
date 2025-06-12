@@ -1,9 +1,9 @@
 {
     "// 🎯 캔들패턴 전략 설정 파일": "외부에서 수정 가능한 거래 설정",
-    "scan_interval_seconds": 1800,
+    "scan_interval_seconds": 60,
     "signal_evaluation_interval": 30,
-    "max_positions": 15,
-    "max_scan_stocks": 50,
+    "max_positions": 50,
+    "max_scan_stocks": 80,
     "risk_per_trade": 0.02,
     "pattern_confidence_threshold": 0.6,
     "volume_threshold": 1.5,
@@ -15,12 +15,12 @@
     "min_daily_volume": 5000000000,
     "rsi_oversold_threshold": 30,
     "rsi_overbought_threshold": 70,
-    "max_day_change_pct": 15.0,
+    "max_day_change_pct": 14.0,
     "max_signal_age_seconds": 300,
     "min_order_interval_seconds": 300,
     "max_priority_multiplier": 1.5,
     "base_priority_multiplier": 0.5,
-    "max_single_investment_ratio": 0.4,
+    "max_single_investment_ratio": 0.2,
     "max_position_size_pct": 25,
     "default_stop_loss_pct": 2.5,
     "default_target_profit_pct": 3.0,
@@ -28,7 +28,7 @@
     "min_holding_minutes": 1440,
     "emergency_stop_loss_pct": 6.0,
     "min_holding_override_conditions": {
-        "high_profit_target": 7.0,
+        "high_profit_target": 3.5,
         "market_crash": -7.0,
         "individual_limit_down": -15.0,
         "pattern_reversal": true
@@ -125,8 +125,8 @@
         "portfolio_usage_ratio": 0.2,
         "min_cash_threshold": 500000,
         "max_portfolio_limit": 3000000,
-        "default_investment": 1000000,
-        "min_investment": 100000
+        "default_investment": 800000,
+        "min_investment": 500000
     },
     "intraday_analysis": {
         "enabled": true,
@@ -163,5 +163,27 @@
             "parallel_processing": true,
             "batch_interval_ms": 300
         }
+    },
+    "quality_management": {
+        "min_replacement_score_gap": 50,
+        "auto_cleanup_enabled": true,
+        "cleanup_interval_hours": 1,
+        "pattern_expiry_hours": 6,
+        "min_confidence_for_priority": 0.7,
+        "min_strength_for_priority": 80,
+        "quality_score_weights": {
+            "confidence": 1.5,
+            "strength": 1.2,
+            "pattern_type": 1.0,
+            "freshness": 0.8
+        }
+    },
+    "trading_thresholds": {
+        "min_buy_signal_score": 70,
+        "min_strong_buy_score": 85,
+        "min_pattern_strength": 70,
+        "min_pattern_confidence": 0.65,
+        "max_daily_trades": 5,
+        "comment": "매수 신호 생성 임계값 설정"
     }
 }

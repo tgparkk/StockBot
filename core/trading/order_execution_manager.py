@@ -107,12 +107,41 @@ class OrderExecutionManager:
                 logger.warning("⚠️ 체결통보에 주문ID가 없습니다")
                 return False
 
-            # 대기 중인 주문 확인
-            if order_id not in self.pending_orders:
-                logger.warning(f"⚠️ 대기 중이지 않은 주문ID: {order_id}")
-                return False
+            # 🆕 대기 중인 주문 확인 (임시 주문ID 매칭 개선)
+            pending_order = None
+            matched_order_id = None
 
-            pending_order = self.pending_orders[order_id]
+            # 1. 정확한 주문ID 매칭 시도
+            if order_id in self.pending_orders:
+                pending_order = self.pending_orders[order_id]
+                matched_order_id = order_id
+                logger.info(f"✅ 정확한 주문ID 매칭: {order_id}")
+            else:
+                # 2. 임시 주문ID 매칭 시도 (종목코드, 타입, 시간 기준)
+                stock_code = execution_info.get('stock_code', '')
+                order_type = execution_info.get('order_type', '')
+                
+                logger.info(f"🔍 임시 주문ID 매칭 시도: 종목={stock_code}, 타입={order_type}")
+                
+                for temp_order_id, temp_order in self.pending_orders.items():
+                    if (temp_order.stock_code == stock_code and 
+                        temp_order.order_type == order_type):
+                        
+                        # 시간 범위 확인 (10분 이내)
+                        elapsed_seconds = (datetime.now() - temp_order.timestamp).total_seconds()
+                        if elapsed_seconds <= 600:  # 10분 이내
+                            pending_order = temp_order
+                            matched_order_id = temp_order_id
+                            logger.info(f"✅ 임시 주문ID 매칭 성공: {temp_order_id} → {order_id}")
+                            logger.info(f"✅ 매칭 조건: 종목={stock_code}, 타입={order_type}, 경과시간={elapsed_seconds:.1f}초")
+                            break
+                        else:
+                            logger.debug(f"⏰ 시간 초과로 매칭 제외: {temp_order_id} ({elapsed_seconds:.1f}초)")
+
+            if not pending_order:
+                logger.warning(f"⚠️ 매칭되는 대기 주문 없음: {order_id}")
+                logger.warning(f"⚠️ 현재 대기 주문 목록: {list(self.pending_orders.keys())}")
+                return False
 
             # 체결 정보 검증
             if not self._validate_execution(pending_order, execution_info):
@@ -123,8 +152,11 @@ class OrderExecutionManager:
             success = await self._process_execution(pending_order, execution_info)
 
             if success:
-                # 대기 목록에서 제거
-                del self.pending_orders[order_id]
+                # 🆕 대기 목록에서 제거 (매칭된 주문ID 사용)
+                if matched_order_id and matched_order_id in self.pending_orders:
+                    del self.pending_orders[matched_order_id]
+                    logger.info(f"✅ 대기 목록에서 제거: {matched_order_id}")
+                
                 self.stats['orders_filled'] += 1
                 self.stats['last_execution_time'] = datetime.now()
 
@@ -140,36 +172,79 @@ class OrderExecutionManager:
             return False
 
     def _parse_notice_data(self, notice_data) -> Optional[Dict]:
-        """🔔 체결통보 데이터 파싱 - KIS 공식 문서 기준 (실전투자 전용)"""
+        """🔔 체결통보 데이터 파싱 - KIS 공식 문서 기준 (실전투자 전용) - 개선된 버전"""
         try:
+            # 🆕 상세 디버깅 로그 추가
+            logger.info(f"🔍 체결통보 파싱 시작: 데이터 타입={type(notice_data)}")
+            
             # 🚨 입력 데이터 타입 처리 (문자열 또는 딕셔너리)
             if isinstance(notice_data, str):
                 # 웹소켓에서 직접 문자열로 전달된 경우
                 data = notice_data
+                logger.info(f"📋 문자열 데이터 수신: 길이={len(data)}")
             elif isinstance(notice_data, dict):
                 # 딕셔너리 구조로 전달된 경우
-                data = notice_data.get('data', '')
+                logger.info(f"📋 딕셔너리 데이터 수신: 키={list(notice_data.keys())}")
+                data = notice_data.get('data', notice_data.get('body', ''))
                 if not data:
-                    logger.warning("⚠️ 체결통보 데이터가 없습니다")
-                    return None
+                    # 🆕 다른 가능한 키들도 확인
+                    for key in ['message', 'content', 'payload', 'result']:
+                        if key in notice_data:
+                            data = notice_data[key]
+                            logger.info(f"📋 대체 키에서 데이터 발견: {key}")
+                            break
+                    
+                    if not data:
+                        logger.warning(f"⚠️ 체결통보 데이터가 없습니다. 전체 구조: {notice_data}")
+                        return None
+                logger.info(f"📋 추출된 데이터: 길이={len(str(data))}")
             else:
                 logger.error(f"❌ 지원하지 않는 데이터 타입: {type(notice_data)}")
+                logger.error(f"❌ 데이터 내용: {str(notice_data)[:200]}...")
                 return None
+
+            # 🆕 데이터 형식 확인 및 전처리
+            data_str = str(data).strip()
+            logger.info(f"📋 파싱할 데이터 (처음 100자): {data_str[:100]}...")
 
             # 🔒 체결통보 데이터는 암호화되어 전송됨 - 복호화 필요
-            # 실제로는 data_parser에서 복호화된 데이터가 전달되어야 함
-            if isinstance(data, str) and data.startswith('encrypt:'):
-                logger.warning("⚠️ 암호화된 체결통보 데이터 - 복호화 처리 필요")
+            if data_str.startswith('encrypt:') or data_str.startswith('1|'):
+                logger.warning("⚠️ 암호화된 체결통보 데이터 감지 - 복호화 처리 필요")
+                logger.warning(f"⚠️ 암호화 데이터 샘플: {data_str[:50]}...")
                 return None
 
+            # 🆕 웹소켓 응답 형식 처리 (|로 구분되는 경우)
+            if '|' in data_str:
+                # 웹소켓 응답: 암호화여부|TR_ID|데이터건수|응답데이터
+                websocket_parts = data_str.split('|')
+                logger.info(f"📋 웹소켓 형식 감지: {len(websocket_parts)}개 부분")
+                
+                if len(websocket_parts) >= 4:
+                    encryption_flag = websocket_parts[0]
+                    tr_id = websocket_parts[1]
+                    data_count = websocket_parts[2]
+                    actual_data = websocket_parts[3]
+                    
+                    logger.info(f"📋 웹소켓 파싱: 암호화={encryption_flag}, TR_ID={tr_id}, 건수={data_count}")
+                    
+                    if encryption_flag == '1':
+                        logger.warning("⚠️ 암호화된 데이터 (flag=1) - 복호화 필요")
+                        return None
+                    
+                    data_str = actual_data
+                    logger.info(f"📋 실제 데이터 추출: {data_str[:100]}...")
+
             # KIS 공식 문서에 따른 '^' 구분자로 필드 분리
-            parts = data.split('^')
+            parts = data_str.split('^')
             
-            # 🔧 로깅을 통한 디버깅 정보 추가
-            logger.debug(f"📋 체결통보 파싱 정보: 전체필드={len(parts)}개")
-            if len(parts) < 20:  # 최소 필요 필드 수 완화
-                logger.warning(f"⚠️ 체결통보 데이터 필드 부족: {len(parts)}개 (최소 20개 필요)")
-                logger.debug(f"📋 체결통보 원본 데이터: {data[:200]}...")  # 처음 200자만 로그
+            # 🆕 상세 디버깅 정보
+            logger.info(f"📋 체결통보 파싱 정보: 전체필드={len(parts)}개")
+            logger.info(f"📋 처음 10개 필드: {parts[:10]}")
+            
+            if len(parts) < 15:  # 🆕 최소 필드 수를 15개로 완화 (더 유연하게)
+                logger.warning(f"⚠️ 체결통보 데이터 필드 부족: {len(parts)}개 (최소 15개 필요)")
+                logger.warning(f"📋 전체 필드 내용: {parts}")
+                logger.warning(f"📋 원본 데이터: {data_str}")
                 return None
 
             # 🎯 KIS 공식 문서에 따른 정확한 필드 매핑 (안전한 인덱스 접근)
@@ -264,27 +339,66 @@ class OrderExecutionManager:
             pending_order_id = pending_order.order_id
             execution_order_id = execution_info.get('order_id', '')
 
-            # 🎯 주문번호 일치 확인 (임시 주문ID 처리)
-            if pending_order_id.startswith('TEMP_'):
-                # 임시 주문ID인 경우: 종목코드와 시간으로 매칭
+            # 🎯 주문번호 일치 확인 (임시 주문ID 처리 개선)
+            if pending_order_id.startswith('order_'):
+                # 🆕 임시 주문ID인 경우: 종목코드, 시간, 수량으로 매칭
                 logger.info(f"🔄 임시 주문ID 검증: {pending_order_id}")
+                logger.info(f"🔄 체결통보 주문번호: {execution_order_id}")
 
-                # 종목코드가 일치하는지 확인
+                # 1. 종목코드가 일치하는지 확인
                 if pending_order.stock_code != execution_info.get('stock_code', ''):
                     logger.error(f"❌ 임시주문 종목코드 불일치: {pending_order.stock_code} vs {execution_info.get('stock_code')}")
                     return False
 
-                # 시간 범위 확인 (임시 주문ID 생성 후 5분 이내)
+                # 2. 주문 타입 확인
+                if pending_order.order_type != execution_info.get('order_type', ''):
+                    logger.error(f"❌ 임시주문 타입 불일치: {pending_order.order_type} vs {execution_info.get('order_type')}")
+                    return False
+
+                # 3. 시간 범위 확인 (임시 주문ID 생성 후 10분 이내로 확장)
+                try:
+                    temp_timestamp = int(pending_order_id.split('_')[-1]) / 1000  # 밀리초를 초로 변환
+                    current_timestamp = datetime.now().timestamp()
+                    elapsed_seconds = current_timestamp - temp_timestamp
+                    
+                    if elapsed_seconds > 600:  # 10분 초과
+                        logger.warning(f"⚠️ 임시주문 시간 초과: {elapsed_seconds:.1f}초")
+                        return False
+                    
+                    logger.info(f"✅ 시간 검증 통과: {elapsed_seconds:.1f}초 경과")
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"⚠️ 임시주문ID 시간 파싱 오류: {pending_order_id}, 오류: {e}")
+                    # 시간 파싱 실패해도 다른 조건으로 매칭 시도
+
+                # 4. 🆕 수량 확인 (추가 검증)
+                pending_qty = pending_order.quantity
+                executed_qty = execution_info.get('executed_quantity', 0)
+                
+                if executed_qty != pending_qty:
+                    logger.warning(f"⚠️ 수량 불일치하지만 부분체결 가능: 주문={pending_qty}주, 체결={executed_qty}주")
+                    # 부분체결도 허용
+
+                logger.info(f"✅ 임시 주문ID 검증 통과: {pending_order_id} → {execution_order_id}")
+                logger.info(f"✅ 매칭 조건: 종목={pending_order.stock_code}, 타입={pending_order.order_type}, 수량={pending_qty}→{executed_qty}")
+
+            elif pending_order_id.startswith('TEMP_'):
+                # 기존 TEMP_ 형식 지원 (하위 호환성)
+                logger.info(f"🔄 TEMP 주문ID 검증: {pending_order_id}")
+
+                if pending_order.stock_code != execution_info.get('stock_code', ''):
+                    logger.error(f"❌ TEMP주문 종목코드 불일치: {pending_order.stock_code} vs {execution_info.get('stock_code')}")
+                    return False
+
                 try:
                     temp_timestamp = int(pending_order_id.split('_')[-1])
                     current_timestamp = int(datetime.now().timestamp())
-                    if current_timestamp - temp_timestamp > 300:  # 5분 초과
-                        logger.warning(f"⚠️ 임시주문 시간 초과: {current_timestamp - temp_timestamp}초")
+                    if current_timestamp - temp_timestamp > 600:  # 10분 초과
+                        logger.warning(f"⚠️ TEMP주문 시간 초과: {current_timestamp - temp_timestamp}초")
                         return False
                 except (ValueError, IndexError):
-                    logger.warning(f"⚠️ 임시주문ID 형식 오류: {pending_order_id}")
+                    logger.warning(f"⚠️ TEMP주문ID 형식 오류: {pending_order_id}")
 
-                logger.info(f"✅ 임시 주문ID 검증 통과: {pending_order_id} → {execution_order_id}")
+                logger.info(f"✅ TEMP 주문ID 검증 통과: {pending_order_id} → {execution_order_id}")
 
             else:
                 # 일반 주문ID인 경우: 정확히 일치해야 함
@@ -341,7 +455,7 @@ class OrderExecutionManager:
             execution_time = execution_info.get('execution_time', '')
             if execution_time and len(execution_time) == 6:  # HHMMSS 형식
                 try:
-                    from datetime import datetime, time as dt_time
+                    from datetime import time as dt_time
                     current_time = datetime.now()
                     exec_hour = int(execution_time[0:2])
                     exec_minute = int(execution_time[2:4])

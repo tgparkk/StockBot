@@ -67,13 +67,39 @@ class CandleStockManager:
                 logger.debug(f"🔄 {stock_code} 기존 종목 업데이트 ({existing.status.value})")
                 return self.update_candidate(candidate)
 
-            # 최대 관찰 종목 수 체크
+            # 최대 관찰 종목 수 체크 및 스마트 교체
             if len(self._all_stocks) >= self.max_watch_stocks:
-                removed = self._remove_lowest_priority_stock()
-                if removed:
-                    logger.info(f"관찰 한도 초과 - {removed} 제거")
+                # 🎯 새 종목이 기존 종목보다 우수한지 확인
+                new_candidate_score = self._calculate_candidate_quality_score(candidate)
+                
+                # 기존 종목 중 가장 낮은 점수 찾기
+                lowest_existing_score = float('inf')
+                lowest_existing_candidate = None
+                
+                for existing_candidate in self._all_stocks.values():
+                    if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                        continue  # 중요 상태는 제외
+                    
+                    existing_score = self._calculate_candidate_quality_score(existing_candidate)
+                    if existing_score < lowest_existing_score:
+                        lowest_existing_score = existing_score
+                        lowest_existing_candidate = existing_candidate
+                
+                # 새 종목이 기존 최저 종목보다 우수하면 교체
+                if (lowest_existing_candidate and 
+                    new_candidate_score > lowest_existing_score + 50):  # 50점 이상 차이나야 교체
+                    
+                    removed_stock = lowest_existing_candidate.stock_code
+                    if self.remove_stock(removed_stock):
+                        logger.info(f"🔄 스마트 교체: {removed_stock}(점수:{lowest_existing_score:.1f}) → "
+                                   f"{stock_code}(점수:{new_candidate_score:.1f})")
+                    else:
+                        logger.warning(f"관찰 한도 초과 - 새 종목 {stock_code} 추가 실패")
+                        return False
                 else:
-                    logger.warning(f"관찰 한도 초과 - 새 종목 {stock_code} 추가 실패")
+                    # 새 종목이 우수하지 않으면 추가 거부
+                    logger.info(f"🚫 품질 기준 미달로 추가 거부: {stock_code}(점수:{new_candidate_score:.1f}) "
+                               f"vs 기존최저(점수:{lowest_existing_score:.1f})")
                     return False
 
             # 종목 추가
@@ -90,7 +116,11 @@ class CandleStockManager:
                 'status': candidate.status.value
             })
 
-            logger.debug(f"✅ 새 종목 추가: {stock_code}({candidate.stock_name}) - {candidate.get_signal_summary()}")
+            # 품질 점수 계산 및 로깅
+            quality_score = self._calculate_candidate_quality_score(candidate)
+            
+            logger.info(f"✅ 새 종목 추가: {stock_code}({candidate.stock_name}) - "
+                       f"품질점수:{quality_score:.1f}, {candidate.get_signal_summary()}")
             return True
 
         except Exception as e:
@@ -402,24 +432,167 @@ class CandleStockManager:
     # ========== 내부 유틸리티 함수들 ==========
 
     def _remove_lowest_priority_stock(self) -> Optional[str]:
-        """가장 낮은 우선순위 종목 제거"""
+        """🎯 스마트 우선순위 기반 종목 제거"""
         try:
-            # 관찰 중이면서 신호가 약한 종목 우선 제거
-            watching_candidates = [
-                (candidate.signal_strength + candidate.pattern_score, candidate.stock_code)
-                for candidate in self._all_stocks.values()
-                if candidate.status == CandleStatus.WATCHING
-            ]
-
-            if watching_candidates:
-                watching_candidates.sort()  # 낮은 점수 순
-                stock_to_remove = watching_candidates[0][1]
-
-                if self.remove_stock(stock_to_remove):
-                    return stock_to_remove
+            # 1. 제거 대상 후보 수집 (중요 상태 제외)
+            removal_candidates = []
+            
+            for candidate in self._all_stocks.values():
+                # 🚨 중요 상태는 절대 제거하지 않음
+                if candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                    continue
+                
+                # 우선순위 점수 계산 (낮을수록 제거 우선순위 높음)
+                priority_score = self._calculate_removal_priority_score(candidate)
+                removal_candidates.append((priority_score, candidate.stock_code, candidate))
+            
+            if not removal_candidates:
+                logger.warning("⚠️ 제거 가능한 종목이 없습니다 (모두 중요 상태)")
+                return None
+            
+            # 2. 우선순위 순으로 정렬 (낮은 점수 = 높은 제거 우선순위)
+            removal_candidates.sort(key=lambda x: x[0])
+            
+            # 3. 가장 낮은 우선순위 종목 제거
+            lowest_priority_score, stock_to_remove, candidate_to_remove = removal_candidates[0]
+            
+            # 4. 제거 실행 및 로깅
+            if self.remove_stock(stock_to_remove):
+                logger.info(f"🗑️ 우선순위 기반 종목 제거: {stock_to_remove}({candidate_to_remove.stock_name}) "
+                           f"- 점수:{lowest_priority_score:.1f}, 상태:{candidate_to_remove.status.value}")
+                return stock_to_remove
 
             return None
 
         except Exception as e:
             logger.error(f"최저 우선순위 종목 제거 오류: {e}")
             return None
+
+    def _calculate_removal_priority_score(self, candidate: CandleTradeCandidate) -> float:
+        """🎯 제거 우선순위 점수 계산 (낮을수록 제거 우선순위 높음)"""
+        try:
+            score = 0.0
+            
+            # 1. 패턴 신뢰도 (높을수록 보존 우선순위 높음)
+            if candidate.detected_patterns:
+                max_confidence = max(p.confidence for p in candidate.detected_patterns)
+                score += max_confidence * 100  # 0~100점
+            else:
+                score += 0  # 패턴 없으면 0점
+            
+            # 2. 패턴 강도 (높을수록 보존 우선순위 높음)
+            if candidate.detected_patterns:
+                max_strength = max(p.strength for p in candidate.detected_patterns)
+                score += max_strength  # 0~100점
+            else:
+                score += 0
+            
+            # 3. 신호 강도 (높을수록 보존 우선순위 높음)
+            score += candidate.signal_strength  # 0~100점
+            
+            # 4. 상태별 가중치 (중요한 상태일수록 높은 점수)
+            status_weights = {
+                CandleStatus.BUY_READY: 50,      # 매수 준비 완료 - 높은 우선순위
+                CandleStatus.WATCHING: 20,       # 관찰 중 - 중간 우선순위
+                CandleStatus.SCANNING: 15,       # 스캐닝 중 - 중간 우선순위
+                CandleStatus.SELL_READY: 30,     # 매도 준비 - 높은 우선순위
+                CandleStatus.ENTERED: 100,       # 진입 완료 - 최고 우선순위 (제거 안됨)
+                CandleStatus.EXITED: 5,          # 청산 완료 - 낮은 우선순위
+                CandleStatus.STOPPED: 5          # 손절 완료 - 낮은 우선순위
+            }
+            score += status_weights.get(candidate.status, 0)
+            
+            # 5. 시간 가중치 (최근 업데이트일수록 높은 점수)
+            if candidate.last_updated:
+                hours_since_update = (datetime.now() - candidate.last_updated).total_seconds() / 3600
+                # 6시간 이내는 보너스, 24시간 이후는 페널티
+                if hours_since_update < 6:
+                    score += 20  # 최근 업데이트 보너스
+                elif hours_since_update > 24:
+                    score -= 30  # 오래된 데이터 페널티
+            
+            # 6. 특별 패턴 보너스 (높은 신뢰도 패턴)
+            if candidate.detected_patterns:
+                for pattern in candidate.detected_patterns:
+                    # Morning Star, Bullish Engulfing 등 강력한 패턴
+                    if pattern.pattern_type in [PatternType.MORNING_STAR, PatternType.BULLISH_ENGULFING]:
+                        if pattern.confidence >= 0.7:
+                            score += 30  # 강력한 패턴 보너스
+                    # Hammer 패턴
+                    elif pattern.pattern_type in [PatternType.HAMMER, PatternType.INVERTED_HAMMER]:
+                        if pattern.confidence >= 0.7:
+                            score += 20  # 망치형 패턴 보너스
+            
+            # 7. 최종 점수 정규화 (0~500 범위)
+            final_score = max(0, min(500, score))
+            
+            return final_score
+            
+        except Exception as e:
+            logger.error(f"우선순위 점수 계산 오류: {e}")
+            return 0.0  # 오류시 가장 낮은 점수 (제거 우선순위 최고)
+
+    def _calculate_candidate_quality_score(self, candidate: CandleTradeCandidate) -> float:
+        """🎯 종목 품질 점수 계산 (높을수록 좋은 종목)"""
+        try:
+            score = 0.0
+            
+            # 1. 패턴 신뢰도 (가장 중요한 요소)
+            if candidate.detected_patterns:
+                max_confidence = max(p.confidence for p in candidate.detected_patterns)
+                score += max_confidence * 150  # 0~150점 (가중치 높음)
+            
+            # 2. 패턴 강도
+            if candidate.detected_patterns:
+                max_strength = max(p.strength for p in candidate.detected_patterns)
+                score += max_strength * 1.2  # 0~120점
+            
+            # 3. 신호 강도
+            score += candidate.signal_strength  # 0~100점
+            
+            # 4. 패턴 타입별 보너스 (강력한 패턴일수록 높은 점수)
+            if candidate.detected_patterns:
+                for pattern in candidate.detected_patterns:
+                    pattern_bonuses = {
+                        PatternType.MORNING_STAR: 50,        # 최고 신뢰도
+                        PatternType.BULLISH_ENGULFING: 40,   # 매우 강력
+                        PatternType.HAMMER: 30,              # 강력
+                        PatternType.INVERTED_HAMMER: 25,     # 좋음
+                        PatternType.RISING_THREE_METHODS: 35, # 추세 지속
+                        PatternType.DOJI: 10                 # 중립적
+                    }
+                    score += pattern_bonuses.get(pattern.pattern_type, 15)
+            
+            # 5. 진입 우선순위 (이미 계산된 값 활용)
+            score += candidate.entry_priority * 0.8  # 0~80점
+            
+            # 6. 현재 상태 보너스
+            status_bonuses = {
+                CandleStatus.BUY_READY: 30,      # 매수 준비 완료
+                CandleStatus.WATCHING: 10,       # 관찰 중
+                CandleStatus.SCANNING: 5,        # 스캐닝 중
+                CandleStatus.SELL_READY: 15,     # 매도 준비
+                CandleStatus.ENTERED: 25,        # 진입 완료 (높은 우선순위)
+                CandleStatus.EXITED: 0,          # 청산 완료 (낮은 우선순위)
+                CandleStatus.STOPPED: 0          # 손절 완료 (낮은 우선순위)
+            }
+            score += status_bonuses.get(candidate.status, 0)
+            
+            # 7. 최신성 보너스 (최근 감지된 패턴일수록 높은 점수)
+            if candidate.created_at:
+                hours_since_creation = (datetime.now() - candidate.created_at).total_seconds() / 3600
+                if hours_since_creation < 1:
+                    score += 25  # 1시간 이내 신규 패턴
+                elif hours_since_creation < 6:
+                    score += 15  # 6시간 이내
+                elif hours_since_creation > 24:
+                    score -= 20  # 24시간 이후 페널티
+            
+            # 8. 최종 점수 정규화 (0~600 범위)
+            final_score = max(0, min(600, score))
+            
+            return final_score
+            
+        except Exception as e:
+            logger.error(f"종목 품질 점수 계산 오류: {e}")
+            return 0.0

@@ -145,12 +145,14 @@ class KISWebSocketMessageHandler:
 
             elif tr_id in [KIS_WSReq.NOTICE.value]:
                 # 체결통보 (실전투자는 NOTICE만 사용)
-                #logger.info(f"📢 체결통보 처리: {tr_id} ({data_count}건)")
+                logger.info(f"📢 체결통보 처리: {tr_id} ({data_count}건)")
 
                 # 🔍 체결통보는 항상 암호화됨
+                logger.info(f"🔍 체결통보 원본 데이터 (처음 100자): {raw_data[:100]}...")
+                
                 decrypted_data = self.data_parser.decrypt_notice_data(raw_data)
                 if decrypted_data:
-                    #logger.info(f"✅ 체결통보 수신: {decrypted_data[:100]}...")
+                    logger.info(f"✅ 체결통보 복호화 성공: {decrypted_data[:100]}...")
 
                     # 🆕 직접 OrderExecutionManager 호출
                     await self._handle_execution_notice_direct(decrypted_data)
@@ -160,6 +162,12 @@ class KISWebSocketMessageHandler:
                                                 {'data': decrypted_data, 'timestamp': datetime.now()})
                 else:
                     logger.warning("❌ 체결통보 복호화 실패")
+                    logger.warning(f"❌ 암호화 키 상태: key={bool(self.data_parser.aes_key)}, iv={bool(self.data_parser.aes_iv)}")
+                    logger.warning(f"❌ 원본 데이터 길이: {len(raw_data)}")
+                    
+                    # 🆕 복호화 실패시에도 원본 데이터로 처리 시도
+                    logger.info("🔄 복호화 실패 - 원본 데이터로 처리 시도")
+                    await self._handle_execution_notice_direct(raw_data)
 
             else:
                 logger.warning(f"⚠️ 알 수 없는 TR_ID: {tr_id}")
@@ -282,9 +290,10 @@ class KISWebSocketMessageHandler:
         return self.stats.copy()
 
     async def _handle_execution_notice_direct(self, decrypted_data: str):
-        """🔔 체결통보 직접 처리 - CandleTradeManager 연동 강화"""
+        """🔔 체결통보 직접 처리 - CandleTradeManager 연동 강화 (개선된 버전)"""
         try:
-            logger.debug(f"📨 체결통보 직접 처리 시작")
+            logger.info(f"📨 체결통보 직접 처리 시작")
+            logger.info(f"📨 처리할 데이터 (처음 200자): {decrypted_data[:200]}...")
 
             # 체결통보 데이터 준비
             execution_data = {
@@ -351,15 +360,22 @@ class KISWebSocketMessageHandler:
             logger.error(f"❌ 체결통보 직접 처리 오류: {e}")
 
     def _parse_execution_notice_simple(self, decrypted_data: str) -> Optional[Dict]:
-        """🆕 간단한 체결통보 파싱 (기본 정보 추출)"""
+        """🆕 간단한 체결통보 파싱 (기본 정보 추출) - 개선된 버전"""
         try:
             if not decrypted_data or not isinstance(decrypted_data, str):
+                logger.debug("❌ 체결통보 데이터가 없거나 문자열이 아님")
                 return None
+
+            logger.info(f"🔍 간단 파싱 시작: 데이터 길이={len(decrypted_data)}")
+            logger.info(f"🔍 파싱할 데이터: {decrypted_data[:200]}...")
 
             # '^' 구분자로 필드 분리
             parts = decrypted_data.split('^')
+            logger.info(f"🔍 분리된 필드 수: {len(parts)}")
+            logger.info(f"🔍 처음 15개 필드: {parts[:15]}")
 
-            if len(parts) < 20:
+            if len(parts) < 15:  # 최소 필드 수 완화
+                logger.warning(f"⚠️ 필드 수 부족: {len(parts)}개 (최소 15개 필요)")
                 return None
 
             # 안전한 인덱스 접근
@@ -368,7 +384,10 @@ class KISWebSocketMessageHandler:
 
             # 체결여부 확인 (가장 중요!)
             execution_yn = safe_get(13)  # CNTG_YN
+            logger.info(f"🔍 체결여부 (CNTG_YN): '{execution_yn}' (2=체결통보, 1=접수통보)")
+            
             if execution_yn != '2':
+                logger.debug(f"📋 체결통보가 아님 (CNTG_YN={execution_yn})")
                 return None  # 체결통보가 아님
 
             # 기본 정보 추출
@@ -378,6 +397,9 @@ class KISWebSocketMessageHandler:
             executed_quantity = safe_get(9)   # 체결수량
             executed_price = safe_get(10)     # 체결단가
 
+            logger.info(f"🔍 추출된 정보: 종목={stock_code}, 주문번호={order_id}, 매매구분={buy_sell_code}")
+            logger.info(f"🔍 체결정보: 수량={executed_quantity}, 가격={executed_price}")
+
             # 매매구분 변환
             if buy_sell_code == '01':
                 order_type = 'SELL'
@@ -385,18 +407,21 @@ class KISWebSocketMessageHandler:
                 order_type = 'BUY'
             else:
                 order_type = 'UNKNOWN'
+                logger.warning(f"⚠️ 알 수 없는 매매구분: {buy_sell_code}")
 
             # 숫자 변환
             try:
                 executed_quantity = int(executed_quantity) if executed_quantity else 0
                 executed_price = int(executed_price) if executed_price else 0
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                logger.error(f"❌ 숫자 변환 오류: {e}")
                 return None
 
             if executed_quantity <= 0 or executed_price <= 0:
+                logger.warning(f"⚠️ 체결 수량/가격 오류: 수량={executed_quantity}, 가격={executed_price}")
                 return None
 
-            return {
+            result = {
                 'stock_code': stock_code,
                 'order_no': order_id,
                 'order_type': order_type,
@@ -406,8 +431,11 @@ class KISWebSocketMessageHandler:
                 'parsed_success': True
             }
 
+            logger.info(f"✅ 간단 파싱 성공: {order_type} {stock_code} {executed_quantity}주 @{executed_price:,}원")
+            return result
+
         except Exception as e:
-            logger.debug(f"간단 파싱 오류: {e}")
+            logger.error(f"❌ 간단 파싱 오류: {e}")
             return None
 
     def _find_execution_manager(self):

@@ -372,97 +372,40 @@ class CandleAnalyzer:
             return None
 
     async def _analyze_intraday_confirmation(self, stock_code: str, current_price: float, daily_ohlcv: Any) -> Dict:
-        """🕐 장중 데이터 보조 분석 (일봉 패턴의 보완용)"""
+        """🕐 장중 데이터 보조 분석 (현재가 추적 + 거래량 급증 감지만)"""
         try:
-            # 기본 구조
+            # 🎯 단순화된 장중 분석 - 핵심만 추출
             intraday_analysis = {
                 'valid': False,
-                'timing_score': 0.5,  # 0~1 (진입/청산 타이밍 점수)
-                'trend_confirmation': 'neutral',  # 'bullish', 'bearish', 'neutral'
                 'volume_surge': False,
-                'support_resistance_level': None,
-                'entry_timing_quality': 'normal',  # 'excellent', 'good', 'normal', 'poor'
-                'exit_timing_quality': 'normal',
-                'analysis_source': 'minute_data'
+                'current_price_updated': True,
+                'analysis_source': 'simplified_intraday'
             }
 
-            # 🎯 장중 분석이 유용한 상황인지 판단
-            if not self._should_use_intraday_analysis():
-                logger.debug(f"📊 {stock_code} 장중 분석 스킵 (장시간 외 또는 설정 비활성화)")
+            # 🆕 장중 분석이 필요한지 간단히 판단
+            if not self._is_trading_time():
+                logger.debug(f"📊 {stock_code} 장시간 외 - 장중 분석 스킵")
                 return intraday_analysis
 
-            # 🆕 분봉 데이터 조회 (5분봉)
-            minute_data = await self._get_minute_candle_data(stock_code, period_minutes=5, count=20)
-            if minute_data is None or minute_data.empty:
-                logger.debug(f"📊 {stock_code} 분봉 데이터 조회 실패")
-                return intraday_analysis
-
-            # 유효한 분석 시작
-            intraday_analysis['valid'] = True
-
-            # 1. 🔍 단기 추세 확인 (최근 5개 분봉)
-            trend_confirmation = self._analyze_minute_trend(minute_data, current_price)
-            intraday_analysis['trend_confirmation'] = trend_confirmation
-
-            # 2. 📊 거래량 급증 감지
-            volume_surge = self._detect_volume_surge(minute_data)
-            intraday_analysis['volume_surge'] = volume_surge
-
-            # 3. 🎯 지지/저항선 근접성 분석
-            support_resistance = self._analyze_support_resistance_proximity(minute_data, current_price, daily_ohlcv)
-            intraday_analysis['support_resistance_level'] = support_resistance
-
-            # 4. ⏰ 진입 타이밍 품질 평가
-            entry_timing = self._evaluate_entry_timing_quality(minute_data, current_price, trend_confirmation, volume_surge)
-            intraday_analysis['entry_timing_quality'] = entry_timing
-
-            # 5. 📈 청산 타이밍 품질 평가
-            exit_timing = self._evaluate_exit_timing_quality(minute_data, current_price, trend_confirmation)
-            intraday_analysis['exit_timing_quality'] = exit_timing
-
-            # 6. 🧮 종합 타이밍 점수 계산
-            timing_score = self._calculate_intraday_timing_score(
-                trend_confirmation, volume_surge, support_resistance, entry_timing, exit_timing
-            )
-            intraday_analysis['timing_score'] = timing_score
-
-            logger.debug(f"📊 {stock_code} 장중 분석 완료: 추세={trend_confirmation}, "
-                       f"거래량급증={volume_surge}, 타이밍점수={timing_score:.2f}")
+            # 🆕 분봉 데이터로 거래량 급증만 확인 (선택적)
+            minute_data = await self._get_minute_candle_data(stock_code, period_minutes=5, count=10)
+            if minute_data is not None and not minute_data.empty:
+                intraday_analysis['valid'] = True
+                
+                # 거래량 급증 감지만 수행
+                volume_surge = self._detect_volume_surge(minute_data)
+                intraday_analysis['volume_surge'] = volume_surge
+                
+                if volume_surge:
+                    logger.info(f"📈 {stock_code} 거래량 급증 감지 - 패턴 확정 가능성 높음")
 
             return intraday_analysis
 
         except Exception as e:
             logger.debug(f"❌ {stock_code} 장중 데이터 분석 오류: {e}")
-            return {'valid': False, 'timing_score': 0.5, 'analysis_source': 'error'}
+            return {'valid': False, 'volume_surge': False, 'analysis_source': 'error'}
 
-    def _should_use_intraday_analysis(self) -> bool:
-        """장중 분석 사용 여부 판단"""
-        try:
-            # 1. 거래 시간 체크
-            if not self._is_trading_time():
-                return False
 
-            # 2. 설정에서 장중 분석 활성화 여부 체크
-            intraday_config = self.config.get('intraday_analysis', {})
-            if not intraday_config.get('enabled', True):  # 기본값: 활성화
-                return False
-
-            # 3. 특별한 시간대 제외 (장 시작 10분, 장 마감 10분)
-            current_time = datetime.now()
-
-            # 장 시작 10분은 변동성이 너무 커서 제외
-            if current_time.hour == 9 and current_time.minute < 10:
-                return False
-
-            # 장 마감 10분은 거래량 폭증으로 노이즈 심해서 제외
-            if current_time.hour == 15 and current_time.minute >= 20:
-                return False
-
-            return True
-
-        except Exception as e:
-            logger.debug(f"장중 분석 사용 여부 판단 오류: {e}")
-            return False
 
     async def _get_minute_candle_data(self, stock_code: str, period_minutes: int = 5, count: int = 20) -> Optional[Any]:
         """분봉 데이터 조회 (KIS API 활용)"""
@@ -510,36 +453,7 @@ class CandleAnalyzer:
             # (일봉 기반 분석으로 폴백 가능)
             return None
 
-    def _analyze_minute_trend(self, minute_data: Any, current_price: float) -> str:
-        """분봉 기반 단기 추세 분석"""
-        try:
-            if minute_data is None or minute_data.empty or len(minute_data) < 5:
-                return 'neutral'
 
-            # 최근 5개 분봉의 종가 추세 확인 (KIS API 컬럼명 사용)
-            recent_closes = []
-            for _, row in minute_data.head(5).iterrows():
-                try:
-                    close_price = float(row.get('stck_clpr', 0))
-                    if close_price > 0:
-                        recent_closes.append(close_price)
-                except (ValueError, TypeError):
-                    continue
-
-            if len(recent_closes) < 3:
-                return 'neutral'
-
-            # 단순 추세 판단: 상승/하락/횡보
-            if recent_closes[0] > recent_closes[-1] * 1.002:  # 0.2% 이상 상승
-                return 'bullish'
-            elif recent_closes[0] < recent_closes[-1] * 0.998:  # 0.2% 이상 하락
-                return 'bearish'
-            else:
-                return 'neutral'
-
-        except Exception as e:
-            logger.debug(f"분봉 추세 분석 오류: {e}")
-            return 'neutral'
 
     def _detect_volume_surge(self, minute_data: Any) -> bool:
         """거래량 급증 감지"""
@@ -579,157 +493,32 @@ class CandleAnalyzer:
             logger.debug(f"거래량 급증 감지 오류: {e}")
             return False
 
-    def _analyze_support_resistance_proximity(self, minute_data: Any, current_price: float, daily_ohlcv: Any) -> Optional[Dict]:
-        """지지/저항선 근접성 분석"""
-        try:
-            # 일봉 데이터에서 주요 지지/저항선 추출
-            if daily_ohlcv is None or daily_ohlcv.empty or len(daily_ohlcv) < 20:
-                return None
 
-            # 최근 20일간의 고가/저가에서 지지/저항선 찾기
-            recent_highs = [float(row.get('stck_hgpr', 0)) for _, row in daily_ohlcv.head(20).iterrows()]
-            recent_lows = [float(row.get('stck_lwpr', 0)) for _, row in daily_ohlcv.head(20).iterrows()]
-
-            # 주요 저항선 (고가들의 평균 상위)
-            resistance_level = sum(sorted(recent_highs, reverse=True)[:5]) / 5
-
-            # 주요 지지선 (저가들의 평균 하위)
-            support_level = sum(sorted(recent_lows)[:5]) / 5
-
-            # 현재가와의 거리 계산
-            resistance_distance = (resistance_level - current_price) / current_price * 100
-            support_distance = (current_price - support_level) / current_price * 100
-
-            return {
-                'resistance_level': resistance_level,
-                'support_level': support_level,
-                'resistance_distance_pct': resistance_distance,
-                'support_distance_pct': support_distance,
-                'near_resistance': abs(resistance_distance) < 1.0,  # 1% 이내
-                'near_support': abs(support_distance) < 1.0,        # 1% 이내
-            }
-
-        except Exception as e:
-            logger.debug(f"지지/저항선 분석 오류: {e}")
-            return None
-
-    def _evaluate_entry_timing_quality(self, minute_data: Any, current_price: float,
-                                     trend_confirmation: str, volume_surge: bool) -> str:
-        """진입 타이밍 품질 평가"""
-        try:
-            score = 0
-
-            # 추세 확인 점수
-            if trend_confirmation == 'bullish':
-                score += 3
-            elif trend_confirmation == 'neutral':
-                score += 1
-
-            # 거래량 급증 점수
-            if volume_surge:
-                score += 2
-
-            # 타이밍 품질 판정
-            if score >= 4:
-                return 'excellent'
-            elif score >= 3:
-                return 'good'
-            elif score >= 1:
-                return 'normal'
-            else:
-                return 'poor'
-
-        except Exception as e:
-            logger.debug(f"진입 타이밍 평가 오류: {e}")
-            return 'normal'
-
-    def _evaluate_exit_timing_quality(self, minute_data: Any, current_price: float, trend_confirmation: str) -> str:
-        """청산 타이밍 품질 평가"""
-        try:
-            # 하락 추세시 좋은 청산 타이밍
-            if trend_confirmation == 'bearish':
-                return 'excellent'
-            elif trend_confirmation == 'neutral':
-                return 'good'
-            else:
-                return 'normal'
-
-        except Exception as e:
-            logger.debug(f"청산 타이밍 평가 오류: {e}")
-            return 'normal'
-
-    def _calculate_intraday_timing_score(self, trend_confirmation: str, volume_surge: bool,
-                                       support_resistance: Optional[Dict], entry_timing: str, exit_timing: str) -> float:
-        """장중 타이밍 종합 점수 계산"""
-        try:
-            score = 0.5  # 기본값
-
-            # 추세 확인 (±0.2)
-            if trend_confirmation == 'bullish':
-                score += 0.2
-            elif trend_confirmation == 'bearish':
-                score -= 0.1
-
-            # 거래량 급증 (+0.1)
-            if volume_surge:
-                score += 0.1
-
-            # 지지/저항선 근접성 (±0.1)
-            if support_resistance:
-                if support_resistance.get('near_support'):
-                    score += 0.1  # 지지선 근처는 좋은 진입점
-                elif support_resistance.get('near_resistance'):
-                    score -= 0.1  # 저항선 근처는 주의
-
-            # 진입 타이밍 품질 (±0.1)
-            timing_scores = {'excellent': 0.1, 'good': 0.05, 'normal': 0, 'poor': -0.1}
-            score += timing_scores.get(entry_timing, 0)
-
-            # 0~1 범위로 제한
-            return max(0.0, min(1.0, score))
-
-        except Exception as e:
-            logger.debug(f"장중 타이밍 점수 계산 오류: {e}")
-            return 0.5
 
     def _refine_position_signals_with_intraday(self, position_signals: Dict, intraday_signals: Dict, focus_on_exit: bool) -> Dict:
-        """장중 데이터로 포지션 신호 정밀화"""
+        """장중 데이터로 포지션 신호 정밀화 (단순화)"""
         try:
             if not intraday_signals.get('valid', False):
                 return position_signals
 
             refined_signals = position_signals.copy()
-            timing_score = intraday_signals.get('timing_score', 0.5)
-            trend_confirmation = intraday_signals.get('trend_confirmation', 'neutral')
+            volume_surge = intraday_signals.get('volume_surge', False)
 
-            if focus_on_exit:
-                # 📈 매도 신호 정밀화
-                if position_signals.get('signal') in ['strong_sell', 'sell']:
-                    # 하락 추세 + 좋은 타이밍이면 신호 강화
-                    if trend_confirmation == 'bearish' and timing_score > 0.7:
-                        refined_signals['intraday_enhancement'] = 'exit_timing_excellent'
-                        logger.debug("🎯 장중 분석: 매도 타이밍 최적화")
-                    elif trend_confirmation == 'bullish':
-                        # 상승 추세인데 매도 신호면 신중하게
-                        refined_signals['intraday_enhancement'] = 'exit_timing_caution'
-                        logger.debug("⚠️ 장중 분석: 매도 신호 있지만 상승 추세")
-
-            else:
-                # 💰 매수 신호 정밀화
-                if position_signals.get('signal') in ['buy_ready', 'strong_buy']:
-                    # 상승 추세 + 좋은 타이밍이면 신호 강화
-                    if trend_confirmation == 'bullish' and timing_score > 0.7:
-                        refined_signals['intraday_enhancement'] = 'entry_timing_excellent'
-                        logger.debug("🎯 장중 분석: 매수 타이밍 최적화")
-                    elif trend_confirmation == 'bearish':
-                        # 하락 추세인데 매수 신호면 대기
-                        refined_signals['signal'] = 'wait'
-                        refined_signals['intraday_enhancement'] = 'entry_timing_poor'
-                        logger.debug("⚠️ 장중 분석: 매수 신호 있지만 하락 추세 - 대기")
+            # 🎯 거래량 급증시에만 신호 강화
+            if volume_surge:
+                if focus_on_exit:
+                    # 매도 신호 + 거래량 급증 = 신호 강화
+                    if position_signals.get('signal') in ['strong_sell', 'sell']:
+                        refined_signals['intraday_enhancement'] = 'volume_surge_exit'
+                        logger.debug("📈 장중 분석: 거래량 급증으로 매도 신호 강화")
+                else:
+                    # 매수 신호 + 거래량 급증 = 신호 강화
+                    if position_signals.get('signal') in ['buy_ready', 'strong_buy']:
+                        refined_signals['intraday_enhancement'] = 'volume_surge_entry'
+                        logger.debug("💰 장중 분석: 거래량 급증으로 매수 신호 강화")
 
             # 장중 분석 메타데이터 추가
-            refined_signals['intraday_timing_score'] = timing_score
-            refined_signals['intraday_trend'] = trend_confirmation
+            refined_signals['volume_surge'] = volume_surge
 
             return refined_signals
 
@@ -1133,20 +922,24 @@ class CandleAnalyzer:
             else:
                 can_enter = False
 
-            # 3. 🆕 패턴 신호 강도 체크
+            # 3. 🆕 패턴 신호 강도 체크 (config에서 임계값 가져오기)
             pattern_strength = current_pattern_signals.get('strength', 0)
-            if pattern_strength >= 70:
+            min_pattern_strength = self.config.get('trading_thresholds', {}).get('min_pattern_strength', 70)
+            
+            if pattern_strength >= min_pattern_strength:
                 entry_reasons.append(f'강한 패턴 신호 ({pattern_strength})')
-            elif pattern_strength >= 50:
+            elif pattern_strength >= min_pattern_strength * 0.8:  # 80% 수준까지 허용
                 entry_reasons.append(f'적정 패턴 신호 ({pattern_strength})')
             else:
                 can_enter = False
 
-            # 4. 🆕 패턴 신뢰도 체크
+            # 4. 🆕 패턴 신뢰도 체크 (config에서 임계값 가져오기)
             pattern_reliability = current_pattern_signals.get('pattern_reliability', 0.0)
-            if pattern_reliability >= 0.7:
+            min_pattern_confidence = self.config.get('trading_thresholds', {}).get('min_pattern_confidence', 0.65)
+            
+            if pattern_reliability >= min_pattern_confidence:
                 entry_reasons.append(f'높은 패턴 신뢰도 ({pattern_reliability:.2f})')
-            elif pattern_reliability < 0.5:
+            elif pattern_reliability < min_pattern_confidence * 0.8:  # 80% 수준 미만은 차단
                 can_enter = False
 
             signal = 'buy_ready' if can_enter else 'wait'
@@ -1238,10 +1031,13 @@ class CandleAnalyzer:
                 else:
                     return TradeSignal.HOLD, int(total_score)
             else:
-                # 매수 신호
-                if total_score >= 80:
+                # 매수 신호 (config에서 임계값 가져오기)
+                min_buy_signal_score = self.config.get('trading_thresholds', {}).get('min_buy_signal_score', 70)
+                min_strong_buy_score = self.config.get('trading_thresholds', {}).get('min_strong_buy_score', 85)
+                
+                if total_score >= min_strong_buy_score:
                     return TradeSignal.STRONG_BUY, int(total_score)
-                elif total_score >= 60:
+                elif total_score >= min_buy_signal_score:
                     return TradeSignal.BUY, int(total_score)
                 else:
                     return TradeSignal.HOLD, int(total_score)

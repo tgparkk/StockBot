@@ -262,7 +262,7 @@ def get_inquire_time_itemchartprice(output_dv: str = "1", div_code: str = "J", i
                 output2_data = getattr(body, 'output2', [])
                 if output2_data:
                     current_data = pd.DataFrame(output2_data)
-                    logger.info(f"📊 {itm_no} 분봉 데이터 조회 성공: {len(current_data)}건 (시간: {input_hour})")
+                    logger.debug(f"📊 {itm_no} 분봉 데이터 조회 성공: {len(current_data)}건 (시간: {input_hour})")
 
                     # 분봉 데이터 정보 로깅
                     if len(current_data) > 0:
@@ -771,19 +771,19 @@ def get_stock_balance(output_dv: str = "01", tr_cont: str = "",
             if output2_data:
                 summary = output2_data[0] if isinstance(output2_data, list) else output2_data
 
-                # 💰 매수가능금액 등 주요 정보 추출
+                # 💰 매수가능금액 등 주요 정보 추출 (API 문서 기준)
                 account_summary = {
-                    'dnca_tot_amt': int(summary.get('dnca_tot_amt', '0')),           # 🎯 매수가능금액 (핵심!)
+                    'dnca_tot_amt': int(summary.get('dnca_tot_amt', '0')),           # 예수금총금액
+                    'nxdy_excc_amt': int(summary.get('nxdy_excc_amt', '0')),        # 🎯 익일정산금액 (실제 매수가능금액!)
+                    'prvs_rcdl_excc_amt': int(summary.get('prvs_rcdl_excc_amt', '0')), # 가수도정산금액 (D+2 예수금)
                     'tot_evlu_amt': int(summary.get('tot_evlu_amt', '0')),          # 총평가액
                     'evlu_pfls_smtl_amt': int(summary.get('evlu_pfls_smtl_amt', '0')), # 평가손익합계
-                    'prvs_rcdl_excc_amt': int(summary.get('prvs_rcdl_excc_amt', '0')), # 전일결산예탁금
                     'pchs_amt_smtl_amt': int(summary.get('pchs_amt_smtl_amt', '0')),   # 매입금액합계
                     'evlu_amt_smtl_amt': int(summary.get('evlu_amt_smtl_amt', '0')),   # 평가금액합계
-                    'nxdy_excc_amt': int(summary.get('nxdy_excc_amt', '0')),           # 익일예탁금
                     'raw_summary': summary  # 원본 데이터 보관
                 }
 
-                logger.debug(f"✅ 계좌요약: 💰매수가능={account_summary['dnca_tot_amt']:,}원, "
+                logger.debug(f"✅ 계좌요약: 💰매수가능={account_summary['nxdy_excc_amt']:,}원, "
                            f"총평가액={account_summary['tot_evlu_amt']:,}원, "
                            f"평가손익={account_summary['evlu_pfls_smtl_amt']:+,}원")
 
@@ -822,10 +822,11 @@ def get_account_balance() -> Optional[Dict]:
             'total_stocks': 0,
             'total_value': account_summary.get('tot_evlu_amt', 0),
             'total_profit_loss': account_summary.get('evlu_pfls_smtl_amt', 0),
-            'available_amount': account_summary.get('dnca_tot_amt', 0),  # 🎯 매수가능금액 (핵심!)
-            'cash_balance': account_summary.get('prvs_rcdl_excc_amt', 0),
+            'available_amount': account_summary.get('prvs_rcdl_excc_amt', 0),  # 🎯 가수도정산금액 (실제 매수가능금액!)
+            'cash_balance': account_summary.get('nxdy_excc_amt', 0),          # 🎯 익일정산금액 (D+1 예수금)
             'purchase_amount': account_summary.get('pchs_amt_smtl_amt', 0),
             'next_day_amount': account_summary.get('nxdy_excc_amt', 0),
+            'deposit_total': account_summary.get('dnca_tot_amt', 0),          # 🆕 예수금총금액 (참고용)
             'stocks': []
         }
 

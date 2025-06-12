@@ -733,9 +733,9 @@ class AsyncDataLogger:
                 cursor = conn.cursor()
                 
                 for data in batch:
-                    # JSON 직렬화
-                    signal_data_json = json.dumps(data.get('signal_data', {}))
-                    validation_checks = json.dumps(data.get('validation_checks', {}))
+                    # JSON 직렬화 (datetime 객체 처리)
+                    signal_data_json = json.dumps(data.get('signal_data', {}), default=str)
+                    validation_checks = json.dumps(data.get('validation_checks', {}), default=str)
                     
                     cursor.execute("""
                         INSERT INTO buy_attempts (
