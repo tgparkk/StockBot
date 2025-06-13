@@ -48,7 +48,7 @@ class CandleTradeManager:
             logger.info("🗄️ 캔들 트레이딩 데이터베이스 연결 완료")
 
         # 🆕 스캔 간격 (초)
-        self.scan_interval = self.config.get('scan_interval_seconds', 1800)
+        self.scan_interval = self.config.get('scan_interval_seconds', 120)
         self.signal_evaluation_interval = self.config.get('signal_evaluation_interval', 30)
 
         # 데이터 수집 및 분석 도구들
@@ -147,7 +147,7 @@ class CandleTradeManager:
                 try:
                     current_time = datetime.now()
 
-                    # 🕯️ 1. 새로운 종목 패턴 스캔 (30분 간격 - 캔들패턴 특성 반영)
+                    # 🕯️ 1. 새로운 종목 패턴 스캔
                     if self._should_scan_new_patterns(current_time):
                         logger.info("🔍 정기 캔들패턴 스캔 시작...")
                         await self._scan_and_detect_patterns()
@@ -545,39 +545,14 @@ class CandleTradeManager:
             if not self._last_pattern_scan_time:
                 return True  # 첫 스캔
 
-            # 기본 시간 간격 체크 (10분)
+            # 기본 시간 간격 체크
             time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
             if time_elapsed >= self._pattern_scan_interval:
                 return True
 
-            # 🆕 급등 감지시 즉시 추가 스캔 (5분 이상 경과시)
-            if time_elapsed >= 300:  # 5분 이상 경과
-                # 현재 보유 종목 중 급등 종목이 있으면 시장에 다른 급등주도 있을 가능성
-                for candidate in self.stock_manager._all_stocks.values():
-                    if (candidate.status == CandleStatus.ENTERED and
-                        candidate.performance and candidate.performance.pnl_pct and
-                        candidate.performance.pnl_pct >= 5.0):  # 5% 이상 수익
-                        logger.info("🚀 급등 종목 감지 - 추가 패턴 스캔 실행")
-                        return True
-
             # 🎯 특별한 상황에서 추가 스캔 (캔들패턴 거래에 중요한 시점들)
             current_hour = current_time.hour
             current_minute = current_time.minute
-
-            # 장 시작 후 30분 (09:30) - 갭 상황 체크
-            if current_hour == 9 and current_minute == 30 and time_elapsed >= 600:  # 10분 이상 경과
-                logger.info("🌅 장 시작 후 30분 - 추가 패턴 스캔")
-                return True
-
-            # 점심시간 후 (13:00) - 오후 패턴 변화 체크
-            if current_hour == 13 and current_minute == 0 and time_elapsed >= 600:
-                logger.info("🌞 점심시간 후 - 추가 패턴 스캔")
-                return True
-
-            # 장 마감 1시간 전 (14:30) - 마지막 기회 체크
-            if current_hour == 14 and current_minute == 30 and time_elapsed >= 600:
-                logger.info("🌇 장 마감 1시간 전 - 마지막 패턴 스캔")
-                return True
 
             return False
 

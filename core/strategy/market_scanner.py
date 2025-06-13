@@ -63,70 +63,110 @@ class MarketScanner:
             logger.error(f"종목 스캔 오류: {e}")
 
     async def scan_market_for_patterns(self, market: str):
-        """특정 시장에서 패턴 스캔 - 배치 처리 방식"""
+        """🆕 전체 KOSPI 종목 대상 캔들 패턴 스캔 - 새로운 방식"""
         try:
-            market_name = "코스피" if market == "0001" else "코스닥" if market == "1001" else f"시장{market}"
-            logger.debug(f"📊 {market_name} 패턴 스캔 시작")
+            # 🆕 KOSPI만 지원 (코스닥은 추후 확장)
+            if market != "0001":
+                logger.info(f"⏩ {market} 시장은 현재 지원하지 않습니다. KOSPI만 지원.")
+                return
 
-            # 1. 기본 후보 종목 수집 (기존 API 활용)
-            candidates = []
+            market_name = "코스피"
+            logger.info(f"📊 {market_name} 전체 종목 캔들 패턴 스캔 시작")
 
-            # 등락률 상위 종목
-            from ..api.kis_market_api import get_fluctuation_rank
-            fluctuation_data = get_fluctuation_rank(
-                fid_input_iscd=market,
-                fid_rank_sort_cls_code="0",  # 상승률순
-                fid_rsfl_rate1="1.0"  # 1% 이상
-            )
+            # 🆕 1. 전체 KOSPI 종목 리스트 로드
+            from ..utils.stock_list_loader import load_kospi_stocks
+            all_kospi_stocks = load_kospi_stocks()
 
-            if fluctuation_data is not None and not fluctuation_data.empty:
-                candidates.extend(fluctuation_data.head(50)['stck_shrn_iscd'].tolist())
+            if not all_kospi_stocks:
+                logger.error("❌ KOSPI 종목 리스트 로드 실패")
+                return
 
-            # 거래량 급증 종목
-            from ..api.kis_market_api import get_volume_rank
-            volume_data = get_volume_rank(
-                fid_input_iscd=market,
-                fid_blng_cls_code="1",  # 거래증가율
-                fid_vol_cnt="50000"
-            )
+            logger.info(f"📋 전체 KOSPI 종목: {len(all_kospi_stocks)}개")
 
-            if volume_data is not None and not volume_data.empty:
-                candidates.extend(volume_data.head(50)['mksc_shrn_iscd'].tolist())
+            # 🆕 2. 모든 종목에 대해 기본 스크리닝 + 패턴 분석
+            candidates_with_scores = []
+            processed_count = 0
+            batch_size = 10  # API 부하 고려하여 10개씩
 
-            # 중복 제거
-            unique_candidates = list(set(candidates))[:self.config['max_scan_stocks']]
+            # 배치 단위로 처리
+            for batch_start in range(0, len(all_kospi_stocks), batch_size):
+                batch_end = min(batch_start + batch_size, len(all_kospi_stocks))
+                batch_stocks = all_kospi_stocks[batch_start:batch_end]
 
-            logger.info(f"📈 {market_name} 후보 종목: {len(unique_candidates)}개")
-
-            # 2. 배치 처리로 종목 분석 (5개씩 병렬 처리)
-            pattern_found_count = 0
-            batch_size = 5  # 배치 크기 설정
-
-            # 배치 단위로 종목들을 그룹화
-            for batch_start in range(0, len(unique_candidates), batch_size):
-                batch_end = min(batch_start + batch_size, len(unique_candidates))
-                batch_stocks = unique_candidates[batch_start:batch_end]
-
-                logger.debug(f"📊 배치 처리: {batch_start+1}-{batch_end}/{len(unique_candidates)} "
+                logger.debug(f"📊 배치 처리: {batch_start+1}-{batch_end}/{len(all_kospi_stocks)} "
                            f"종목 ({len(batch_stocks)}개)")
 
-                # 배치 내 종목들을 병렬로 처리
-                batch_results = await self.process_stock_batch(batch_stocks, market_name)
+                # 배치 내 종목들 병렬 처리
+                batch_results = await self.process_full_screening_batch(batch_stocks, market_name)
 
-                # 성공적으로 패턴이 감지된 종목들을 스톡 매니저에 추가
-                for candidate in batch_results:
-                    if candidate and candidate.detected_patterns:
-                        if self.stock_manager.add_candidate(candidate):
-                            pattern_found_count += 1
+                # 패턴이 감지된 종목들 수집
+                for result in batch_results:
+                    if result and result['candidate'] and result['pattern_score'] > 0:
+                        candidates_with_scores.append(result)
 
-                # 배치 간 간격 (API 부하 방지)
-                if batch_end < len(unique_candidates):
-                    await asyncio.sleep(0.5)  # 500ms 대기
+                processed_count += len(batch_stocks)
 
-            logger.debug(f"🎯 {market_name} 패턴 감지: {pattern_found_count}개 종목")
+                # 진행률 로깅 (100개마다)
+                if processed_count % 100 == 0:
+                    logger.info(f"🔄 진행률: {processed_count}/{len(all_kospi_stocks)} "
+                               f"({processed_count/len(all_kospi_stocks)*100:.1f}%) "
+                               f"- 현재 후보: {len(candidates_with_scores)}개")
+
+                # API 부하 방지 대기
+                if batch_end < len(all_kospi_stocks):
+                    await asyncio.sleep(0.3)  # 300ms 대기
+
+            # 🆕 3. 패턴 점수 기준으로 상위 50개 선별
+            candidates_with_scores.sort(key=lambda x: x['pattern_score'], reverse=True)
+            top_candidates = candidates_with_scores[:50]  # 상위 50개만
+
+            logger.info(f"🎯 {market_name} 패턴 분석 완료: "
+                       f"전체 {len(candidates_with_scores)}개 중 상위 {len(top_candidates)}개 선별")
+
+            # 🆕 4. 선별된 후보들을 스톡 매니저에 추가
+            pattern_found_count = 0
+            for result in top_candidates:
+                candidate = result['candidate']
+                if self.stock_manager.add_candidate(candidate):
+                    pattern_found_count += 1
+                    logger.debug(f"✅ {candidate.stock_code}({candidate.stock_name}) "
+                               f"패턴점수: {result['pattern_score']:.2f}")
+
+            logger.info(f"🏆 {market_name} 최종 후보: {pattern_found_count}개 종목 추가")
 
         except Exception as e:
-            logger.error(f"시장 {market} 스캔 오류: {e}")
+            logger.error(f"시장 {market} 전체 스캔 오류: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def process_full_screening_batch(self, stock_codes: List[str], market_name: str) -> List[Optional[Dict]]:
+        """🆕 전체 스크리닝 배치 처리 (기본 필터링 + 패턴 분석)"""
+        import asyncio
+
+        try:
+            # 배치 내 모든 종목을 비동기로 동시 처리
+            tasks = [
+                self.analyze_stock_with_full_screening(stock_code, market_name)
+                for stock_code in stock_codes
+            ]
+
+            # 모든 작업이 완료될 때까지 대기
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 성공한 결과만 필터링
+            valid_results = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.debug(f"종목 {stock_codes[i]} 전체 스크리닝 실패: {result}")
+                    valid_results.append(None)
+                else:
+                    valid_results.append(result)
+
+            return valid_results
+
+        except Exception as e:
+            logger.error(f"전체 스크리닝 배치 처리 오류: {e}")
+            return [None] * len(stock_codes)
 
     async def process_stock_batch(self, stock_codes: List[str], market_name: str) -> List[Optional[CandleTradeCandidate]]:
         """주식 배치 병렬 처리"""
@@ -433,6 +473,298 @@ class MarketScanner:
             return RiskManagement(0, 0, 0, 0, 0, 8, 100)
 
     # _calculate_risk_score 함수는 candle_analyzer.py로 이동됨
+
+    async def analyze_stock_with_full_screening(self, stock_code: str, market_name: str) -> Optional[Dict]:
+        """🆕 개별 종목 전체 스크리닝 (기본 필터링 + 패턴 분석)"""
+        try:
+            # 🆕 1. 엑셀에서 종목 기본 정보 조회
+            from ..utils.stock_list_loader import get_stock_info_from_excel
+            stock_excel_info = get_stock_info_from_excel(stock_code)
+            
+            if not stock_excel_info:
+                return None
+
+            stock_name = stock_excel_info['stock_name_short']
+            listed_shares = stock_excel_info['listed_shares']
+
+            # 🆕 2. 현재가 조회 (기본 필터링용)
+            from ..api.kis_market_api import get_inquire_price
+            current_info = get_inquire_price(itm_no=stock_code)
+            
+            if current_info is None or current_info.empty:
+                return None
+
+            current_price = float(current_info.iloc[0].get('stck_prpr', 0))
+            volume = int(current_info.iloc[0].get('acml_vol', 0))
+            trading_value = int(current_info.iloc[0].get('acml_tr_pbmn', 0))
+            
+            if current_price <= 0:
+                return None
+
+            # 🆕 3. 기본 필터링 조건 체크
+            if not self._passes_enhanced_basic_filters(
+                current_price, volume, trading_value, listed_shares, stock_code
+            ):
+                return None
+
+            # 🆕 4. 30일 일봉 데이터 조회 (get_inquire_daily_itemchartprice 사용)
+            from ..api.kis_market_api import get_inquire_daily_itemchartprice
+            from datetime import datetime, timedelta
+            
+            # 시작일 (30거래일 전 approximate)
+            start_date = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
+            end_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")  # 당일 제외
+            
+            ohlcv_data = get_inquire_daily_itemchartprice(
+                output_dv="2",  # 일봉 데이터 배열
+                itm_no=stock_code,
+                inqr_strt_dt=start_date,
+                inqr_end_dt=end_date,
+                period_code="D",  # 일봉
+                adj_prc="1"       # 원주가
+            )
+
+            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 20:
+                return None
+
+            # 🆕 5. 추가 거래량 필터링 (최근 5일 평균 거래량 체크)
+            if not self._check_recent_volume_filter(ohlcv_data):
+                return None
+
+            # 🆕 6. 캔들 패턴 분석 (28일 흐름 + 최근 2일 패턴)
+            pattern_result = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
+            
+            if not pattern_result or len(pattern_result) == 0:
+                return None
+
+            # 🆕 7. 패턴 점수 계산 (새로운 방식)
+            pattern_score = self._calculate_enhanced_pattern_score(pattern_result, ohlcv_data)
+            
+            if pattern_score < 0.3:  # 최소 점수 기준
+                return None
+
+            # 🆕 8. 후보 생성
+            candidate = CandleTradeCandidate(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                current_price=current_price,
+                market_type=market_name
+            )
+
+            # 패턴 정보 추가
+            for pattern in pattern_result:
+                candidate.add_pattern(pattern)
+
+            # 일봉 데이터 캐싱
+            candidate.cache_ohlcv_data(ohlcv_data)
+
+            # 매매 신호 생성
+            trade_signal, signal_strength = self._generate_trade_signal(pattern_result)
+            candidate.trade_signal = trade_signal
+            candidate.signal_strength = signal_strength
+            candidate.signal_updated_at = datetime.now()
+
+            # 진입 우선순위 계산
+            candidate.entry_priority = self.manager.candle_analyzer.calculate_entry_priority(candidate)
+
+            # 리스크 관리 설정
+            candidate.risk_management = self._calculate_risk_management(candidate)
+
+            return {
+                'candidate': candidate,
+                'pattern_score': pattern_score,
+                'stock_info': stock_excel_info
+            }
+
+        except Exception as e:
+            logger.debug(f"❌ {stock_code} 전체 스크리닝 오류: {e}")
+            return None
+
+    def _passes_enhanced_basic_filters(self, current_price: float, volume: int, 
+                                     trading_value: int, listed_shares: int, stock_code: str) -> bool:
+        """🆕 강화된 기본 필터링 (시가총액, 거래량, 가격대 등)"""
+        try:
+            # 1. 가격대 필터 (1,000원 ~ 300,000원)
+            if not (1000 <= current_price <= 300000):
+                return False
+
+            # 2. 일일 거래량 필터 (최소 10,000주)
+            if volume < 10000:
+                return False
+
+            # 3. 일일 거래대금 필터 (최소 1억원)
+            if trading_value < 100_000_000:
+                return False
+
+            # 4. 시가총액 필터 (1,000억 ~ 10조)
+            if listed_shares > 0:
+                market_cap = current_price * listed_shares
+                if not (100_000_000_000 <= market_cap <= 10_000_000_000_000):
+                    return False
+            else:
+                return False  # 상장주식수 정보 없으면 제외
+
+            # 5. 상장주식수 필터 (최소 1,000만주)
+            if listed_shares < 10_000_000:
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"❌ {stock_code} 기본 필터링 오류: {e}")
+            return False
+
+    def _check_recent_volume_filter(self, ohlcv_data) -> bool:
+        """🆕 최근 5일 평균 거래량 필터링 (50,000주 이상)"""
+        try:
+            if len(ohlcv_data) < 5:
+                return False
+
+            # 최근 5일 거래량 (stck_vol 또는 acml_vol 컬럼)
+            volume_col = 'stck_vol' if 'stck_vol' in ohlcv_data.columns else 'acml_vol'
+            
+            if volume_col not in ohlcv_data.columns:
+                return False
+
+            recent_5_days = ohlcv_data.head(5)  # 최신 데이터가 앞에 있다고 가정
+            avg_volume = recent_5_days[volume_col].astype(int).mean()
+
+            return avg_volume >= 50000
+
+        except Exception as e:
+            logger.debug(f"거래량 필터링 오류: {e}")
+            return False
+
+    def _calculate_enhanced_pattern_score(self, patterns: List[CandlePatternInfo], ohlcv_data) -> float:
+        """🆕 강화된 패턴 점수 계산 (과거 흐름 + 최근 패턴)"""
+        try:
+            if not patterns or len(ohlcv_data) < 10:
+                return 0.0
+
+            # 1. 기본 패턴 점수 (기존 로직)
+            strongest_pattern = max(patterns, key=lambda p: p.strength)
+            base_score = strongest_pattern.strength / 100.0  # 0.0 ~ 1.0
+
+            # 2. 패턴 신뢰도 가중치
+            confidence_weight = strongest_pattern.confidence  # 0.0 ~ 1.0
+
+            # 3. 최근 2일 패턴 완성도 체크
+            recent_completion_score = self._check_recent_pattern_completion(ohlcv_data)
+
+            # 4. 추세 일관성 점수 (과거 28일 vs 최근 2일)
+            trend_consistency_score = self._check_trend_consistency(ohlcv_data)
+
+            # 5. 거래량 증가 점수
+            volume_increase_score = self._check_volume_increase_pattern(ohlcv_data)
+
+            # 6. 종합 점수 계산 (가중 평균)
+            final_score = (
+                base_score * 0.4 +
+                confidence_weight * 0.2 +
+                recent_completion_score * 0.2 +
+                trend_consistency_score * 0.1 +
+                volume_increase_score * 0.1
+            )
+
+            return min(1.0, max(0.0, final_score))
+
+        except Exception as e:
+            logger.debug(f"패턴 점수 계산 오류: {e}")
+            return 0.0
+
+    def _check_recent_pattern_completion(self, ohlcv_data) -> float:
+        """최근 2일 패턴 완성도 체크"""
+        try:
+            if len(ohlcv_data) < 3:
+                return 0.0
+
+            # 최근 3일 데이터 (비교용)
+            recent_3 = ohlcv_data.head(3)
+
+            # 가격 컬럼 확인
+            price_col = 'stck_clpr' if 'stck_clpr' in recent_3.columns else 'close'
+            if price_col not in recent_3.columns:
+                return 0.0
+
+            prices = recent_3[price_col].astype(float).tolist()
+
+            # 상승 패턴 완성도 체크 (최근 2일 연속 상승)
+            if len(prices) >= 3:
+                if prices[0] > prices[1] > prices[2]:  # 2일 연속 상승
+                    return 0.8
+                elif prices[0] > prices[1]:  # 1일 상승
+                    return 0.5
+
+            return 0.2
+
+        except Exception as e:
+            logger.debug(f"최근 패턴 완성도 체크 오류: {e}")
+            return 0.0
+
+    def _check_trend_consistency(self, ohlcv_data) -> float:
+        """추세 일관성 체크 (과거 28일 vs 최근 2일)"""
+        try:
+            if len(ohlcv_data) < 30:
+                return 0.5  # 기본값
+
+            # 가격 컬럼 확인
+            price_col = 'stck_clpr' if 'stck_clpr' in ohlcv_data.columns else 'close'
+            if price_col not in ohlcv_data.columns:
+                return 0.5
+
+            prices = ohlcv_data[price_col].astype(float)
+
+            # 과거 28일 추세 (장기)
+            long_term_start = prices.iloc[-28]
+            long_term_end = prices.iloc[-3]  # 최근 2일 제외
+            long_term_trend = (long_term_end - long_term_start) / long_term_start
+
+            # 최근 2일 추세 (단기)
+            short_term_start = prices.iloc[-2]
+            short_term_end = prices.iloc[0]
+            short_term_trend = (short_term_end - short_term_start) / short_term_start
+
+            # 추세 일관성 (같은 방향이면 높은 점수)
+            if long_term_trend > 0 and short_term_trend > 0:  # 둘 다 상승
+                return 0.8
+            elif long_term_trend < 0 and short_term_trend > 0:  # 반전 패턴
+                return 0.6
+            else:
+                return 0.3
+
+        except Exception as e:
+            logger.debug(f"추세 일관성 체크 오류: {e}")
+            return 0.5
+
+    def _check_volume_increase_pattern(self, ohlcv_data) -> float:
+        """거래량 증가 패턴 체크"""
+        try:
+            if len(ohlcv_data) < 10:
+                return 0.5
+
+            # 거래량 컬럼 확인
+            volume_col = 'stck_vol' if 'stck_vol' in ohlcv_data.columns else 'volume'
+            if volume_col not in ohlcv_data.columns:
+                return 0.5
+
+            volumes = ohlcv_data[volume_col].astype(int)
+
+            # 최근 2일 평균 vs 과거 8일 평균 비교
+            recent_avg = volumes.head(2).mean()
+            past_avg = volumes.iloc[2:10].mean()
+
+            volume_ratio = recent_avg / past_avg if past_avg > 0 else 1.0
+
+            if volume_ratio >= 1.5:  # 50% 이상 증가
+                return 0.8
+            elif volume_ratio >= 1.2:  # 20% 이상 증가
+                return 0.6
+            else:
+                return 0.3
+
+        except Exception as e:
+            logger.debug(f"거래량 증가 패턴 체크 오류: {e}")
+            return 0.5
 
     # 상태 조회 메서드
     def get_scan_status(self) -> Dict[str, Any]:
