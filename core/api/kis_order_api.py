@@ -351,49 +351,79 @@ async def cancel_external_order(kis_api_manager, stock_code: str, order_no: str,
                               buy_sell_code: str, remaining_qty: int, product_name: str) -> bool:
     """🆕 외부 미체결 주문 취소 실행 (개선된 버전)"""
     try:
-        # 🎯 1단계: 정정취소가능주문조회로 정확한 주문조직번호 획득
-        logger.debug(f"🔍 {stock_code} 정정취소가능주문 조회 중...")
+        # 🎯 1단계: 저장된 주문 정보에서 KRX_FWDG_ORD_ORGNO 찾기
+        logger.debug(f"🔍 {stock_code} 저장된 주문 정보에서 조직번호 조회 중...")
         
-        cancelable_orders = get_inquire_psbl_rvsecncl_lst()
-        if not cancelable_orders or cancelable_orders.empty:
-            logger.warning(f"⚠️ {stock_code} 정정취소가능주문 조회 결과 없음")
+        ord_orgno = ""
+        ord_dvsn = "00"  # 기본값
+        
+        # TradingManager의 pending_orders에서 찾기 (kis_api_manager를 통해 접근)
+        if hasattr(kis_api_manager, 'trading_manager') and hasattr(kis_api_manager.trading_manager, 'pending_orders'):
+            pending_orders = kis_api_manager.trading_manager.pending_orders
+            if order_no in pending_orders:
+                order_info = pending_orders[order_no]
+                ord_orgno = order_info.get('krx_fwdg_ord_orgno', '')
+                # 주문 데이터에서 주문구분 추출
+                order_data = order_info.get('order_data', {})
+                ord_dvsn = order_data.get('ord_dvsn', '00')
+                logger.info(f"📋 {stock_code} 저장된 주문정보에서 조직번호 획득: {ord_orgno}")
+        
+        # 저장된 정보에서 찾지 못한 경우, 당일 주문 조회에서 찾기
+        if not ord_orgno:
+            logger.debug(f"🔍 {stock_code} 당일 주문 조회에서 조직번호 찾는 중...")
+            today_orders = kis_api_manager.get_today_orders(include_filled=True)
+            
+            for order_info in today_orders:
+                if str(order_info.get('odno', '')) == str(order_no):
+                    # 당일 주문 조회에서는 KRX_FWDG_ORD_ORGNO가 없을 수 있으므로
+                    # 다른 필드명들도 확인
+                    ord_orgno = str(order_info.get('krx_fwdg_ord_orgno', '') or 
+                                   order_info.get('ord_orgno', '') or 
+                                   order_info.get('KRX_FWDG_ORD_ORGNO', ''))
+                    ord_dvsn = str(order_info.get('ord_dvsn', '00'))
+                    logger.info(f"📋 {stock_code} 당일주문에서 조직번호 획득: {ord_orgno}")
+                    break
+
+        # 여전히 찾지 못한 경우 정정취소가능주문조회 시도 (마지막 수단)
+        if not ord_orgno:
+            logger.debug(f"🔍 {stock_code} 정정취소가능주문조회로 조직번호 찾는 중...")
+            cancelable_orders = get_inquire_psbl_rvsecncl_lst()
+            
+            if cancelable_orders is not None and len(cancelable_orders) > 0:
+                for _, order in cancelable_orders.iterrows():
+                    if str(order.get('odno', '')) == str(order_no):
+                        ord_orgno = str(order.get('krx_fwdg_ord_orgno', '') or 
+                                       order.get('ord_orgno', '') or 
+                                       order.get('KRX_FWDG_ORD_ORGNO', ''))
+                        ord_dvsn = str(order.get('ord_dvsn', '00'))
+                        psbl_qty = int(order.get('psbl_qty', 0) or order.get('rmn_qty', 0))
+                        logger.info(f"📋 {stock_code} 정정취소가능주문에서 조직번호 획득: {ord_orgno}")
+                        
+                        if psbl_qty <= 0:
+                            logger.warning(f"⚠️ {stock_code} 정정취소가능수량이 0 - 이미 처리된 주문")
+                            return False
+                        break
+
+        # 🎯 2단계: 주문조직번호 검증
+        if not ord_orgno:
+            logger.error(f"❌ {stock_code} 주문조직번호를 찾을 수 없음 (주문번호: {order_no})")
             return False
 
-        # 해당 주문번호 찾기
-        target_order = None
-        for _, order in cancelable_orders.iterrows():
-            if order.get('odno', '') == order_no:
-                target_order = order
-                break
-
-        if target_order is None:
-            logger.warning(f"⚠️ {stock_code} 주문번호 {order_no} 정정취소가능주문에서 찾을 수 없음")
-            return False
-
-        # 🎯 2단계: 정확한 주문조직번호와 주문구분 획득
-        ord_orgno = target_order.get('ord_orgno', '')  # 주문조직번호
-        ord_dvsn = target_order.get('ord_dvsn', '00')  # 주문구분
-        psbl_qty = int(target_order.get('psbl_qty', 0))  # 정정취소가능수량
-
-        logger.debug(f"📋 {stock_code} 주문정보: 조직번호={ord_orgno}, 구분={ord_dvsn}, 가능수량={psbl_qty}")
-
-        if psbl_qty <= 0:
-            logger.warning(f"⚠️ {stock_code} 정정취소가능수량이 0 - 이미 처리된 주문")
-            return False
+        logger.debug(f"📋 {stock_code} 주문정보: 조직번호={ord_orgno}, 구분={ord_dvsn}")
 
         # 🎯 3단계: 주문 취소 실행
         cancel_result = kis_api_manager.cancel_order(
             order_no=order_no,
-            ord_orgno=ord_orgno,    # 🆕 정확한 주문조직번호 사용
+            ord_orgno=ord_orgno,    # 🆕 저장된 주문조직번호 사용
             ord_dvsn=ord_dvsn,      # 🆕 정확한 주문구분 사용
             qty_all_ord_yn="Y"      # 전량 취소
         )
 
-        if cancel_result and cancel_result.get('status') == 'success':
+        if cancel_result and isinstance(cancel_result, dict) and cancel_result.get('status') == 'success':
             logger.info(f"✅ {stock_code}({product_name}) 외부 주문 취소 성공 (주문번호: {order_no})")
             return True
         else:
-            error_msg = cancel_result.get('message', 'Unknown error') if cancel_result else 'API call failed'
+            error_msg = cancel_result.get('message', 'Unknown error') if isinstance(cancel_result, dict) else 'API call failed'
             logger.error(f"❌ {stock_code} 외부 주문 취소 실패: {error_msg}")
             return False
 

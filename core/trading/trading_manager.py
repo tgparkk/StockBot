@@ -21,6 +21,9 @@ class TradingManager:
         self.rest_api = rest_api_manager
         self.data_collector = data_collector
 
+        # 🆕 rest_api에 자신의 참조 설정
+        self.rest_api.set_trading_manager(self)
+
         # 주문 추적
         self.pending_orders: Dict[str, Dict] = {}  # {order_no: order_info}
         self.order_history: List[Dict] = []
@@ -97,16 +100,22 @@ class TradingManager:
                     order_no = f"order_{int(time.time() * 1000)}"  # 밀리초 포함
                     logger.warning(f"⚠️ {stock_code} API에서 주문번호 누락 - 임시번호 생성: {order_no}")
 
+                # 🆕 KRX_FWDG_ORD_ORGNO 추출
+                krx_fwdg_ord_orgno = result.get('krx_fwdg_ord_orgno', '')
+                logger.info(f"📋 {stock_code} 주문조직번호: {krx_fwdg_ord_orgno}")
+
                 # 주문 정보 저장
                 order_info = {
                     'order_no': order_no,
+                    'krx_fwdg_ord_orgno': krx_fwdg_ord_orgno,  # 🆕 주문조직번호 저장
                     'stock_code': stock_code,
                     'order_type': order_type,
                     'quantity': quantity,
                     'price': price,
                     'strategy_type': strategy_type,
                     'order_time': time.time(),
-                    'status': 'pending'
+                    'status': 'pending',
+                    'order_data': result.get('order_data', {})  # 🆕 전체 주문 데이터 저장
                 }
 
                 self.pending_orders[order_no] = order_info

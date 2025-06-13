@@ -155,7 +155,18 @@ class TradeExecutor:
                 # 🎯 웹소켓 NOTICE 대기를 위해 OrderExecutionManager에 등록 (체결시 거래 기록 저장됨)
                 self.execution_manager.add_pending_order(
                     order_id=order_id, stock_code=stock_code, order_type='BUY',
-                    quantity=buy_quantity, price=buy_price, strategy_type=strategy
+                    quantity=buy_quantity, price=buy_price, strategy_type=strategy,
+                    # 🆕 패턴 정보 추가
+                    pattern_type=signal.get('pattern_type', ''),
+                    pattern_confidence=signal.get('pattern_confidence', 0.0),
+                    pattern_strength=signal.get('pattern_strength', 0),
+                    # 🆕 기술적 지표 정보 추가
+                    rsi_value=signal.get('rsi_value', None),
+                    macd_value=signal.get('macd_value', None),
+                    volume_ratio=signal.get('volume_ratio', None),
+                    # 🆕 투자 정보 추가
+                    investment_amount=total_amount,
+                    investment_ratio=signal.get('investment_ratio', None)
                 )
 
                 logger.info(f"✅ 매수 주문 성공: {stock_code} (주문번호: {order_id}) - 체결 대기 중")

@@ -63,13 +63,7 @@
             "min_minutes": 1440,
             "description": "상승장악형: 매우 강한 신호, 적극적 목표"
         },
-        "bearish_engulfing": {
-            "target": 0.0,
-            "stop": 1.0,
-            "max_hours": 6,
-            "min_minutes": 60,
-            "description": "하락장악형: 매도 신호, 빠른 청산"
-        },
+
         "evening_star": {
             "target": 0.0,
             "stop": 1.0,
