@@ -170,6 +170,14 @@
             "strength": 1.2,
             "pattern_type": 1.0,
             "freshness": 0.8
+        },
+        "pattern_invalidation": {
+            "enabled": true,
+            "consecutive_opposite_days": 2,
+            "price_decline_threshold": -3.0,
+            "volume_decline_threshold": 0.5,
+            "max_pattern_age_days": 3,
+            "description": "패턴 무효화 조건: 연속 반대 움직임 시 패턴 제외"
         }
     },
     "trading_thresholds": {
