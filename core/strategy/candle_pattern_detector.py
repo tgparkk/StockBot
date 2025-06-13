@@ -257,6 +257,11 @@ class CandlePatternDetector:
                         if confidence < self.thresholds['min_confidence']:
                             continue
 
+                        # 🆕 패턴 유효성 검증
+                        if not self._validate_pattern_still_valid(df, i, 'hammer'):
+                            logger.debug(f"🚫 {stock_code} 망치형 패턴 무효화됨 ({i}일 전)")
+                            continue
+
                         strength = int(80 + (confidence - 0.6) * 60)
 
                         # 패턴 발생 일자 계산 (i일 전)
@@ -363,6 +368,11 @@ class CandlePatternDetector:
                         
                         # 최소 신뢰도 체크
                         if confidence < self.thresholds['min_confidence']:
+                            continue
+
+                        # 🆕 패턴 유효성 검증
+                        if not self._validate_pattern_still_valid(df, i, 'bullish_engulfing'):
+                            logger.debug(f"🚫 {stock_code} 상승장악형 패턴 무효화됨 ({i}일 전)")
                             continue
 
                         strength = int(85 + (confidence - 0.65) * 65)
@@ -763,37 +773,79 @@ class CandlePatternDetector:
             return 0.0
 
     def _check_volatility_confirmation(self, df: pd.DataFrame, idx: int) -> float:
-        """🆕 변동성 지표 확인 (0.0~1.0)"""
+        """변동성 확인 지표"""
         try:
-            if idx >= len(df):
-                return 0.0
-
             current = df.iloc[idx]
-            score = 0.0
-
-            # 1. ATR 기반 변동성 확인
-            volatility_level = current.get('volatility_level', 0.02)
-            if 0.015 <= volatility_level <= 0.05:  # 적정 변동성 (1.5%~5%)
-                score += 0.3
-            elif volatility_level > 0.05:  # 높은 변동성
-                score += 0.1
-
-            # 2. 볼린저 밴드 위치
+            
+            # 1. ATR 대비 변동성 체크
+            atr_ratio = current.get('total_range', 0) / current.get('atr_14', current.get('total_range', 1))
+            volatility_score = min(1.0, atr_ratio / 1.5)  # ATR의 1.5배 이상이면 만점
+            
+            # 2. 볼린저 밴드 위치 체크
             bb_position = current.get('bb_position', 0.5)
-            if bb_position <= 0.2:  # 하단 근처 (과매도)
-                score += 0.3
-            elif bb_position >= 0.8:  # 상단 근처 (과매수)
-                score += 0.3
-            elif 0.3 <= bb_position <= 0.7:  # 중간 영역
-                score += 0.2
-
-            # 3. 일중 변동률
-            intraday_vol = current.get('intraday_volatility', 0.0)
-            if 0.02 <= intraday_vol <= 0.08:  # 적정 일중 변동률
-                score += 0.2
-
-            return min(1.0, score)
-
+            if bb_position < 0.2 or bb_position > 0.8:  # 밴드 끝쪽에 있으면 변동성 높음
+                volatility_score += 0.3
+            
+            # 3. 일중 변동률 체크
+            intraday_vol = current.get('intraday_volatility', 0.02)
+            if intraday_vol > 0.03:  # 3% 이상 일중 변동
+                volatility_score += 0.2
+                
+            return min(1.0, volatility_score)
+            
         except Exception as e:
             logger.error(f"변동성 확인 오류: {e}")
-            return 0.0
+            return 0.5
+
+    def _validate_pattern_still_valid(self, df: pd.DataFrame, pattern_idx: int, pattern_type: str) -> bool:
+        """패턴이 여전히 유효한지 검증"""
+        try:
+            # 패턴 무효화 설정 로드
+            import json
+            import os
+            
+            config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
+                                     'config', 'candle_strategy_config.json')
+            
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            invalidation_config = config.get('quality_management', {}).get('pattern_invalidation', {})
+            
+            if not invalidation_config.get('enabled', False):
+                return True
+            
+            consecutive_days = invalidation_config.get('consecutive_opposite_days', 2)
+            price_threshold = invalidation_config.get('price_decline_threshold', -3.0)
+            max_age_days = invalidation_config.get('max_pattern_age_days', 3)
+            
+            # 1. 패턴 나이 체크
+            if pattern_idx >= max_age_days:
+                logger.debug(f"패턴 무효화: 너무 오래됨 ({pattern_idx}일 전)")
+                return False
+            
+            # 2. 연속 반대 움직임 체크
+            if pattern_type in ['bullish_engulfing', 'hammer', 'inverted_hammer']:
+                # 상승 패턴의 경우 연속 하락 체크
+                consecutive_declines = 0
+                total_decline = 0
+                
+                for i in range(pattern_idx):
+                    current = df.iloc[i]
+                    if current['close'] < current['open']:  # 하락 캔들
+                        consecutive_declines += 1
+                        total_decline += (current['close'] - current['open']) / current['open'] * 100
+                    else:
+                        break
+                
+                # 연속 하락일 수 또는 총 하락률 체크
+                if (consecutive_declines >= consecutive_days or 
+                    total_decline <= price_threshold):
+                    logger.debug(f"패턴 무효화: 연속 {consecutive_declines}일 하락, 총 {total_decline:.1f}% 하락")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"패턴 검증 오류: {e}")
+            return True  # 오류 시 보수적으로 유효하다고 판단
