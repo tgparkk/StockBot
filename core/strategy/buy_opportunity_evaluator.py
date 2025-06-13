@@ -497,10 +497,18 @@ class BuyOpportunityEvaluator:
                 'price': current_price,
                 'quantity': quantity,
                 'total_amount': int(current_price * quantity),
-                'pattern_type': str(candidate.detected_patterns[0].pattern_type) if candidate.detected_patterns else 'unknown',
+                'pattern_type': str(candidate.detected_patterns[0].pattern_type.value) if candidate.detected_patterns else 'unknown',
+                'pattern_confidence': candidate.detected_patterns[0].confidence if candidate.detected_patterns else 0.0,
+                'pattern_strength': candidate.detected_patterns[0].strength if candidate.detected_patterns else 0,
                 'signal_strength': candidate.signal_strength,
                 'entry_priority': candidate.entry_priority,
-                'pre_validated': True  # 캔들 시스템에서 이미 검증 완료
+                'pre_validated': True,  # 캔들 시스템에서 이미 검증 완료
+                # 🆕 기술적 지표 정보 추가 (진입 조건 체크에서 계산된 값들)
+                'rsi_value': getattr(candidate, '_rsi_value', None),
+                'macd_value': getattr(candidate, '_macd_value', None),
+                'volume_ratio': getattr(candidate, '_volume_ratio', None),
+                'investment_amount': int(current_price * quantity),
+                'investment_ratio': investment_amount / max(available_funds, 1) if available_funds > 0 else 0.0
             }
 
             # 실제 매수 주문 실행 (TradeExecutor 사용)
@@ -629,6 +637,10 @@ class BuyOpportunityEvaluator:
                         rsi_values = TechnicalIndicators.calculate_rsi(close_prices)
                         current_rsi = rsi_values[-1] if rsi_values else 50.0
                         conditions.technical_indicators['rsi'] = current_rsi
+                        
+                        # 🆕 candidate에 기술적 지표 값 저장
+                        candidate._rsi_value = current_rsi
+                        candidate._volume_ratio = volume_ratio
 
                         # RSI 과매수 구간 (65 이상) 체크
                         conditions.rsi_check = current_rsi < 65  # 65 미만일 때 진입 허용
@@ -646,6 +658,9 @@ class BuyOpportunityEvaluator:
                                 conditions.technical_indicators['macd'] = float(current_macd)
                                 conditions.technical_indicators['macd_signal'] = float(current_signal)
                                 conditions.technical_indicators['macd_histogram'] = float(current_histogram)
+                                
+                                # 🆕 candidate에 MACD 값 저장
+                                candidate._macd_value = float(current_histogram)
 
                                 # MACD가 상승 전환 중이면 가점 (RSI 과매수여도 진입 고려)
                                 if float(current_macd) > float(current_signal) and float(current_histogram) > 0.0:
@@ -655,6 +670,7 @@ class BuyOpportunityEvaluator:
                                         logger.debug(f"📊 {candidate.stock_code} MACD 상승전환으로 RSI 조건 완화")
                         except Exception as e:
                             logger.debug(f"📊 {candidate.stock_code} MACD 계산 오류: {e}")
+                            candidate._macd_value = None
 
                         # 🔥 3. 볼린저 밴드 계산 (추가 확인)
                         try:

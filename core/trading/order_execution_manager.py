@@ -26,6 +26,20 @@ class PendingOrder:
     timestamp: datetime
     timeout_seconds: int = 300  # 5분 타임아웃
     account_no: str = ""        # 계좌번호 (체결통보 검증용)
+    
+    # 🆕 패턴 정보 추가
+    pattern_type: str = ""      # 사용된 패턴 (HAMMER/BULLISH_ENGULFING/BEARISH_ENGULFING)
+    pattern_confidence: float = 0.0  # 패턴 신뢰도 (0.0-1.0)
+    pattern_strength: int = 0   # 패턴 강도 (0-100)
+    
+    # 🆕 기술적 지표 정보 추가
+    rsi_value: float = None     # RSI 값
+    macd_value: float = None    # MACD 값
+    volume_ratio: float = None  # 거래량 비율
+    
+    # 🆕 투자 정보 추가
+    investment_amount: int = 0  # 실제 투자금액
+    investment_ratio: float = None  # 포트폴리오 대비 투자 비율
 
     def is_expired(self) -> bool:
         """주문 타임아웃 여부"""
@@ -66,8 +80,12 @@ class OrderExecutionManager:
         logger.info("✅ 주문 실행 관리자 초기화 완료 (KIS API 직접 사용)")
 
     def add_pending_order(self, order_id: str, stock_code: str, order_type: str,
-                         quantity: int, price: int, strategy_type: str) -> bool:
-        """대기 중인 주문 추가"""
+                         quantity: int, price: int, strategy_type: str,
+                         pattern_type: str = "", pattern_confidence: float = 0.0,
+                         pattern_strength: int = 0, rsi_value: float = None,
+                         macd_value: float = None, volume_ratio: float = None,
+                         investment_amount: int = 0, investment_ratio: float = None) -> bool:
+        """대기 중인 주문 추가 - 패턴 정보 포함"""
         try:
             if not order_id:
                 logger.error("❌ 주문ID가 없습니다")
@@ -80,13 +98,22 @@ class OrderExecutionManager:
                 quantity=quantity,
                 price=price,
                 strategy_type=strategy_type,
-                timestamp=datetime.now()
+                timestamp=datetime.now(),
+                pattern_type=pattern_type,
+                pattern_confidence=pattern_confidence,
+                pattern_strength=pattern_strength,
+                rsi_value=rsi_value,
+                macd_value=macd_value,
+                volume_ratio=volume_ratio,
+                investment_amount=investment_amount,
+                investment_ratio=investment_ratio
             )
 
             self.pending_orders[order_id] = pending_order
             self.stats['orders_sent'] += 1
 
-            logger.info(f"📝 대기 주문 등록: {order_type} {stock_code} {quantity:,}주 @{price:,}원 (ID: {order_id})")
+            logger.info(f"📝 대기 주문 등록: {order_type} {stock_code} {quantity:,}주 @{price:,}원 "
+                       f"패턴:{pattern_type} 신뢰도:{pattern_confidence:.2f} (ID: {order_id})")
             return True
 
         except Exception as e:
@@ -505,7 +532,7 @@ class OrderExecutionManager:
             return False
 
     async def _process_buy_execution(self, pending_order: PendingOrder, execution_info: Dict) -> bool:
-        """매수 체결 처리"""
+        """매수 체결 처리 - 패턴 정보 포함"""
         try:
             executed_quantity = execution_info['executed_quantity']
             executed_price = execution_info['executed_price']
@@ -513,7 +540,7 @@ class OrderExecutionManager:
             # 1. 포지션 관리는 KIS API로 처리
             logger.debug(f"💡 KIS API로 포지션 관리: {pending_order.stock_code}")
 
-            # 2. 거래 기록 저장
+            # 2. 거래 기록 저장 - 패턴 정보 포함
             trade_id = self.trade_db.record_buy_trade(
                 stock_code=pending_order.stock_code,
                 stock_name=pending_order.stock_code,  # 실제로는 종목명 조회
@@ -523,6 +550,18 @@ class OrderExecutionManager:
                 strategy_type=pending_order.strategy_type,
                 order_id=pending_order.order_id,
                 status='FILLED',
+                # 🆕 패턴 정보 추가
+                pattern_type=pending_order.pattern_type,
+                pattern_confidence=pending_order.pattern_confidence,
+                pattern_strength=pending_order.pattern_strength,
+                # 🆕 기술적 지표 정보 추가
+                rsi_value=pending_order.rsi_value,
+                macd_value=pending_order.macd_value,
+                volume_ratio=pending_order.volume_ratio,
+                # 🆕 투자 정보 추가
+                investment_amount=pending_order.investment_amount or (executed_quantity * executed_price),
+                investment_ratio=pending_order.investment_ratio,
+                # 기존 정보
                 market_conditions={
                     'execution_time': execution_info.get('execution_time', ''),
                     'original_order_price': pending_order.price,
@@ -541,11 +580,14 @@ class OrderExecutionManager:
                 signal_data={
                     'execution_method': 'websocket_notice',
                     'order_id': pending_order.order_id,
-                    'execution_info': execution_info
+                    'execution_info': execution_info,
+                    'pattern_type': pending_order.pattern_type,
+                    'pattern_confidence': pending_order.pattern_confidence
                 }
             )
 
-            logger.info(f"✅ 매수 체결 완료: {pending_order.stock_code} {executed_quantity:,}주 @{executed_price:,}원 (거래ID: {trade_id})")
+            logger.info(f"✅ 매수 체결 완료: {pending_order.stock_code} {executed_quantity:,}주 @{executed_price:,}원 "
+                       f"패턴:{pending_order.pattern_type} (거래ID: {trade_id})")
             return True
 
         except Exception as e:
@@ -553,7 +595,7 @@ class OrderExecutionManager:
             return False
 
     async def _process_sell_execution(self, pending_order: PendingOrder, execution_info: Dict) -> bool:
-        """매도 체결 처리"""
+        """매도 체결 처리 - 패턴 정보 포함"""
         try:
             executed_quantity = execution_info['executed_quantity']
             executed_price = execution_info['executed_price']
@@ -561,7 +603,7 @@ class OrderExecutionManager:
             # 1. 포지션 관리는 KIS API로 처리
             logger.debug(f"💡 KIS API로 포지션 관리: {pending_order.stock_code}")
 
-            # 2. 거래 기록 저장
+            # 2. 거래 기록 저장 - 패턴 정보 포함
             buy_trade_id = self.trade_db.find_buy_trade_for_sell(
                 pending_order.stock_code,
                 executed_quantity
@@ -577,6 +619,15 @@ class OrderExecutionManager:
                 buy_trade_id=buy_trade_id,
                 order_id=pending_order.order_id,
                 status='FILLED',
+                # 🆕 패턴 정보 추가 (매도 시에는 매도 사유 패턴)
+                pattern_type=pending_order.pattern_type,
+                pattern_confidence=pending_order.pattern_confidence,
+                pattern_strength=pending_order.pattern_strength,
+                # 🆕 기술적 지표 정보 추가
+                rsi_value=pending_order.rsi_value,
+                macd_value=pending_order.macd_value,
+                volume_ratio=pending_order.volume_ratio,
+                # 기존 정보
                 market_conditions={
                     'execution_time': execution_info.get('execution_time', ''),
                     'original_order_price': pending_order.price,
@@ -585,7 +636,8 @@ class OrderExecutionManager:
                 notes=f"웹소켓 체결통보 기반 매도 완료"
             )
 
-            logger.info(f"✅ 매도 체결 완료: {pending_order.stock_code} {executed_quantity:,}주 @{executed_price:,}원 (거래ID: {trade_id})")
+            logger.info(f"✅ 매도 체결 완료: {pending_order.stock_code} {executed_quantity:,}주 @{executed_price:,}원 "
+                       f"패턴:{pending_order.pattern_type} (거래ID: {trade_id})")
             return True
 
         except Exception as e:

@@ -49,6 +49,7 @@ class KISRestAPIManager:
 
         logger.info("✅ KIS API 인증 성공!")
 
+        self.trading_manager = None  # 🆕 TradingManager 참조 추가
 
     # === 인증 관련 ===
 
@@ -81,10 +82,13 @@ class KISRestAPIManager:
         result = order_api.get_order_cash("buy", stock_code, quantity, price)
 
         if result is not None and not result.empty:
+            order_data = result.iloc[0]
             return {
                 "status": "success",
-                "order_no": result.iloc[0].get('odno', ''),
-                "message": "매수 주문 완료"
+                "order_no": order_data.get('odno', ''),
+                "krx_fwdg_ord_orgno": order_data.get('krx_fwdg_ord_orgno', ''),
+                "message": "매수 주문 완료",
+                "order_data": order_data.to_dict()
             }
         else:
             return {
@@ -100,10 +104,13 @@ class KISRestAPIManager:
         result = order_api.get_order_cash("sell", stock_code, quantity, price)
 
         if result is not None and not result.empty:
+            order_data = result.iloc[0]
             return {
                 "status": "success",
-                "order_no": result.iloc[0].get('odno', ''),
-                "message": "매도 주문 완료"
+                "order_no": order_data.get('odno', ''),
+                "krx_fwdg_ord_orgno": order_data.get('krx_fwdg_ord_orgno', ''),
+                "message": "매도 주문 완료",
+                "order_data": order_data.to_dict()
             }
         else:
             return {
@@ -441,3 +448,7 @@ class KISRestAPIManager:
         except Exception as e:
             logger.debug(f"갭 정보 계산 오류: {e}")
             return None
+
+    def set_trading_manager(self, trading_manager):
+        """🆕 TradingManager 참조 설정"""
+        self.trading_manager = trading_manager

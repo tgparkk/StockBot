@@ -197,6 +197,20 @@ class TradeDatabase:
                             status TEXT NOT NULL,               -- SUCCESS/FAILED
                             error_message TEXT,                 -- 오류 메시지
 
+                            -- 🆕 캔들 패턴 상세 정보
+                            pattern_type TEXT,                  -- 사용된 패턴 (HAMMER/BULLISH_ENGULFING/BEARISH_ENGULFING)
+                            pattern_confidence REAL,           -- 패턴 신뢰도 (0.0-1.0)
+                            pattern_strength INTEGER,          -- 패턴 강도 (0-100)
+                            
+                            -- 🆕 기술적 지표 정보
+                            rsi_value REAL,                     -- RSI 값
+                            macd_value REAL,                    -- MACD 값
+                            volume_ratio REAL,                  -- 거래량 비율
+                            
+                            -- 🆕 투자 정보
+                            investment_amount INTEGER,          -- 실제 투자금액
+                            investment_ratio REAL,              -- 포트폴리오 대비 투자 비율
+
                             -- 매도시 수익 정보
                             buy_price INTEGER,                  -- 매수가
                             profit_loss INTEGER,                -- 손익
@@ -512,32 +526,47 @@ class TradeDatabase:
                         price: int, total_amount: int, strategy_type: str,
                         order_id: str = "", status: str = "SUCCESS",
                         error_message: str = "", **kwargs) -> int:
-        """매수 거래 기록"""
+        """매수 거래 기록 - 패턴 정보 포함"""
         def _record_buy():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
-                # 시장 상황 및 기술적 지표 JSON 직렬화
-                market_conditions = json.dumps(kwargs.get('market_conditions', {}))
-                technical_indicators = json.dumps(kwargs.get('technical_indicators', {}))
+                # 🆕 패턴 정보 추출
+                pattern_type = kwargs.get('pattern_type', '')
+                pattern_confidence = kwargs.get('pattern_confidence', 0.0)
+                pattern_strength = kwargs.get('pattern_strength', 0)
+                
+                # 🆕 기술적 지표 정보 추출
+                rsi_value = kwargs.get('rsi_value', None)
+                macd_value = kwargs.get('macd_value', None)
+                volume_ratio = kwargs.get('volume_ratio', None)
+                
+                # 🆕 투자 정보 추출
+                investment_amount = kwargs.get('investment_amount', total_amount)
+                investment_ratio = kwargs.get('investment_ratio', None)
 
                 cursor.execute("""
                     INSERT INTO trades (
                         trade_type, stock_code, stock_name, quantity, price,
                         total_amount, strategy_type, timestamp, order_id,
-                        status, error_message, market_conditions,
-                        technical_indicators, notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, error_message,
+                        pattern_type, pattern_confidence, pattern_strength,
+                        rsi_value, macd_value, volume_ratio,
+                        investment_amount, investment_ratio
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     'BUY', stock_code, stock_name, quantity, price,
                     total_amount, strategy_type, datetime.now(), order_id,
-                    status, error_message, market_conditions,
-                    technical_indicators, kwargs.get('notes', '')
+                    status, error_message,
+                    pattern_type, pattern_confidence, pattern_strength,
+                    rsi_value, macd_value, volume_ratio,
+                    investment_amount, investment_ratio
                 ))
 
                 trade_id = cursor.lastrowid
 
-                logger.info(f"💾 매수 기록 저장: {stock_code} {quantity}주 @{price:,}원 (ID: {trade_id})")
+                logger.info(f"💾 매수 기록 저장: {stock_code} {quantity}주 @{price:,}원 "
+                          f"패턴:{pattern_type} 신뢰도:{pattern_confidence:.2f} (ID: {trade_id})")
 
                 # 일별 요약 업데이트
                 self._update_daily_summary()
@@ -555,7 +584,7 @@ class TradeDatabase:
                          buy_trade_id: int = None, order_id: str = "",
                          status: str = "SUCCESS", error_message: str = "",
                          **kwargs) -> int:
-        """매도 거래 기록"""
+        """매도 거래 기록 - 패턴 정보 포함"""
         def _record_sell():
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -580,30 +609,38 @@ class TradeDatabase:
                 profit_loss = (price - buy_price) * quantity if buy_price > 0 else 0
                 profit_rate = ((price - buy_price) / buy_price * 100) if buy_price > 0 else 0
 
-                # 시장 상황 및 기술적 지표 JSON 직렬화
-                market_conditions = json.dumps(kwargs.get('market_conditions', {}))
-                technical_indicators = json.dumps(kwargs.get('technical_indicators', {}))
+                # 🆕 패턴 정보 추출 (매도 시에는 매도 사유 패턴)
+                pattern_type = kwargs.get('pattern_type', '')
+                pattern_confidence = kwargs.get('pattern_confidence', 0.0)
+                pattern_strength = kwargs.get('pattern_strength', 0)
+                
+                # 🆕 기술적 지표 정보 추출
+                rsi_value = kwargs.get('rsi_value', None)
+                macd_value = kwargs.get('macd_value', None)
+                volume_ratio = kwargs.get('volume_ratio', None)
 
                 cursor.execute("""
                     INSERT INTO trades (
                         trade_type, stock_code, stock_name, quantity, price,
                         total_amount, strategy_type, timestamp, order_id,
-                        status, error_message, buy_trade_id, profit_loss,
-                        profit_rate, holding_duration, market_conditions,
-                        technical_indicators, notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, error_message, buy_price, profit_loss,
+                        profit_rate, hold_days,
+                        pattern_type, pattern_confidence, pattern_strength,
+                        rsi_value, macd_value, volume_ratio
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     'SELL', stock_code, stock_name, quantity, price,
                     total_amount, strategy_type, datetime.now(), order_id,
-                    status, error_message, buy_trade_id, profit_loss,
-                    profit_rate, holding_duration, market_conditions,
-                    technical_indicators, kwargs.get('notes', '')
+                    status, error_message, buy_price, profit_loss,
+                    profit_rate, holding_duration,
+                    pattern_type, pattern_confidence, pattern_strength,
+                    rsi_value, macd_value, volume_ratio
                 ))
 
                 trade_id = cursor.lastrowid
 
                 logger.info(f"💾 매도 기록 저장: {stock_code} {quantity}주 @{price:,}원 "
-                          f"(손익: {profit_loss:,}원, {profit_rate:.2f}%, ID: {trade_id})")
+                          f"(손익: {profit_loss:,}원, {profit_rate:.2f}%, 패턴:{pattern_type}, ID: {trade_id})")
 
                 # 일별 요약 업데이트
                 self._update_daily_summary()

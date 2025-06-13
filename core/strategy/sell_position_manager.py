@@ -83,15 +83,31 @@ class SellPositionManager:
         """기존 포지션 관리 (손절/익절/추적손절) - _all_stocks 통합 버전"""
         try:
             # 🆕 _all_stocks에서 ENTERED 상태인 모든 종목 관리 (기존 보유 + 새로 매수)
-            entered_positions = [
-                stock for stock in self.manager.stock_manager._all_stocks.values()
-                if stock.status == CandleStatus.ENTERED
-            ]
+            # 🔧 더 강화된 필터링: 실제로 관리가 필요한 종목만 선별
+            entered_positions = []
+            for stock in self.manager.stock_manager._all_stocks.values():
+                # 기본 상태 체크
+                if stock.status != CandleStatus.ENTERED:
+                    continue
+                
+                # 매도 체결 확인 완료된 종목 제외
+                if stock.metadata.get('final_exit_confirmed', False):
+                    continue
+                
+                # 자동 종료된 종목 제외
+                if stock.metadata.get('auto_exit_reason'):
+                    continue
+                
+                # PENDING_ORDER 상태로 변경된 종목 제외 (매도 주문 대기 중)
+                if stock.status == CandleStatus.PENDING_ORDER:
+                    continue
+                
+                entered_positions.append(stock)
 
             if not entered_positions:
                 return
 
-            logger.debug(f"📊 포지션 관리: {len(entered_positions)}개 포지션 (_all_stocks 통합)")
+            logger.debug(f"📊 포지션 관리: {len(entered_positions)}개 포지션 (_all_stocks 통합, 필터링 강화)")
 
             for position in entered_positions:
                 try:
@@ -114,6 +130,19 @@ class SellPositionManager:
             if position.metadata.get('final_exit_confirmed', False):
                 logger.debug(f"⏭️ {position.stock_code} 매도 체결 확인 완료 - 포지션 관리 생략")
                 return
+
+            # 🆕 자동 종료된 종목 스킵 (실제 보유 없음으로 인한 자동 종료)
+            if position.metadata.get('auto_exit_reason'):
+                logger.debug(f"⏭️ {position.stock_code} 자동 종료됨 ({position.metadata['auto_exit_reason']}) - 포지션 관리 생략")
+                return
+
+            # 🆕 실제 보유 여부 사전 체크 (매번 API 호출하지 않고 캐시 활용)
+            if hasattr(position, '_last_holding_check'):
+                last_check_time = position._last_holding_check.get('time', datetime.min)
+                if (datetime.now() - last_check_time).total_seconds() < 60:  # 1분 이내 체크했으면 스킵
+                    if not position._last_holding_check.get('has_holding', True):
+                        logger.debug(f"⏭️ {position.stock_code} 최근 보유 확인 실패 - 포지션 관리 생략")
+                        return
 
             # 📊 매도 조건 체크
             should_exit = False
@@ -328,11 +357,23 @@ class SellPositionManager:
 
                     if not actual_holding:
                         logger.warning(f"⚠️ {position.stock_code} 실제 보유하지 않는 종목 - 매도 취소")
+                        # 🆕 실제 보유하지 않는 종목은 EXITED 상태로 변경하여 더 이상 관리하지 않음
+                        position.status = CandleStatus.EXITED
+                        position.metadata['auto_exit_reason'] = '실제_보유_없음'
+                        position.metadata['final_exit_confirmed'] = True
+                        self.manager.stock_manager.update_candidate(position)
+                        logger.info(f"✅ {position.stock_code} 상태 변경: ENTERED → EXITED (실제 보유 없음)")
                         return False
 
                     actual_quantity = actual_holding.get('quantity', 0)
                     if actual_quantity <= 0:
                         logger.warning(f"⚠️ {position.stock_code} 실제 보유 수량 없음 ({actual_quantity}주) - 매도 취소")
+                        # 🆕 실제 보유 수량이 없는 종목도 EXITED 상태로 변경
+                        position.status = CandleStatus.EXITED
+                        position.metadata['auto_exit_reason'] = '실제_보유수량_없음'
+                        position.metadata['final_exit_confirmed'] = True
+                        self.manager.stock_manager.update_candidate(position)
+                        logger.info(f"✅ {position.stock_code} 상태 변경: ENTERED → EXITED (실제 보유 수량 없음)")
                         return False
 
                     # 매도할 수량을 실제 보유 수량으로 조정
@@ -1209,5 +1250,46 @@ class SellPositionManager:
 
         except Exception as e:
             logger.error(f"패턴 정보 저장 오류: {e}")
+
+    async def cleanup_completed_positions(self):
+        """🧹 이미 매도 완료된 종목들을 정리"""
+        try:
+            cleanup_count = 0
+            all_stocks = list(self.manager.stock_manager._all_stocks.values())
+            
+            for position in all_stocks:
+                # ENTERED 상태이지만 실제로는 보유하지 않는 종목들 정리
+                if (position.status == CandleStatus.ENTERED and 
+                    not position.metadata.get('final_exit_confirmed', False) and
+                    not position.metadata.get('auto_exit_reason')):
+                    
+                    # 실제 보유 여부 확인
+                    try:
+                        account_info = await self.manager.kis_api_manager.get_account_balance()
+                        if account_info and 'stocks' in account_info:
+                            actual_holding = None
+                            for stock in account_info['stocks']:
+                                if stock.get('stock_code') == position.stock_code:
+                                    actual_holding = stock
+                                    break
+                            
+                            # 실제 보유하지 않는 종목 정리
+                            if not actual_holding or actual_holding.get('quantity', 0) <= 0:
+                                position.status = CandleStatus.EXITED
+                                position.metadata['auto_exit_reason'] = '정리작업_실제보유없음'
+                                position.metadata['final_exit_confirmed'] = True
+                                self.manager.stock_manager.update_candidate(position)
+                                cleanup_count += 1
+                                logger.info(f"🧹 {position.stock_code} 정리 완료: ENTERED → EXITED (실제 보유 없음)")
+                    
+                    except Exception as e:
+                        logger.debug(f"보유 확인 오류 ({position.stock_code}): {e}")
+                        continue
+            
+            if cleanup_count > 0:
+                logger.info(f"🧹 포지션 정리 완료: {cleanup_count}개 종목")
+                
+        except Exception as e:
+            logger.error(f"포지션 정리 오류: {e}")
 
 
