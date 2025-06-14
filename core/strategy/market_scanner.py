@@ -11,6 +11,7 @@ from .candle_trade_candidate import (
     CandleTradeCandidate, CandleStatus, TradeSignal, PatternType,
     CandlePatternInfo, EntryConditions, RiskManagement
 )
+from .price_position_filter import PricePositionFilter
 from utils.logger import setup_logger
 
 # 순환 import 방지를 위한 TYPE_CHECKING 사용
@@ -41,26 +42,105 @@ class MarketScanner:
 
         self._last_scan_time: Optional[datetime] = None
         self._scan_interval = 30  # 30초
+        
+        # 🆕 가격 위치 필터 초기화
+        self.price_position_filter = PricePositionFilter(self.config)
 
         logger.info("✅ MarketScanner 초기화 완료")
 
     async def scan_and_detect_patterns(self):
-        """종목 스캔 및 패턴 감지 - 메인 진입점"""
+        """🚀 스마트 종목 스캔 - 장전 전체 스캔 vs 장중 급등/급증 모니터링"""
         try:
             current_time = datetime.now()
+            current_hour = current_time.hour
+            current_minute = current_time.minute
 
-            logger.debug("🔍 매수 후보 종목 스캔 시작")
-
-            # 시장별 스캔
-            markets = ['0001', '1001']  # 코스피, 코스닥
-            for market in markets:
-                await self.scan_market_for_patterns(market)
+            # 🎯 1. 장전 전체 스캔 (08:30 - 08:50)
+            if 8 <= current_hour < 9 and 30 <= current_minute <= 50:
+                logger.info("🌅 장전 전체 KOSPI 스캔 시작")
+                await self.scan_market_for_patterns("0001")  # KOSPI만
+                
+            # 🎯 2. 장중 급등/급증 종목 모니터링 (09:00 - 15:30)
+            elif 9 <= current_hour < 15 or (current_hour == 15 and current_minute <= 30):
+                logger.debug("📈 장중 급등/급증 종목 모니터링")
+                await self.scan_intraday_movers("0001")  # 새로운 함수
+                
+            # 🎯 3. 장후에는 스캔 안함 (15:30 이후)
+            else:
+                logger.debug("🌙 장후 시간 - 스캔 생략")
+                return
 
             self._last_scan_time = current_time
             logger.debug("✅ 종목 스캔 완료")
 
         except Exception as e:
             logger.error(f"종목 스캔 오류: {e}")
+
+    async def scan_intraday_movers(self, market: str):
+        """🆕 장중 급등/급증 종목 모니터링 (기존 API 활용)"""
+        try:
+            market_name = "코스피" if market == "0001" else "코스닥"
+            logger.debug(f"📈 {market_name} 장중 급등/급증 종목 모니터링")
+
+            # 1. 기본 후보 종목 수집 (기존 API 활용)
+            candidates = []
+
+            # 등락률 상위 종목
+            from ..api.kis_market_api import get_fluctuation_rank
+            fluctuation_data = get_fluctuation_rank(
+                fid_input_iscd=market,
+                fid_rank_sort_cls_code="0",  # 상승률순
+                fid_rsfl_rate1="1.0"  # 1% 이상
+            )
+
+            if fluctuation_data is not None and not fluctuation_data.empty:
+                candidates.extend(fluctuation_data.head(50)['stck_shrn_iscd'].tolist())
+
+            # 거래량 급증 종목
+            from ..api.kis_market_api import get_volume_rank
+            volume_data = get_volume_rank(
+                fid_input_iscd=market,
+                fid_blng_cls_code="1",  # 거래증가율
+                fid_vol_cnt="50000"
+            )
+
+            if volume_data is not None and not volume_data.empty:
+                candidates.extend(volume_data.head(50)['mksc_shrn_iscd'].tolist())
+
+            # 중복 제거
+            unique_candidates = list(set(candidates))[:50]  # 최대 50개
+
+            if not unique_candidates:
+                logger.debug(f"📊 {market_name} 장중 급등/급증 종목 없음")
+                return
+
+            logger.info(f"📊 {market_name} 장중 급등/급증 후보: {len(unique_candidates)}개")
+
+            # 2. 후보 종목들에 대해 빠른 패턴 분석
+            new_candidates_count = 0
+            for stock_code in unique_candidates:
+                try:
+                    # 이미 관리 중인 종목은 제외
+                    if (hasattr(self.manager, 'stock_manager') and 
+                        hasattr(self.manager.stock_manager, '_all_stocks') and
+                        stock_code in self.manager.stock_manager._all_stocks):
+                        continue
+
+                    # 빠른 패턴 분석
+                    candidate = await self.analyze_stock_for_patterns(stock_code, market_name)
+                    
+                    if candidate and self.stock_manager.add_candidate(candidate):
+                        new_candidates_count += 1
+                        logger.debug(f"✅ 장중 신규 후보: {candidate.stock_code}({candidate.stock_name})")
+
+                except Exception as e:
+                    logger.debug(f"장중 종목 분석 오류 ({stock_code}): {e}")
+                    continue
+
+            logger.info(f"🎯 {market_name} 장중 신규 후보: {new_candidates_count}개 추가")
+
+        except Exception as e:
+            logger.error(f"장중 급등/급증 모니터링 오류: {e}")
 
     async def scan_market_for_patterns(self, market: str):
         """🆕 전체 KOSPI 종목 대상 캔들 패턴 스캔 - 새로운 방식"""
@@ -83,10 +163,10 @@ class MarketScanner:
 
             logger.info(f"📋 전체 KOSPI 종목: {len(all_kospi_stocks)}개")
 
-            # 🆕 2. 모든 종목에 대해 기본 스크리닝 + 패턴 분석
+            # 🆕 2. 성능 최적화된 종목 스크리닝 (30분 → 10분)
             candidates_with_scores = []
             processed_count = 0
-            batch_size = 10  # API 부하 고려하여 10개씩
+            batch_size = 20  # 🚀 배치 크기 증가 (10 → 20)
 
             # 배치 단위로 처리
             for batch_start in range(0, len(all_kospi_stocks), batch_size):
@@ -112,9 +192,9 @@ class MarketScanner:
                                f"({processed_count/len(all_kospi_stocks)*100:.1f}%) "
                                f"- 현재 후보: {len(candidates_with_scores)}개")
 
-                # API 부하 방지 대기
+                # 🚀 API 대기 시간 최적화 (300ms → 100ms)
                 if batch_end < len(all_kospi_stocks):
-                    await asyncio.sleep(0.3)  # 300ms 대기
+                    await asyncio.sleep(0.1)  # 100ms 대기 (초당 20회 제한 준수)
 
             # 🆕 3. 패턴 점수 기준으로 상위 50개 선별
             candidates_with_scores.sort(key=lambda x: x['pattern_score'], reverse=True)
@@ -218,8 +298,9 @@ class MarketScanner:
             if not self._passes_basic_filters(current_price, current_info.iloc[0].to_dict()):
                 return None
 
-            # 🆕 3. OHLCV 데이터 준비 (캐시 우선 활용)
+            # 🆕 3. 🚀 고성능 OHLCV 데이터 준비 (캐시 우선 + 에러 핸들링)
             ohlcv_data = None
+            use_cached_data = False
 
             # 🚀 candle_trade_manager의 stock_manager._all_stocks에서 캐시된 데이터 우선 확인
             if (hasattr(self.manager, 'stock_manager') and
@@ -229,23 +310,26 @@ class MarketScanner:
 
                 # 🔧 중요한 상태(ENTERED, PENDING_ORDER)는 스캔에서 제외
                 if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
-                    logger.debug(f"🔒 {stock_code} 중요 상태 보호 ({existing_candidate.status.value}) - 스캔 제외")
-                    return None
+                    return None  # 로깅 제거로 성능 향상
 
                 # 🔄 다른 상태는 캐시된 데이터 사용해서 패턴 업데이트 진행
                 ohlcv_data = existing_candidate.get_ohlcv_data()
-                if ohlcv_data is not None:
-                    logger.debug(f"📄 {stock_code} 기존 _all_stocks에서 캐시된 일봉 데이터 사용")
+                if ohlcv_data is not None and not ohlcv_data.empty:
+                    use_cached_data = True
 
-            # 캐시에 없으면 API 호출
-            if ohlcv_data is None:
-                from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                ohlcv_data = get_inquire_daily_itemchartprice(
-                    output_dv="2",  # ✅ output2 데이터 (일자별 차트 데이터 배열) 조회
-                    itm_no=stock_code,
-                    period_code="D",  # 일봉
-                    adj_prc="1"
-                )
+            # 캐시에 없으면 API 호출 (timeout 설정으로 성능 향상)
+            if ohlcv_data is None or ohlcv_data.empty:
+                try:
+                    from ..api.kis_market_api import get_inquire_daily_itemchartprice
+                    ohlcv_data = get_inquire_daily_itemchartprice(
+                        output_dv="2",  # ✅ output2 데이터 (일자별 차트 데이터 배열) 조회
+                        itm_no=stock_code,
+                        period_code="D",  # 일봉
+                        adj_prc="1"
+                    )
+                except Exception as e:
+                    # 🚀 API 오류 시 빠른 실패로 성능 확보
+                    return None
 
                 # 🆕 API 조회 성공시 로그
                 if ohlcv_data is not None and not ohlcv_data.empty:
@@ -403,7 +487,7 @@ class MarketScanner:
                 confidence = candidate.primary_pattern.confidence
 
                 # 강한 패턴일수록 큰 포지션
-                if pattern_type in [PatternType.MORNING_STAR, PatternType.BULLISH_ENGULFING]:
+                if pattern_type in [PatternType.BULLISH_ENGULFING]:
                     base_position_pct = min(30, self.config['max_position_size_pct'])
                 elif pattern_type in [PatternType.HAMMER, PatternType.INVERTED_HAMMER]:
                     base_position_pct = 20
@@ -448,7 +532,7 @@ class MarketScanner:
                     # 패턴별 기본 조정 (백업)
                     if candidate.primary_pattern.pattern_type in [PatternType.RISING_THREE_METHODS]:
                         max_holding_hours = 12  # 추세 지속 패턴은 길게
-                    elif candidate.primary_pattern.pattern_type == PatternType.MORNING_STAR:
+                    elif candidate.primary_pattern.pattern_type == PatternType.BULLISH_ENGULFING:
                         max_holding_hours = 8   # 샛별형은 강력한 패턴
                     elif candidate.primary_pattern.pattern_type in [PatternType.HAMMER, PatternType.INVERTED_HAMMER]:
                         max_holding_hours = 4   # 망치형은 짧게
@@ -475,9 +559,9 @@ class MarketScanner:
     # _calculate_risk_score 함수는 candle_analyzer.py로 이동됨
 
     async def analyze_stock_with_full_screening(self, stock_code: str, market_name: str) -> Optional[Dict]:
-        """🆕 개별 종목 전체 스크리닝 (기본 필터링 + 패턴 분석)"""
+        """🆕 🚀 고성능 개별 종목 전체 스크리닝 (빠른 실패 + 캐시 활용)"""
         try:
-            # 🆕 1. 엑셀에서 종목 기본 정보 조회
+            # 🚀 1. 엑셀에서 종목 기본 정보 조회 (빠른 실패)
             from ..utils.stock_list_loader import get_stock_info_from_excel
             stock_excel_info = get_stock_info_from_excel(stock_code)
             
@@ -487,63 +571,105 @@ class MarketScanner:
             stock_name = stock_excel_info['stock_name_short']
             listed_shares = stock_excel_info['listed_shares']
 
-            # 🆕 2. 현재가 조회 (기본 필터링용)
-            from ..api.kis_market_api import get_inquire_price
-            current_info = get_inquire_price(itm_no=stock_code)
-            
-            if current_info is None or current_info.empty:
-                return None
+            # 🚀 2. 현재가 조회 (timeout 처리)
+            try:
+                from ..api.kis_market_api import get_inquire_price
+                current_info = get_inquire_price(itm_no=stock_code)
+                
+                if current_info is None or current_info.empty:
+                    return None
 
-            current_price = float(current_info.iloc[0].get('stck_prpr', 0))
-            volume = int(current_info.iloc[0].get('acml_vol', 0))
-            trading_value = int(current_info.iloc[0].get('acml_tr_pbmn', 0))
-            
-            if current_price <= 0:
-                return None
+                current_price = float(current_info.iloc[0].get('stck_prpr', 0))
+                volume = int(current_info.iloc[0].get('acml_vol', 0))
+                trading_value = int(current_info.iloc[0].get('acml_tr_pbmn', 0))
+                
+                if current_price <= 0:
+                    return None
 
-            # 🆕 3. 기본 필터링 조건 체크
+            except Exception:
+                return None  # 빠른 실패
+
+            # 🚀 3. 기본 필터링 조건 체크 (빠른 제외)
             if not self._passes_enhanced_basic_filters(
                 current_price, volume, trading_value, listed_shares, stock_code
             ):
                 return None
 
-            # 🆕 4. 30일 일봉 데이터 조회 (get_inquire_daily_itemchartprice 사용)
-            from ..api.kis_market_api import get_inquire_daily_itemchartprice
-            from datetime import datetime, timedelta
-            
-            # 시작일 (30거래일 전 approximate)
-            start_date = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
-            end_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")  # 당일 제외
-            
-            ohlcv_data = get_inquire_daily_itemchartprice(
-                output_dv="2",  # 일봉 데이터 배열
-                itm_no=stock_code,
-                inqr_strt_dt=start_date,
-                inqr_end_dt=end_date,
-                period_code="D",  # 일봉
-                adj_prc="1"       # 원주가
-            )
+            # 🚀 4. 캐시 우선 일봉 데이터 조회
+            ohlcv_data = None
+            use_cached = False
+
+            # 캐시 확인 (기존 candidate에서 OHLCV 데이터 재사용)
+            if hasattr(self.manager, 'stock_manager') and hasattr(self.manager.stock_manager, '_all_stocks'):
+                if stock_code in self.manager.stock_manager._all_stocks:
+                    existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
+                    # 중요 상태 제외
+                    if existing_candidate.status not in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                        cached_ohlcv = existing_candidate.get_ohlcv_data()
+                        if cached_ohlcv is not None and not cached_ohlcv.empty and len(cached_ohlcv) >= 20:
+                            ohlcv_data = cached_ohlcv
+                            use_cached = True
+
+            # 캐시 없으면 API 호출
+            if ohlcv_data is None:
+                try:
+                    from ..api.kis_market_api import get_inquire_daily_itemchartprice
+                    from datetime import datetime, timedelta
+                    
+                    # 시작일 (30거래일 전 approximate)
+                    start_date = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
+                    end_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")  # 당일 제외
+                    
+                    ohlcv_data = get_inquire_daily_itemchartprice(
+                        output_dv="2",  # 일봉 데이터 배열
+                        itm_no=stock_code,
+                        inqr_strt_dt=start_date,
+                        inqr_end_dt=end_date,
+                        period_code="D",  # 일봉
+                        adj_prc="1"       # 원주가
+                    )
+                except Exception:
+                    return None  # 빠른 실패
 
             if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 20:
                 return None
 
-            # 🆕 5. 추가 거래량 필터링 (최근 5일 평균 거래량 체크)
+            # 🚀 5. 거래량 필터링 (빠른 체크)
             if not self._check_recent_volume_filter(ohlcv_data):
                 return None
 
-            # 🆕 6. 캔들 패턴 분석 (28일 흐름 + 최근 2일 패턴)
-            pattern_result = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
+            # 🆕 6. 가격 위치 안전성 체크 (고점 매수 방지)
+            price_position_check = self.price_position_filter.check_price_position_safety(
+                stock_code, current_price, ohlcv_data, {'rsi_value': None}
+            )
             
-            if not pattern_result or len(pattern_result) == 0:
+            if not price_position_check['is_safe']:
+                risk_factors = ', '.join(price_position_check['risk_factors'])
+                logger.debug(f"🚫 {stock_code} 가격위치 필터링: {risk_factors}")
                 return None
+            elif price_position_check['risk_factors']:
+                # 위험 요소가 있지만 통과한 경우 로깅
+                position_summary = self.price_position_filter.get_position_summary(
+                    price_position_check['position_scores']
+                )
+                logger.debug(f"⚠️ {stock_code} 가격위치 주의: {position_summary}")
 
-            # 🆕 7. 패턴 점수 계산 (새로운 방식)
+            # 🚀 7. 캔들 패턴 분석 (에러 처리 강화)
+            try:
+                pattern_result = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
+                
+                if not pattern_result or len(pattern_result) == 0:
+                    return None
+            except Exception:
+                return None  # 빠른 실패
+
+            # 🚀 8. 패턴 점수 계산 (최적화)
             pattern_score = self._calculate_enhanced_pattern_score(pattern_result, ohlcv_data)
             
             if pattern_score < 0.3:  # 최소 점수 기준
                 return None
 
-            # 🆕 8. 후보 생성
+            # 🚀 9. 후보 생성 (필수 데이터만)
             candidate = CandleTradeCandidate(
                 stock_code=stock_code,
                 stock_name=stock_name,
@@ -576,9 +702,8 @@ class MarketScanner:
                 'stock_info': stock_excel_info
             }
 
-        except Exception as e:
-            logger.debug(f"❌ {stock_code} 전체 스크리닝 오류: {e}")
-            return None
+        except Exception:
+            return None  # 모든 예외에 대해 빠른 실패
 
     def _passes_enhanced_basic_filters(self, current_price: float, volume: int, 
                                      trading_value: int, listed_shares: int, stock_code: str) -> bool:

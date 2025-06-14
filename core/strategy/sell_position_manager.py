@@ -10,7 +10,7 @@ from utils.logger import setup_logger
 if TYPE_CHECKING:
     from .candle_trade_manager import CandleTradeManager
 
-from .candle_trade_candidate import CandleTradeCandidate, CandleStatus, RiskManagement
+from .candle_trade_candidate import CandleTradeCandidate, CandleStatus, RiskManagement, TradeSignal
 
 logger = setup_logger(__name__)
 
@@ -119,7 +119,7 @@ class SellPositionManager:
             logger.error(f"포지션 관리 오류: {e}")
 
     async def _manage_single_position(self, position: CandleTradeCandidate):
-        """개별 포지션 관리"""
+        """🆕 개별 포지션 관리 - candle_analyzer로 통합 위임"""
         try:
             # 🆕 EXITED나 PENDING_ORDER 상태 종목 스킵 (체결 통보 처리 완료된 종목)
             if position.status in [CandleStatus.EXITED, CandleStatus.PENDING_ORDER]:
@@ -144,66 +144,39 @@ class SellPositionManager:
                         logger.debug(f"⏭️ {position.stock_code} 최근 보유 확인 실패 - 포지션 관리 생략")
                         return
 
-            # 📊 매도 조건 체크
-            should_exit = False
-            exit_reason = ""
-
-            # 🆕 실시간 캔들 패턴 재분석 (DB 의존 제거)
-            target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(position)
-
-            # 🆕 패턴 정보 추출 (로깅용)
-            original_pattern = None
-            if position.detected_patterns and len(position.detected_patterns) > 0:
-                strongest_pattern = max(position.detected_patterns, key=lambda p: p.strength)
-                original_pattern = strongest_pattern.pattern_type.value
-            elif 'original_pattern_type' in position.metadata:
-                original_pattern = position.metadata['original_pattern_type']
-
-            # 🆕 최소 보유시간 체크 (노이즈 거래 방지)
-            min_holding_check = self._check_min_holding_time(position, stop_loss_pct)
-            if not min_holding_check['can_exit'] and min_holding_check['reason'] != 'emergency':
-                logger.debug(f"⏰ {position.stock_code} 최소 보유시간 미달 - 매도 차단: {min_holding_check['reason']}")
-                return  # 최소 보유시간 미달시 매도 차단
-
-            # 1. 손절 체크 (패턴별) - 최소 보유시간 고려
-            if position.performance.pnl_pct is not None and position.performance.pnl_pct <= -stop_loss_pct:
-                # 긴급 상황이면 즉시 매도, 아니면 최소 보유시간 체크
-                if min_holding_check['can_exit']:
-                    should_exit = True
-                    exit_reason = "손절" if min_holding_check['reason'] != 'emergency' else f"긴급손절({min_holding_check['reason']})"
-                else:
-                    logger.info(f"⏰ {position.stock_code} 손절 조건 충족하지만 최소 보유시간 미달 - 대기: {min_holding_check['reason']}")
-
-            # 2. 익절 체크 (패턴별) - 최소 보유시간 무관 (수익은 언제든 실현 가능)
-            elif position.performance.pnl_pct is not None and position.performance.pnl_pct >= target_profit_pct:
-                should_exit = True
-                exit_reason = "목표가 도달"
-
-            # 3. 시간 청산 체크 (패턴별 max_hours 우선 사용)
-            elif self._should_time_exit_pattern_based(position, max_hours):
-                should_exit = True
-                exit_reason = "시간 청산"
-                # 🎯 Morning Star 패턴의 경우 특별 로깅
-                if pattern_based and original_pattern and 'morning_star' in str(original_pattern).lower():
-                    logger.info(f"⭐ {position.stock_code} Morning Star 패턴 96시간 보유 완료 - 시간 청산")
-
-            # 🆕 동적 추적 손절 업데이트 (손절가가 계속 조정됨)
-            if position.performance.entry_price:
-                self._update_trailing_stop(position, position.current_price)
-
-            # 매도 실행
+            # 🎯 이미 candle_trade_manager에서 매도 신호 분석 완료됨
+            # comprehensive_signal_analysis(focus_on_exit=True)에서 _analyze_candle_exit_conditions 실행됨
+            
+            current_price = position.current_price
+            
+            # 🆕 업데이트된 매도 신호 확인 (중복 분석 방지)
+            trade_signal = position.trade_signal
+            should_exit = trade_signal in [TradeSignal.STRONG_SELL, TradeSignal.SELL]
+            
             if should_exit:
+                # 신호 강도에 따른 매도 사유 결정
+                if trade_signal == TradeSignal.STRONG_SELL:
+                    exit_reason = f"강한 매도 신호 (강도: {position.signal_strength})"
+                    exit_priority = "high"
+                else:
+                    exit_reason = f"매도 신호 (강도: {position.signal_strength})"
+                    exit_priority = "normal"
+                
                 # 🔧 실시간 수익률 재계산하여 정확한 로깅
-                current_price = position.current_price
                 entry_price = position.performance.entry_price
                 if entry_price and entry_price > 0:
                     real_pnl_pct = ((current_price - entry_price) / entry_price) * 100
-                    logger.info(f"📉 {position.stock_code} 매도 조건 충족: {exit_reason} "
+                    logger.info(f"📉 {position.stock_code} 매도 신호 감지 ({exit_priority}): {exit_reason} "
                                f"(실제수익률: {real_pnl_pct:+.2f}%, 현재가: {current_price:,.0f}원)")
                 else:
-                    logger.info(f"📉 {position.stock_code} 매도 조건 충족: {exit_reason} "
+                    logger.info(f"📉 {position.stock_code} 매도 신호 감지 ({exit_priority}): {exit_reason} "
                                f"(수익률계산불가, 현재가: {current_price:,.0f}원)")
-                await self._execute_exit(position, position.current_price, exit_reason)
+                
+                await self._execute_exit(position, current_price, exit_reason)
+            else:
+                # 🆕 동적 추적 손절 업데이트 (매도하지 않을 때만)
+                if position.performance.entry_price:
+                    self._update_trailing_stop(position, current_price)
 
         except Exception as e:
             logger.error(f"개별 포지션 관리 오류 ({position.stock_code}): {e}")
@@ -1021,54 +994,7 @@ class SellPositionManager:
             # 오류시 기본 패턴별 최소시간 반환
             return self._get_pattern_min_holding_time(position)
 
-    def _check_emergency_conditions(self, position: CandleTradeCandidate) -> Dict:
-        """🚨 긴급 상황 체크 (최소 보유시간 무시 조건)"""
-        try:
-            current_pnl = position.performance.pnl_pct or 0.0
-            emergency_threshold = self.manager.config.get('emergency_stop_loss_pct', 5.0)
-            override_conditions = self.manager.config.get('min_holding_override_conditions', {})
-
-            # 🆕 1. 높은 수익시 즉시 매도 (최소 보유시간 무시)
-            high_profit_target = override_conditions.get('high_profit_target', 3.0)
-            if current_pnl >= high_profit_target:
-                return {
-                    'is_emergency': True,
-                    'reason': f'high_profit_target_{high_profit_target}%',
-                    'detail': f'목표수익달성: {current_pnl:.2f}%'
-                }
-
-            # 2. 긴급 손절 임계값 체크 (-5% 이하)
-            if current_pnl <= -emergency_threshold:
-                return {
-                    'is_emergency': True,
-                    'reason': f'emergency_stop_loss_{emergency_threshold}%',
-                    'detail': f'현재손실: {current_pnl:.2f}%'
-                }
-
-            # 3. 시장 급락 체크 (개별 구현 필요 - 현재는 개별 종목 기준)
-            market_crash_threshold = override_conditions.get('market_crash', -7.0)
-            if current_pnl <= market_crash_threshold:
-                return {
-                    'is_emergency': True,
-                    'reason': f'market_crash_{abs(market_crash_threshold)}%',
-                    'detail': f'급락손실: {current_pnl:.2f}%'
-                }
-
-            # 4. 큰 하락 근접 체크
-            limit_down_threshold = override_conditions.get('individual_limit_down', -15.0)
-            if current_pnl <= limit_down_threshold:
-                return {
-                    'is_emergency': True,
-                    'reason': f'big_drop_approach_{abs(limit_down_threshold)}%',
-                    'detail': f'큰하락근접: {current_pnl:.2f}%'
-                }
-
-            # 5. 긴급상황 없음
-            return {'is_emergency': False, 'reason': 'normal'}
-
-        except Exception as e:
-            logger.error(f"❌ 긴급상황 체크 오류: {e}")
-            return {'is_emergency': False, 'reason': 'error'}
+    # 🆕 긴급 상황 체크는 candle_analyzer로 통합됨 (중복 제거)
 
     def _get_pattern_min_holding_time(self, position: CandleTradeCandidate) -> float:
         """패턴별 최소 보유시간 가져오기 (분 단위)"""

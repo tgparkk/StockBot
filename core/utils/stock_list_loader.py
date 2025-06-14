@@ -14,13 +14,13 @@ logger = setup_logger(__name__)
 
 def load_kospi_stocks(excel_path: str = "data_0737_20250613.xlsx") -> List[str]:
     """
-    엑셀 파일에서 KOSPI 종목 리스트를 로드
+    엑셀 파일에서 KOSPI 종목 리스트를 로드 (우선주 제외)
     
     Args:
         excel_path: 엑셀 파일 경로
         
     Returns:
-        KOSPI 종목 단축코드 리스트
+        KOSPI 종목 단축코드 리스트 (우선주 제외)
     """
     try:
         # 엑셀 파일 읽기
@@ -29,13 +29,16 @@ def load_kospi_stocks(excel_path: str = "data_0737_20250613.xlsx") -> List[str]:
         # KOSPI 종목만 필터링
         kospi_df = df[df['시장구분'] == 'KOSPI'].copy()
         
+        # 🚀 우선주 제거 (종목명에 '(우)' 포함된 종목 제외)
+        kospi_df = kospi_df[~kospi_df['한글 종목명'].str.contains(r'\(우\)', na=False)]
+        
         # 단축코드 추출 (문자열로 변환하여 일관성 확보)
         stock_codes = kospi_df['단축코드'].astype(str).tolist()
         
         # 6자리가 아닌 종목코드 필터링 (안전성 확보)
         valid_codes = [code for code in stock_codes if len(code) == 6 and code.isdigit()]
         
-        logger.info(f"✅ KOSPI 종목 로드 완료: {len(valid_codes)}개 종목")
+        logger.info(f"✅ KOSPI 종목 로드 완료: {len(valid_codes)}개 종목 (우선주 제외)")
         logger.debug(f"📋 샘플 종목코드: {valid_codes[:10]}")
         
         return valid_codes
