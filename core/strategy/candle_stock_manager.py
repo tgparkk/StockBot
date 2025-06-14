@@ -515,7 +515,7 @@ class CandleStockManager:
             if candidate.detected_patterns:
                 for pattern in candidate.detected_patterns:
                     # Morning Star, Bullish Engulfing 등 강력한 패턴
-                    if pattern.pattern_type in [PatternType.MORNING_STAR, PatternType.BULLISH_ENGULFING]:
+                    if pattern.pattern_type in [PatternType.BULLISH_ENGULFING]:
                         if pattern.confidence >= 0.7:
                             score += 30  # 강력한 패턴 보너스
                     # Hammer 패턴
@@ -554,10 +554,9 @@ class CandleStockManager:
             if candidate.detected_patterns:
                 for pattern in candidate.detected_patterns:
                     pattern_bonuses = {
-                        PatternType.MORNING_STAR: 50,        # 최고 신뢰도
-                        PatternType.BULLISH_ENGULFING: 40,   # 매우 강력
-                        PatternType.HAMMER: 30,              # 강력
-                        PatternType.INVERTED_HAMMER: 25,     # 좋음
+                        PatternType.BULLISH_ENGULFING: 50,   # 최고 신뢰도
+                        PatternType.HAMMER: 40,              # 매우 강력
+                        PatternType.INVERTED_HAMMER: 30,     # 강력
                         PatternType.RISING_THREE_METHODS: 35, # 추세 지속
                         PatternType.DOJI: 10                 # 중립적
                     }

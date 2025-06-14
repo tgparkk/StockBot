@@ -147,7 +147,7 @@ class CandleTradeManager:
                 try:
                     current_time = datetime.now()
 
-                    # 🕯️ 1. 새로운 종목 패턴 스캔
+                    #🕯️ 1. 새로운 종목 패턴 스캔
                     if self._should_scan_new_patterns(current_time):
                         logger.info("🔍 정기 캔들패턴 스캔 시작...")
                         await self._scan_and_detect_patterns()
@@ -540,20 +540,37 @@ class CandleTradeManager:
 
 
     def _should_scan_new_patterns(self, current_time: datetime) -> bool:
-        """🕯️ 새로운 패턴 스캔 필요 여부 판단 (캔들패턴 특성 반영)"""
+        """🕯️ 🚀 스마트 패턴 스캔 스케줄링 (장전 1회 + 장중 보완)"""
         try:
-            if not self._last_pattern_scan_time:
-                return True  # 첫 스캔
-
-            # 기본 시간 간격 체크
-            time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
-            if time_elapsed >= self._pattern_scan_interval:
-                return True
-
-            # 🎯 특별한 상황에서 추가 스캔 (캔들패턴 거래에 중요한 시점들)
             current_hour = current_time.hour
             current_minute = current_time.minute
-
+            
+            # 🎯 1. 장전 전체 스캔 (08:30 - 08:50)
+            if 8 <= current_hour < 9 and 30 <= current_minute <= 50:
+                if not self._last_pattern_scan_time:
+                    logger.info("🌅 장전 전체 KOSPI 스캔 시작")
+                    return True
+                
+                # 장전에는 한 번만 실행
+                last_scan_hour = self._last_pattern_scan_time.hour
+                if last_scan_hour < 8 or last_scan_hour >= 9:
+                    logger.info("🌅 장전 전체 KOSPI 스캔 (일일 1회)")
+                    return True
+            
+            # 🎯 2. 장중에는 전체 스캔 금지 (09:00 - 15:30)
+            elif 9 <= current_hour < 15 or (current_hour == 15 and current_minute <= 30):
+                # 장중에는 급등/급증 종목만 추가 모니터링
+                return False
+            
+            # 🎯 3. 장후에는 다음날 준비를 위한 스캔 허용 (15:30 이후)
+            elif current_hour >= 15 and current_minute > 30:
+                if not self._last_pattern_scan_time:
+                    return True
+                
+                # 장후에는 2시간마다 한 번씩
+                time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
+                return time_elapsed >= 7200  # 2시간
+            
             return False
 
         except Exception as e:
@@ -1317,6 +1334,16 @@ class CandleTradeManager:
             updated_count = 0
             batch_size = 10
 
+            # 🔧 기존 보유 종목들의 잘못된 max_holding_hours 수정 (한 번만 실행)
+            if not hasattr(self, '_max_hours_fixed'):
+                fixed_count = self.candle_analyzer.fix_existing_holdings_max_hours(self.stock_manager)
+                if fixed_count > 0:
+                    logger.info(f"🔧 기존 보유 종목 max_holding_hours 수정 완료: {fixed_count}개")
+                self._max_hours_fixed = True
+            
+            # 🆕 임시 수정 명령 파일 체크 (즉시 수정용)
+            await self._check_and_apply_temp_fix_command()
+
             # 5개씩 배치로 나누어 처리
             for i in range(0, len(candidates), batch_size):
                 batch = candidates[i:i + batch_size]
@@ -1510,8 +1537,38 @@ class CandleTradeManager:
                 'market_scanner': self.market_scanner.get_scan_status() if hasattr(self, 'market_scanner') else None,
                 'daily_stats': self.daily_stats,
                 'config': self.config,
-                # 🆕 시장 상황 정보 추가
-                'market_condition': {
+                # 🆕 시장 상황 정보 추가 (Dict 타입 처리)
+                'market_condition': self._format_market_condition_dict(market_condition)
+            }
+
+        except Exception as e:
+            logger.error(f"상태 조회 오류: {e}")
+            return {'error': str(e)}
+
+    def _format_market_condition_dict(self, market_condition) -> Dict[str, Any]:
+        """시장 상황 정보를 Dict로 안전하게 포맷팅"""
+        try:
+            # Dict 타입인 경우 (analyze_market_condition 결과)
+            if isinstance(market_condition, dict):
+                investor_sentiment = market_condition.get('investor_sentiment', {})
+                return {
+                    'market_trend': market_condition.get('market_trend', 'neutral_market'),
+                    'investor_sentiment': {
+                        'foreign_buying': investor_sentiment.get('foreign_buying', False),
+                        'institution_buying': investor_sentiment.get('institution_buying', False),
+                        'overall_sentiment': investor_sentiment.get('overall_sentiment', 'neutral')
+                    },
+                    'volatility': market_condition.get('volatility', 'low_volatility'),
+                    'market_strength_score': 50.0,  # 기본값
+                    'market_risk_level': 'medium',  # 기본값
+                    'last_updated': market_condition.get('timestamp', ''),
+                    'data_quality': 'good',
+                    'confidence_score': 0.7
+                }
+            
+            # MarketCondition 객체인 경우 (기존 방식)
+            else:
+                return {
                     'kospi_trend': market_condition.kospi_trend.value,
                     'kosdaq_trend': market_condition.kosdaq_trend.value,
                     'kospi_change_pct': market_condition.kospi_change_pct,
@@ -1526,11 +1583,17 @@ class CandleTradeManager:
                     'data_quality': market_condition.data_quality,
                     'confidence_score': market_condition.confidence_score
                 }
-            }
-
         except Exception as e:
-            logger.error(f"상태 조회 오류: {e}")
-            return {'error': str(e)}
+            logger.warning(f"⚠️ 시장 상황 포맷팅 오류: {e} - 기본값 반환")
+            return {
+                'market_trend': 'neutral_market',
+                'volatility': 'low_volatility',
+                'market_strength_score': 50.0,
+                'market_risk_level': 'medium',
+                'last_updated': datetime.now().strftime('%H:%M:%S'),
+                'data_quality': 'limited',
+                'confidence_score': 0.5
+            }
 
     def get_active_positions(self) -> List[Dict[str, Any]]:
         """활성 포지션 조회"""
@@ -1820,3 +1883,56 @@ class CandleTradeManager:
             logger.error(f"❌ {candidate.stock_code} 기존 보유 candle_trades 저장 오류: {e}")
             import traceback
             logger.error(f"❌ 상세 오류:\n{traceback.format_exc()}")
+
+    async def _check_and_apply_temp_fix_command(self):
+        """🆕 임시 수정 명령 파일 체크 및 적용"""
+        try:
+            import os
+            import json
+            
+            command_file = 'temp_fix_command.json'
+            if not os.path.exists(command_file):
+                return
+            
+            # 명령 파일 읽기
+            with open(command_file, 'r', encoding='utf-8') as f:
+                command = json.load(f)
+            
+            if command.get('action') != 'fix_max_holding_hours':
+                return
+            
+            logger.info("🔧 임시 수정 명령 감지 - 즉시 max_holding_hours 수정 시작")
+            
+            # 수정 실행
+            fixed_count = 0
+            pattern_defaults = command.get('pattern_defaults', {})
+            default_hours = command.get('default_hours', 48)
+            
+            for stock_code, candidate in self.stock_manager._all_stocks.items():
+                if (candidate.status.value == 'entered' and 
+                    candidate.risk_management and 
+                    candidate.risk_management.max_holding_hours <= 0):
+                    
+                    # 패턴별 올바른 시간 계산
+                    correct_hours = default_hours  # 기본값
+                    
+                    if candidate.detected_patterns and len(candidate.detected_patterns) > 0:
+                        pattern_type = candidate.detected_patterns[0].pattern_type.value
+                        correct_hours = pattern_defaults.get(pattern_type, default_hours)
+                    
+                    # 수정 적용
+                    old_hours = candidate.risk_management.max_holding_hours
+                    candidate.risk_management.max_holding_hours = correct_hours
+                    
+                    logger.info(f"🔧 {stock_code} max_holding_hours 즉시 수정: {old_hours}h → {correct_hours}h")
+                    fixed_count += 1
+            
+            if fixed_count > 0:
+                logger.info(f"✅ 임시 명령으로 {fixed_count}개 종목 max_holding_hours 즉시 수정 완료")
+            
+            # 명령 파일 삭제
+            os.remove(command_file)
+            logger.info("🗑️ 임시 수정 명령 파일 삭제 완료")
+            
+        except Exception as e:
+            logger.error(f"❌ 임시 수정 명령 처리 오류: {e}")

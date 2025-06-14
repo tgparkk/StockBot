@@ -145,7 +145,7 @@ class CandleTradeCandidate:
     # ========== 리스크 관리 ==========
     risk_management: RiskManagement = field(default_factory=lambda: RiskManagement(
         position_size_pct=0.0, position_amount=0, stop_loss_price=0.0,
-        target_price=0.0, trailing_stop_pct=0.0, max_holding_hours=0, risk_score=100
+        target_price=0.0, trailing_stop_pct=0.0, max_holding_hours=48, risk_score=100  # 기본 48시간으로 변경
     ))
 
     # ========== 상태 관리 ==========

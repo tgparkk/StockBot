@@ -15,7 +15,31 @@
     "min_daily_volume": 5000000000,
     "rsi_oversold_threshold": 30,
     "rsi_overbought_threshold": 70,
-    "max_day_change_pct": 14.0,
+    "max_day_change_pct": 12.0,
+    "price_position_filters": {
+        "enabled": true,
+        "max_position_vs_20d_high": 90.0,
+        "max_position_vs_60d_high": 95.0,
+        "max_daily_change_for_entry": 12.0,
+        "max_intraday_high_ratio": 95.0,
+        "description": "적극적 수준: 고가 대비 위치 체크로 고점 매수 방지"
+    },
+    "surge_protection": {
+        "enabled": true,
+        "max_3day_surge": 25.0,
+        "max_5day_surge": 35.0,
+        "cooldown_after_surge_days": 1,
+        "check_volume_confirmation": true,
+        "description": "급등 후 고점 매수 방지 (적극적 수준)"
+    },
+    "technical_position_filters": {
+        "enabled": true,
+        "max_bollinger_position": 85.0,
+        "rsi_high_threshold": 65.0,
+        "avoid_upper_shadow_ratio": 2.5,
+        "min_support_distance": 3.0,
+        "description": "기술적 지표 기반 고점 회피 (적극적 수준)"
+    },
     "max_signal_age_seconds": 300,
     "min_order_interval_seconds": 300,
     "max_priority_multiplier": 1.5,
@@ -26,84 +50,48 @@
     "default_target_profit_pct": 3.0,
     "max_holding_hours": 72,
     "min_holding_minutes": 1440,
-    "emergency_stop_loss_pct": 6.0,
+    "emergency_stop_loss_pct": 5.0,
     "min_holding_override_conditions": {
-        "high_profit_target": 3.5,
-        "market_crash": -7.0,
-        "individual_limit_down": -15.0,
-        "pattern_reversal": true
+        "high_profit_target": 2.0,
+        "pattern_reversal": true,
+        "description": "긴급상황: 높은수익(2.0%이상) 즉시실현, 긴급손절(-6%이하) 즉시매도"
     },
     "pattern_targets": {
-        "// 🎯 Morning Star 패턴 특별 설정": "96시간(4일) 보유로 큰 수익 추구",
-        "morning_star": {
-            "target": 4.5,
-            "stop": 2.5,
-            "max_hours": 96,
-            "min_minutes": 1440,
-            "description": "샛별형: 최고 신뢰도, 96시간(4일) 보유로 큰 목표 추구"
-        },
         "hammer": {
-            "target": 3.5,
-            "stop": 2.5,
+            "target": 2.5,
+            "stop": 2.0,
             "max_hours": 48,
             "min_minutes": 1440,
-            "description": "망치형: 강한 매수 신호, 적정 보유"
+            "description": "망치형: 데이트레이딩 지향, 24시간 최소 보유"
         },
         "inverted_hammer": {
-            "target": 3.0,
-            "stop": 2.5,
+            "target": 2.0,
+            "stop": 2.0,
             "max_hours": 36,
             "min_minutes": 1440,
-            "description": "역망치형: 중간 신호, 조심스러운 접근"
+            "description": "역망치형: 데이트레이딩 지향, 24시간 최소 보유"
         },
         "bullish_engulfing": {
-            "target": 4.0,
-            "stop": 2.5,
+            "target": 3.0,
+            "stop": 2.0,
             "max_hours": 60,
             "min_minutes": 1440,
-            "description": "상승장악형: 매우 강한 신호, 적극적 목표"
-        },
-
-        "evening_star": {
-            "target": 0.0,
-            "stop": 1.0,
-            "max_hours": 6,
-            "min_minutes": 60,
-            "description": "저녁별형: 강한 매도 신호, 즉시 청산"
-        },
-        "rising_three_methods": {
-            "target": 5.0,
-            "stop": 3.5,
-            "max_hours": 120,
-            "min_minutes": 2880,
-            "description": "상승삼법: 추세 지속, 가장 큰 목표와 긴 보유"
-        },
-        "falling_three_methods": {
-            "target": 0.0,
-            "stop": 1.5,
-            "max_hours": 12,
-            "min_minutes": 120,
-            "description": "하락삼법: 하락 지속, 빠른 청산"
-        },
-        "doji": {
-            "target": 2.0,
-            "stop": 1.5,
-            "max_hours": 12,
-            "min_minutes": 360,
-            "description": "도지: 중립 신호, 짧은 보유와 작은 목표"
+            "description": "상승장악형: 데이트레이딩 지향, 24시간 최소 보유"
         }
     },
     "time_exit_rules": {
         "profit_exit_hours": 36,
-        "min_profit_for_time_exit": 1.0,
+        "min_profit_for_time_exit": 1.5,
         "market_close_exit_minutes": 30,
         "overnight_avoid": false,
         "weekend_gap_risk": true,
+        "loss_situation_time_exit_block": true,
         "pattern_strength_multiplier": {
             "high": 1.5,
             "medium": 1.0,
             "low": 0.7
-        }
+        },
+        "description": "수익 중 시간 청산: 36시간 후 1.5% 이상 수익시만, 손실시 차단"
     },
     "execution_time_strategy": {
         "use_execution_time": true,

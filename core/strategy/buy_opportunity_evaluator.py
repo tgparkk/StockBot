@@ -89,14 +89,6 @@ class BuyOpportunityEvaluator:
                     if candidate.status == CandleStatus.BUY_READY
                 ]
 
-                if buy_ready_status_only:
-                    logger.warning(f"⚠️ BUY_READY 상태이지만 매수 준비되지 않은 종목: {len(buy_ready_status_only)}개")
-                    for candidate in buy_ready_status_only:
-                        ready_check = candidate.is_ready_for_entry()
-                        logger.warning(f"   🔍 {candidate.stock_code}: status={candidate.status.value}, "
-                                     f"is_ready={ready_check}, signal={candidate.trade_signal.value}, "
-                                     f"entry_conditions={candidate.entry_conditions is not None}")
-
                 return
 
             #logger.info(f"💰 매수 실행: {len(buy_ready_candidates)}개 준비된 종목")
