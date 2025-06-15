@@ -622,12 +622,12 @@ class CandleTradeManager:
             # 🎯 2. 장중에는 전체 스캔 금지 (09:00 - 15:30)
             elif 9 <= current_hour < 15 or (current_hour == 15 and current_minute <= 30):
                 # 장중에는 급등/급증 종목만 추가 모니터링
-                return False
+                return True
             
             # 🎯 3. 장후에는 다음날 준비를 위한 스캔 허용 (15:30 이후)
             elif current_hour >= 15 and current_minute > 30:
                 if not self._last_pattern_scan_time:
-                    return True
+                    return False
                 
                 # 장후에는 2시간마다 한 번씩
                 time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
@@ -1342,16 +1342,30 @@ class CandleTradeManager:
                         if stock_current_data is None:
                             continue
 
-                        # 다각도 종합 분석 수행 (current_data 전달)
-                        analysis_result = await self.candle_analyzer.comprehensive_signal_analysis(
+                        # 🚀 매수 전용 빠른 판단 수행 (current_data 전달)
+                        analysis_result = await self.candle_analyzer.quick_buy_decision(
                             candidate, current_data=stock_current_data
                         )
 
-                        if analysis_result and self._should_update_signal(candidate, analysis_result):
-                            # 신호 업데이트
+                        if analysis_result and self.buy_evaluator.should_update_buy_signal(candidate, analysis_result):
+                            # 🚀 매수 신호 업데이트 (quick_buy_decision 결과 처리)
                             old_signal = candidate.trade_signal
-                            candidate.trade_signal = analysis_result['new_signal']
-                            candidate.signal_strength = analysis_result['signal_strength']
+                            buy_decision = analysis_result['buy_decision']
+                            buy_score = analysis_result.get('buy_score', 50)
+
+                            # 매수 결정을 TradeSignal로 변환
+                            if buy_decision == 'buy':
+                                if buy_score >= 85:
+                                    new_signal = TradeSignal.STRONG_BUY
+                                else:
+                                    new_signal = TradeSignal.BUY
+                            elif buy_decision == 'wait':
+                                new_signal = TradeSignal.HOLD
+                            else:  # 'reject'
+                                new_signal = TradeSignal.HOLD
+
+                            candidate.trade_signal = new_signal
+                            candidate.signal_strength = buy_score
                             candidate.signal_updated_at = datetime.now(self.korea_tz)
 
                             # 우선순위 재계산
@@ -1360,9 +1374,9 @@ class CandleTradeManager:
                             # stock_manager 업데이트
                             self.stock_manager.update_candidate(candidate)
 
-                            logger.debug(f"🔄 {candidate.stock_code} 신호 업데이트: "
+                            logger.debug(f"🔄 {candidate.stock_code} 매수 신호 업데이트: "
                                        f"{old_signal.value} → {candidate.trade_signal.value} "
-                                       f"(강도:{candidate.signal_strength})")
+                                       f"(점수:{buy_score}, 결정:{buy_decision})")
                             signal_updated_count += 1
 
                     except Exception as e:
@@ -1466,7 +1480,7 @@ class CandleTradeManager:
             return 0
 
     def _should_update_signal(self, candidate: CandleTradeCandidate, analysis_result: Dict) -> bool:
-        """신호 업데이트 필요 여부 판단 (개선된 버전)"""
+        """신호 업데이트 필요 여부 판단 (개선된 버전) - comprehensive_signal_analysis용"""
         try:
             new_signal = analysis_result['new_signal']
             new_strength = analysis_result['signal_strength']
@@ -1508,6 +1522,8 @@ class CandleTradeManager:
         except Exception as e:
             logger.debug(f"신호 업데이트 판단 오류: {e}")
             return False
+
+
 
     def _get_strength_range(self, strength: float, thresholds: List[int]) -> str:
         """강도 구간 계산"""

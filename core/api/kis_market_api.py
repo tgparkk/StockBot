@@ -114,7 +114,7 @@ def get_inquire_daily_itemchartprice(output_dv: str = "1", div_code: str = "J", 
     tr_id = "FHKST03010100"  # 국내주식기간별시세
 
     if inqr_strt_dt is None:
-        inqr_strt_dt = (datetime.now() - timedelta(days=100)).strftime("%Y%m%d")
+        inqr_strt_dt = (datetime.now() - timedelta(days=20)).strftime("%Y%m%d")
     if inqr_end_dt is None:
         inqr_end_dt = datetime.today().strftime("%Y%m%d")
 
