@@ -49,7 +49,7 @@ class CandleTradeManager:
 
         # 🆕 스캔 간격 (초)
         self.scan_interval = self.config.get('scan_interval_seconds', 120)
-        self.signal_evaluation_interval = self.config.get('signal_evaluation_interval', 30)
+        self.signal_evaluation_interval = self.config.get('signal_evaluation_interval', 20)
 
         # 데이터 수집 및 분석 도구들
         self.pattern_detector = CandlePatternDetector()
@@ -1334,16 +1334,6 @@ class CandleTradeManager:
             updated_count = 0
             batch_size = 10
 
-            # 🔧 기존 보유 종목들의 잘못된 max_holding_hours 수정 (한 번만 실행)
-            if not hasattr(self, '_max_hours_fixed'):
-                fixed_count = self.candle_analyzer.fix_existing_holdings_max_hours(self.stock_manager)
-                if fixed_count > 0:
-                    logger.info(f"🔧 기존 보유 종목 max_holding_hours 수정 완료: {fixed_count}개")
-                self._max_hours_fixed = True
-            
-            # 🆕 임시 수정 명령 파일 체크 (즉시 수정용)
-            await self._check_and_apply_temp_fix_command()
-
             # 5개씩 배치로 나누어 처리
             for i in range(0, len(candidates), batch_size):
                 batch = candidates[i:i + batch_size]
@@ -1883,56 +1873,3 @@ class CandleTradeManager:
             logger.error(f"❌ {candidate.stock_code} 기존 보유 candle_trades 저장 오류: {e}")
             import traceback
             logger.error(f"❌ 상세 오류:\n{traceback.format_exc()}")
-
-    async def _check_and_apply_temp_fix_command(self):
-        """🆕 임시 수정 명령 파일 체크 및 적용"""
-        try:
-            import os
-            import json
-            
-            command_file = 'temp_fix_command.json'
-            if not os.path.exists(command_file):
-                return
-            
-            # 명령 파일 읽기
-            with open(command_file, 'r', encoding='utf-8') as f:
-                command = json.load(f)
-            
-            if command.get('action') != 'fix_max_holding_hours':
-                return
-            
-            logger.info("🔧 임시 수정 명령 감지 - 즉시 max_holding_hours 수정 시작")
-            
-            # 수정 실행
-            fixed_count = 0
-            pattern_defaults = command.get('pattern_defaults', {})
-            default_hours = command.get('default_hours', 48)
-            
-            for stock_code, candidate in self.stock_manager._all_stocks.items():
-                if (candidate.status.value == 'entered' and 
-                    candidate.risk_management and 
-                    candidate.risk_management.max_holding_hours <= 0):
-                    
-                    # 패턴별 올바른 시간 계산
-                    correct_hours = default_hours  # 기본값
-                    
-                    if candidate.detected_patterns and len(candidate.detected_patterns) > 0:
-                        pattern_type = candidate.detected_patterns[0].pattern_type.value
-                        correct_hours = pattern_defaults.get(pattern_type, default_hours)
-                    
-                    # 수정 적용
-                    old_hours = candidate.risk_management.max_holding_hours
-                    candidate.risk_management.max_holding_hours = correct_hours
-                    
-                    logger.info(f"🔧 {stock_code} max_holding_hours 즉시 수정: {old_hours}h → {correct_hours}h")
-                    fixed_count += 1
-            
-            if fixed_count > 0:
-                logger.info(f"✅ 임시 명령으로 {fixed_count}개 종목 max_holding_hours 즉시 수정 완료")
-            
-            # 명령 파일 삭제
-            os.remove(command_file)
-            logger.info("🗑️ 임시 수정 명령 파일 삭제 완료")
-            
-        except Exception as e:
-            logger.error(f"❌ 임시 수정 명령 처리 오류: {e}")

@@ -303,115 +303,75 @@ class SellPositionManager:
             return False
 
     async def _execute_exit(self, position: CandleTradeCandidate, exit_price: float, reason: str) -> bool:
-        """매도 청산 실행"""
+        """매도 청산 실행 - 간소화된 버전"""
         try:
-            # 🕐 거래 시간 재확인 (매도 실행 직전 체크)
+            # 🕐 거래 시간 체크
             current_time = datetime.now().time()
             trading_start = datetime.strptime(self.manager.config['trading_start_time'], '%H:%M').time()
             trading_end = datetime.strptime(self.manager.config['trading_end_time'], '%H:%M').time()
 
-            is_trading_time = trading_start <= current_time <= trading_end
-            if not is_trading_time:
+            if not (trading_start <= current_time <= trading_end):
                 logger.warning(f"⏰ {position.stock_code} 거래 시간 외 매도 차단 - {reason}")
-                logger.info(f"현재 시간: {current_time}, 거래 시간: {trading_start} ~ {trading_end}")
-
-            # 🔍 실제 보유 여부 확인 (매도 전 필수 체크)
-            try:
-                from ..api.kis_market_api import get_account_balance
-                account_info = get_account_balance()
-
-                if account_info and 'stocks' in account_info:
-                    # 실제 보유 종목에서 해당 종목 찾기
-                    actual_holding = None
-                    for stock in account_info['stocks']:
-                        if stock.get('stock_code') == position.stock_code:
-                            actual_holding = stock
-                            break
-
-                    if not actual_holding:
-                        logger.warning(f"⚠️ {position.stock_code} 실제 보유하지 않는 종목 - 매도 취소")
-                        # 🆕 실제 보유하지 않는 종목은 EXITED 상태로 변경하여 더 이상 관리하지 않음
-                        position.status = CandleStatus.EXITED
-                        position.metadata['auto_exit_reason'] = '실제_보유_없음'
-                        position.metadata['final_exit_confirmed'] = True
-                        self.manager.stock_manager.update_candidate(position)
-                        logger.info(f"✅ {position.stock_code} 상태 변경: ENTERED → EXITED (실제 보유 없음)")
-                        return False
-
-                    actual_quantity = actual_holding.get('quantity', 0)
-                    if actual_quantity <= 0:
-                        logger.warning(f"⚠️ {position.stock_code} 실제 보유 수량 없음 ({actual_quantity}주) - 매도 취소")
-                        # 🆕 실제 보유 수량이 없는 종목도 EXITED 상태로 변경
-                        position.status = CandleStatus.EXITED
-                        position.metadata['auto_exit_reason'] = '실제_보유수량_없음'
-                        position.metadata['final_exit_confirmed'] = True
-                        self.manager.stock_manager.update_candidate(position)
-                        logger.info(f"✅ {position.stock_code} 상태 변경: ENTERED → EXITED (실제 보유 수량 없음)")
-                        return False
-
-                    # 매도할 수량을 실제 보유 수량으로 조정
-                    quantity = min(position.performance.entry_quantity or 0, actual_quantity)
-                    logger.info(f"✅ {position.stock_code} 보유 확인: 시스템{position.performance.entry_quantity}주 → 실제{actual_quantity}주 → 매도{quantity}주")
-                else:
-                    logger.warning(f"⚠️ {position.stock_code} 계좌 정보 조회 실패 - 매도 진행")
-                    quantity = position.performance.entry_quantity
-
-            except Exception as e:
-                logger.warning(f"⚠️ {position.stock_code} 보유 확인 오류: {e} - 기존 수량으로 진행")
-                quantity = position.performance.entry_quantity
-
-            if not quantity or quantity <= 0:
-                logger.warning(f"❌ {position.stock_code} 매도할 수량 없음 ({quantity}주)")
                 return False
 
-            # 🆕 안전한 매도가 계산 (현재가 직접 사용 금지)
+            # 🔍 파라미터에서 직접 정보 추출 (검증 로직 간소화)
+            stock_code = position.stock_code
+            quantity = position.performance.entry_quantity or 0
+            
+            if quantity <= 0:
+                logger.warning(f"❌ {position.stock_code} 매도할 수량 없음 ({quantity}주)")
+                # 수량이 없으면 EXITED 상태로 변경
+                position.status = CandleStatus.EXITED
+                position.metadata['auto_exit_reason'] = '매도수량_없음'
+                position.metadata['final_exit_confirmed'] = True
+                self.manager.stock_manager.update_candidate(position)
+                return False
+
+            # 🆕 안전한 매도가 계산
             safe_sell_price = self._calculate_safe_sell_price(exit_price, reason)
 
             # 매도 신호 생성
             signal = {
-                'stock_code': position.stock_code,
+                'stock_code': stock_code,
                 'action': 'sell',
                 'strategy': 'candle_pattern',
-                'price': safe_sell_price,  # 🎯 계산된 안전한 매도가 사용
+                'price': safe_sell_price,
                 'quantity': quantity,
                 'total_amount': int(safe_sell_price * quantity),
                 'reason': reason,
                 'pattern_type': str(position.detected_patterns[0].pattern_type) if position.detected_patterns else 'unknown',
-                'pre_validated': True  # 캔들 시스템에서 이미 검증 완료
+                'pre_validated': True
             }
 
-            # 실제 매도 주문 실행 (TradeExecutor 사용)
+            # 🚀 매도 주문 실행
             if hasattr(self.manager, 'trade_executor') and self.manager.trade_executor:
                 try:
                     result = self.manager.trade_executor.execute_sell_signal(signal)
                     if not result.success:
-                        logger.error(f"❌ 매도 주문 실패: {position.stock_code} - {result.error_message}")
+                        logger.error(f"❌ 매도 주문 실패: {stock_code} - {result.error_message}")
                         return False
 
-                    # 🔧 수정: 매도 주문 성공시 PENDING_ORDER 상태로 변경
+                    # 매도 주문 성공시 PENDING_ORDER 상태로 변경
                     order_no = getattr(result, 'order_no', None)
-                    position.set_pending_order(order_no or f"sell_unknown_{datetime.now().strftime('%H%M%S')}", 'sell')
+                    position.set_pending_order(order_no or f"sell_{datetime.now().strftime('%H%M%S')}", 'sell')
 
-                    # 🆕 현재가와 주문가 명확히 구분하여 로깅
-                    logger.info(f"📉 매도 주문 제출 성공: {position.stock_code}")
-                    logger.info(f"   💰 현재가: {exit_price:,.0f}원 (매도 조건 체크 기준)")
-                    logger.info(f"   📝 주문가: {safe_sell_price:,.0f}원 (실제 주문 제출가)")
-                    logger.info(f"   🆔 주문번호: {order_no}")
+                    # 로깅
+                    logger.info(f"📉 매도 주문 제출 성공: {stock_code}")
+                    logger.info(f"   💰 기준가: {exit_price:,.0f}원 → 주문가: {safe_sell_price:,.0f}원")
+                    logger.info(f"   📦 수량: {quantity:,}주 | 🆔 주문번호: {order_no}")
                     logger.info(f"   📋 매도사유: {reason}")
-
-                    # 🎯 중요: 매도 주문 제출시에는 update_candidate() 호출하지 않음
-                    # 실제 체결은 웹소켓에서 확인 후 handle_execution_confirmation에서 처리됨
 
                     return True
 
                 except Exception as e:
-                    logger.error(f"❌ 매도 주문 실행 오류: {position.stock_code} - {e}")
+                    logger.error(f"❌ 매도 주문 실행 오류: {stock_code} - {e}")
                     return False
 
-            return True
+            logger.error(f"❌ TradeExecutor 없음: {stock_code}")
+            return False
 
         except Exception as e:
-            logger.error(f"매도 청산 실행 오류 ({position.stock_code}): {e}")
+            logger.error(f"❌ 매도 청산 실행 오류 ({position.stock_code}): {e}")
             return False
 
     def _calculate_safe_sell_price(self, current_price: float, reason: str) -> int:
@@ -1178,7 +1138,7 @@ class SellPositionManager:
             logger.error(f"패턴 정보 저장 오류: {e}")
 
     async def cleanup_completed_positions(self):
-        """🧹 이미 매도 완료된 종목들을 정리"""
+        """🧹 이미 매도 완료된 종목들을 정리 (시스템 관리 수량 기준)"""
         try:
             cleanup_count = 0
             all_stocks = list(self.manager.stock_manager._all_stocks.values())
@@ -1189,28 +1149,41 @@ class SellPositionManager:
                     not position.metadata.get('final_exit_confirmed', False) and
                     not position.metadata.get('auto_exit_reason')):
                     
-                    # 실제 보유 여부 확인
-                    try:
-                        account_info = await self.manager.kis_api_manager.get_account_balance()
-                        if account_info and 'stocks' in account_info:
-                            actual_holding = None
-                            for stock in account_info['stocks']:
-                                if stock.get('stock_code') == position.stock_code:
-                                    actual_holding = stock
-                                    break
-                            
-                            # 실제 보유하지 않는 종목 정리
-                            if not actual_holding or actual_holding.get('quantity', 0) <= 0:
-                                position.status = CandleStatus.EXITED
-                                position.metadata['auto_exit_reason'] = '정리작업_실제보유없음'
-                                position.metadata['final_exit_confirmed'] = True
-                                self.manager.stock_manager.update_candidate(position)
-                                cleanup_count += 1
-                                logger.info(f"🧹 {position.stock_code} 정리 완료: ENTERED → EXITED (실제 보유 없음)")
+                    # 🆕 시스템 관리 수량 기준으로 정리 (API 호출 제거)
+                    system_quantity = position.performance.entry_quantity or 0
                     
-                    except Exception as e:
-                        logger.debug(f"보유 확인 오류 ({position.stock_code}): {e}")
+                    if system_quantity <= 0:
+                        position.status = CandleStatus.EXITED
+                        position.metadata['auto_exit_reason'] = '정리작업_시스템관리수량없음'
+                        position.metadata['final_exit_confirmed'] = True
+                        self.manager.stock_manager.update_candidate(position)
+                        cleanup_count += 1
+                        logger.info(f"🧹 {position.stock_code} 정리 완료: ENTERED → EXITED (시스템 관리 수량 없음)")
                         continue
+                    
+                    # 🆕 선택적으로만 실제 보유 확인 (설정으로 제어)
+                    if self.manager.config.get('validate_actual_holding_before_sell', False):
+                        try:
+                            account_info = await self.manager.kis_api_manager.get_account_balance()
+                            if account_info and 'stocks' in account_info:
+                                actual_holding = None
+                                for stock in account_info['stocks']:
+                                    if stock.get('stock_code') == position.stock_code:
+                                        actual_holding = stock
+                                        break
+                                
+                                # 실제 보유하지 않는 종목 정리
+                                if not actual_holding or actual_holding.get('quantity', 0) <= 0:
+                                    position.status = CandleStatus.EXITED
+                                    position.metadata['auto_exit_reason'] = '정리작업_실제보유없음'
+                                    position.metadata['final_exit_confirmed'] = True
+                                    self.manager.stock_manager.update_candidate(position)
+                                    cleanup_count += 1
+                                    logger.info(f"🧹 {position.stock_code} 정리 완료: ENTERED → EXITED (실제 보유 없음)")
+                        
+                        except Exception as e:
+                            logger.debug(f"보유 확인 오류 ({position.stock_code}): {e}")
+                            continue
             
             if cleanup_count > 0:
                 logger.info(f"🧹 포지션 정리 완료: {cleanup_count}개 종목")
