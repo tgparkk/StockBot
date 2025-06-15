@@ -30,6 +30,15 @@ class BuyOpportunityEvaluator:
     async def evaluate_entry_opportunities(self):
         """💰 매수 실행 전용 - 모든 분석은 _periodic_signal_evaluation에서 완료됨"""
         try:
+            # ⏰ 시간 체크: 09:00~15:00 시간대에만 매수 허용
+            current_time = datetime.now().time()
+            trading_start_time = datetime.strptime("09:00", "%H:%M").time()
+            trading_end_time = datetime.strptime("15:00", "%H:%M").time()
+            
+            if current_time < trading_start_time or current_time > trading_end_time:
+                logger.debug(f"⏰ 거래 시간외 ({current_time.strftime('%H:%M')}) - 매수 스킵 (허용시간: 09:00~15:00)")
+                return
+            
             # 🔍 전체 종목 상태 분석
             all_stocks = self.manager.stock_manager._all_stocks.values()
 

@@ -156,7 +156,7 @@ class CandleTradeManager:
 
                     # 🌍 2. 시장 상황 분석 (5분마다)
                     if self.market_analyzer.should_update():
-                        await self.market_analyzer.analyze_market_condition()
+                        self.market_analyzer.analyze_market_condition()
 
                     # 🔄 3. 기존 종목 신호 재평가 (30초 간격 - 실시간 모니터링)
                     await self._periodic_signal_evaluation()
@@ -316,7 +316,7 @@ class CandleTradeManager:
             logger.debug("📊 기존 보유 종목 웹소켓 모니터링 설정 시작")
 
             # 1. 기존 보유 종목 조회
-            existing_stocks = await self._fetch_existing_holdings()
+            existing_stocks = self._fetch_existing_holdings()
             if not existing_stocks:
                 logger.info("📊 보유 종목이 없습니다.")
                 return True
@@ -371,7 +371,7 @@ class CandleTradeManager:
             logger.error(f"기존 보유 종목 모니터링 설정 오류: {e}")
             return False
 
-    async def _fetch_existing_holdings(self) -> List[Dict]:
+    def _fetch_existing_holdings(self) -> List[Dict]:
         """기존 보유 종목 조회"""
         try:
             from ..api.kis_market_api import get_existing_holdings
