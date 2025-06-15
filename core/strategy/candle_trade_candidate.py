@@ -14,6 +14,7 @@ class PatternType(Enum):
     INVERTED_HAMMER = "inverted_hammer"
     BULLISH_ENGULFING = "bullish_engulfing"
     BEARISH_ENGULFING = "bearish_engulfing"
+    PIERCING_LINE = "piercing_line"
     MORNING_STAR = "morning_star"
     EVENING_STAR = "evening_star"
     DOJI = "doji"
@@ -49,9 +50,16 @@ class CandlePatternInfo:
     pattern_type: PatternType
     confidence: float           # 0.0~1.0 신뢰도
     strength: int              # 0~100 강도 점수
-    formation_bars: int        # 패턴 형성에 사용된 봉 수
-    detected_at: datetime      # 패턴 감지 시간
-    description: str           # 패턴 설명
+    detected_at: int           # 패턴 감지된 캔들의 인덱스 (0=오늘, 1=어제)
+    trade_signal: TradeSignal = TradeSignal.HOLD
+    target_price_ratio: float = 1.0    # 목표가 비율 (1.02 = 2% 목표)
+    stop_loss_ratio: float = 1.0       # 손절가 비율 (0.98 = 2% 손절)
+    expected_duration_hours: int = 24   # 예상 보유 시간
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # 기존 호환성을 위한 필드들
+    formation_bars: int = 1        # 패턴 형성에 사용된 봉 수
+    description: str = ""          # 패턴 설명
 
 
 @dataclass

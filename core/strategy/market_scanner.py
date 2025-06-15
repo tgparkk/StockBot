@@ -381,54 +381,6 @@ class MarketScanner:
             # logger.info(f"✅ {stock_code}({stock_name}) 신호 생성: {trade_signal.value.upper()} "
             #            f"(강도:{signal_strength}) 패턴:{strongest_pattern.pattern_type.value}")
 
-            # 🆕 7. 데이터베이스에 후보 저장
-            try:
-                if self.trade_db:  # None 체크 추가
-                    candidate_id = self.trade_db.record_candle_candidate(
-                        stock_code=stock_code,
-                        stock_name=stock_name,
-                        current_price=int(current_price),
-                        pattern_type=strongest_pattern.pattern_type.value,
-                        pattern_strength=strongest_pattern.strength,
-                        signal_strength='HIGH' if strongest_pattern.strength >= 80 else 'MEDIUM',
-                        entry_reason=strongest_pattern.description,
-                        risk_score=self.manager.candle_analyzer.calculate_risk_score({'stck_prpr': current_price}),
-                        target_price=int(current_price * 1.05),  # 5% 목표
-                        stop_loss_price=int(current_price * 0.95)  # 5% 손절
-                    )
-
-                    candidate.metadata['db_id'] = candidate_id  # metadata에 저장
-                    # logger.info(f"🗄️ {stock_code} 후보 DB 저장 완료 (ID: {candidate_id})")
-
-                    # 패턴 분석 결과도 저장
-                    if pattern_result:
-                        # ✅ 타입 변환 수정: strength를 문자열로, candle_data를 Dict 리스트로
-                        pattern_data_list = []
-                        for pattern in pattern_result:
-                            pattern_dict = {
-                                'pattern_type': pattern.pattern_type.value if hasattr(pattern.pattern_type, 'value') else str(pattern.pattern_type),
-                                'strength': pattern.strength,
-                                'confidence': pattern.confidence,
-                                'description': pattern.description
-                            }
-                            pattern_data_list.append(pattern_dict)
-
-                        self.trade_db.record_candle_pattern(
-                            stock_code=stock_code,
-                            pattern_name=strongest_pattern.pattern_type.value,
-                            pattern_type='BULLISH' if strongest_pattern.strength >= 80 else 'BEARISH',
-                            confidence_score=strongest_pattern.confidence,
-                            strength=str(strongest_pattern.strength),  # ✅ 문자열로 변환
-                            candle_data=pattern_data_list,  # ✅ Dict 리스트로 변환
-                            volume_analysis=None,
-                            trend_analysis=None,
-                            predicted_direction='UP' if strongest_pattern.strength >= 80 else 'DOWN'
-                        )
-
-            except Exception as db_error:
-                logger.warning(f"⚠️ {stock_code} DB 저장 실패: {db_error}")
-                # DB 저장 실패해도 거래는 계속 진행
-
             # 7. 웹소켓 구독 (새로운 후보인 경우)
             try:
                 if self.websocket_manager and stock_code not in self.subscribed_stocks:

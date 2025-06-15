@@ -10,6 +10,7 @@
     "min_volume_ratio": 2.0,
     "trading_start_time": "09:00",
     "trading_end_time": "15:20",
+    "open_price_buy_range_pct": 1.5,
     "min_price": 1000,
     "max_price": 500000,
     "min_daily_volume": 5000000000,
@@ -50,7 +51,7 @@
     "default_target_profit_pct": 3.0,
     "max_holding_hours": 72,
     "min_holding_minutes": 1440,
-    "emergency_stop_loss_pct": 5.0,
+    "emergency_stop_loss_pct": 4.5,
     "validate_actual_holding_before_sell": false,
     "min_holding_override_conditions": {
         "high_profit_target": 2.0,
@@ -59,25 +60,32 @@
     },
     "pattern_targets": {
         "hammer": {
-            "target": 2.5,
-            "stop": 2.0,
+            "target": 2.0,
+            "stop": 1.5,
             "max_hours": 48,
             "min_minutes": 1440,
-            "description": "망치형: 데이트레이딩 지향, 24시간 최소 보유"
-        },
-        "inverted_hammer": {
-            "target": 2.0,
-            "stop": 2.0,
-            "max_hours": 36,
-            "min_minutes": 1440,
-            "description": "역망치형: 데이트레이딩 지향, 24시간 최소 보유"
+            "description": "망치형: 5일 데이터, 하락추세+긴 아래꼬리+종가 상단부, 1-2일 보유"
         },
         "bullish_engulfing": {
             "target": 3.0,
             "stop": 2.0,
-            "max_hours": 48,
-            "min_minutes": 1440,
-            "description": "상승장악형: 데이트레이딩 지향, 24시간 최소 보유"
+            "max_hours": 24,
+            "min_minutes": 720,
+            "description": "상승장악형: 4일 데이터, 전날 음봉+당일 완전포함 양봉, 당일-1일 보유"
+        },
+        "piercing_line": {
+            "target": 2.0,
+            "stop": 1.5,
+            "max_hours": 24,
+            "min_minutes": 720,
+            "description": "관통형: 3일 데이터, 전날 강한음봉+당일 갭하락후 반등, 당일-1일 보유"
+        },
+        "morning_star": {
+            "target": 4.0,
+            "stop": 2.5,
+            "max_hours": 24,
+            "min_minutes": 480,
+            "description": "아침샛별: 4일 데이터, 음봉+도지/팽이+강한양봉, 1일 보유, 가장 강한 반전신호"
         }
     },
     "time_exit_rules": {
