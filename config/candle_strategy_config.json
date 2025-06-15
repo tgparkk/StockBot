@@ -10,7 +10,6 @@
     "min_volume_ratio": 2.0,
     "trading_start_time": "09:00",
     "trading_end_time": "15:20",
-    "open_price_buy_range_pct": 1.5,
     "min_price": 1000,
     "max_price": 500000,
     "min_daily_volume": 5000000000,
