@@ -212,7 +212,49 @@ class BuyOpportunityEvaluator:
             return 0
 
     async def _validate_detailed_entry_conditions(self, candidate: CandleTradeCandidate, current_data: Optional[Any] = None) -> bool:
-        """🔍 세부 진입 조건 검증 (candle_trade_manager에서 이관)"""
+        """🚀 세부 진입 조건 검증 - 새로운 빠른 매수 판단 함수 사용"""
+        try:
+            # 🆕 빠른 매수 판단 함수 사용 (장전 패턴분석 + 현재가격 기반)
+            buy_decision_result = await self.manager.candle_analyzer.quick_buy_decision(candidate, current_data)
+            
+            if buy_decision_result is None:
+                logger.debug(f"❌ {candidate.stock_code} 빠른 매수 판단 실패 - 결과 없음")
+                return False
+
+            # 매수 결정 확인
+            buy_decision = buy_decision_result.get('buy_decision', 'reject')
+            buy_score = buy_decision_result.get('buy_score', 0)
+            current_price = buy_decision_result.get('current_price', 0)
+
+            if buy_decision == 'buy':
+                logger.info(f"✅ {candidate.stock_code} 빠른 매수 판단 통과: 점수 {buy_score}/100, 현재가 {current_price:,}원")
+                
+                # 🔧 기존 시스템과의 호환성을 위해 entry_conditions 설정
+                from .candle_trade_candidate import EntryConditions
+                candidate.entry_conditions = EntryConditions(
+                    overall_passed=True,
+                    fail_reasons=[],
+                    pass_reasons=[f'빠른_매수_판단_통과(점수:{buy_score})']
+                )
+                return True
+                
+            elif buy_decision == 'wait':
+                reason = buy_decision_result.get('reason', '알 수 없음')
+                logger.debug(f"⏸️ {candidate.stock_code} 빠른 매수 대기: {reason} (점수: {buy_score}/100)")
+                return False
+                
+            else:  # 'reject'
+                reason = buy_decision_result.get('reason', '알 수 없음')
+                logger.debug(f"❌ {candidate.stock_code} 빠른 매수 거부: {reason}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ {candidate.stock_code} 빠른 매수 판단 검증 오류: {e}")
+            # 오류시 기존 방식으로 폴백
+            return await self._validate_detailed_entry_conditions_fallback(candidate, current_data)
+
+    async def _validate_detailed_entry_conditions_fallback(self, candidate: CandleTradeCandidate, current_data: Optional[Any] = None) -> bool:
+        """🔧 기존 세부 진입 조건 검증 (폴백용)"""
         try:
             # 1. 가격 정보 (파라미터로 받거나 API 조회)
             if current_data is None:
@@ -286,7 +328,7 @@ class BuyOpportunityEvaluator:
             return True
 
         except Exception as e:
-            logger.info(f"❌ {candidate.stock_code} 세부 진입 조건 검증 오류: {e}")
+            logger.info(f"❌ {candidate.stock_code} 폴백 진입 조건 검증 오류: {e}")
             return False
 
     def _perform_additional_safety_checks(self, candidate: CandleTradeCandidate, current_price: float, stock_info: Dict) -> bool:
@@ -514,45 +556,49 @@ class BuyOpportunityEvaluator:
             logger.error(f"매수 실행 오류 ({candidate.stock_code}): {e}")
             return False
 
-    async def _save_candle_position_to_db(self, candidate: CandleTradeCandidate, investment_amount: float):
-        """🆕 캔들 전략 매수 정보를 데이터베이스에 저장"""
-        try:
-            if not self.manager.trade_db:
-                logger.debug(f"📚 {candidate.stock_code} DB 없음 - 저장 스킵")
-                return
-
-            # 매수 정보 구성
-            entry_data = {
-                'stock_code': candidate.stock_code,
-                'stock_name': candidate.stock_name,
-                'strategy_type': 'candle_pattern',
-                'entry_price': candidate.performance.entry_price,
-                'entry_quantity': candidate.performance.entry_quantity,
-                'investment_amount': investment_amount,
-                'pattern_type': candidate.detected_patterns[0].pattern_type.value if candidate.detected_patterns else 'unknown',
-                'pattern_strength': candidate.detected_patterns[0].strength if candidate.detected_patterns else 0,
-                'signal_strength': candidate.signal_strength,
-                'entry_priority': candidate.entry_priority,
-                'target_price': candidate.risk_management.target_price,
-                'stop_loss_price': candidate.risk_management.stop_loss_price,
-                'max_holding_hours': candidate.risk_management.max_holding_hours,
-                'entry_time': datetime.now().isoformat()
-            }
-
-            # 임시로 로그만 출력 (실제 DB 스키마에 따라 구현)
-            logger.info(f"📚 {candidate.stock_code} 캔들 전략 매수 정보 DB 저장 대상")
-            logger.debug(f"매수 정보: {entry_data}")
-
-            # 🆕 메타데이터에 DB 저장 정보 기록
-            candidate.metadata['db_saved'] = True
-            candidate.metadata['original_entry_source'] = 'candle_strategy'
-            candidate.metadata['entry_timestamp'] = entry_data['entry_time']
-
-        except Exception as e:
-            logger.warning(f"⚠️ {candidate.stock_code} 캔들 전략 매수 DB 저장 오류: {e}")
-            # DB 저장 실패해도 거래는 계속 진행
 
     # ========== 🆕 진입 조건 체크 ==========
+
+    def should_update_buy_signal(self, candidate: CandleTradeCandidate, analysis_result: Dict) -> bool:
+        """🚀 매수 신호 업데이트 필요 여부 판단 - quick_buy_decision용"""
+        try:
+            buy_decision = analysis_result['buy_decision']
+            buy_score = analysis_result.get('buy_score', 50)
+            
+            # 매수 결정을 TradeSignal로 변환
+            if buy_decision == 'buy':
+                new_signal = TradeSignal.STRONG_BUY if buy_score >= 85 else TradeSignal.BUY
+            elif buy_decision == 'wait':
+                new_signal = TradeSignal.HOLD
+            else:  # 'reject'
+                new_signal = TradeSignal.HOLD
+
+            # 1. 신호 종류가 변경된 경우
+            signal_changed = new_signal != candidate.trade_signal
+            if signal_changed:
+                logger.debug(f"🚀 {candidate.stock_code} 매수 신호 변경: {candidate.trade_signal.value} → {new_signal.value}")
+                return True
+
+            # 2. 점수 변화 체크 (매수 신호는 더 민감하게)
+            score_diff = abs(buy_score - candidate.signal_strength)
+            
+            # 매수 신호에서는 10점 차이로 민감하게 반응
+            if score_diff >= 10:
+                logger.debug(f"🚀 {candidate.stock_code} 매수 점수 변화: {candidate.signal_strength} → {buy_score} (차이:{score_diff:.1f})")
+                return True
+
+            # 3. 매수 결정 변화 (buy_decision이 바뀐 경우)
+            prev_decision = getattr(candidate, '_last_buy_decision', None)
+            if prev_decision != buy_decision:
+                candidate._last_buy_decision = buy_decision
+                logger.debug(f"🚀 {candidate.stock_code} 매수 결정 변화: {prev_decision} → {buy_decision}")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"매수 신호 업데이트 판단 오류: {e}")
+            return False
 
     async def check_entry_conditions(self, candidate: CandleTradeCandidate,
                                    current_info: Dict, daily_data: Optional[Any] = None):

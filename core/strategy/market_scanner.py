@@ -248,34 +248,6 @@ class MarketScanner:
             logger.error(f"전체 스크리닝 배치 처리 오류: {e}")
             return [None] * len(stock_codes)
 
-    async def process_stock_batch(self, stock_codes: List[str], market_name: str) -> List[Optional[CandleTradeCandidate]]:
-        """주식 배치 병렬 처리"""
-        import asyncio
-
-        try:
-            # 배치 내 모든 종목을 비동기로 동시 처리
-            tasks = [
-                self.analyze_stock_for_patterns(stock_code, market_name)
-                for stock_code in stock_codes
-            ]
-
-            # 모든 작업이 완료될 때까지 대기
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # 성공한 결과만 필터링
-            valid_results = []
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.debug(f"종목 {stock_codes[i]} 분석 실패: {result}")
-                    valid_results.append(None)
-                else:
-                    valid_results.append(result)
-
-            return valid_results
-
-        except Exception as e:
-            logger.error(f"배치 처리 오류: {e}")
-            return [None] * len(stock_codes)
 
     async def analyze_stock_for_patterns(self, stock_code: str, market_name: str) -> Optional[CandleTradeCandidate]:
         """개별 종목 패턴 분석"""
@@ -583,7 +555,7 @@ class MarketScanner:
                 except Exception:
                     return None  # 빠른 실패
 
-            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 20:
+            if ohlcv_data is None or ohlcv_data.empty or len(ohlcv_data) < 10:
                 return None
 
             # 🚀 5. 거래량 필터링 (빠른 체크)

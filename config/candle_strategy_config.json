@@ -116,8 +116,9 @@
         "portfolio_usage_ratio": 0.2,
         "min_cash_threshold": 500000,
         "max_portfolio_limit": 3000000,
-        "default_investment": 800000,
-        "min_investment": 500000
+        "default_investment": 1000000,
+        "min_investment": 1000000,
+        "comment": "최소 투자금 100만원으로 상향 - 수수료 효율성 및 포지션 관리 최적화"
     },
     "intraday_analysis": {
         "enabled": true,
@@ -182,8 +183,45 @@
         "min_strong_buy_score": 85,
         "min_pattern_strength": 70,
         "min_pattern_confidence": 0.65,
+        "min_quick_buy_score": 75,
         "max_daily_trades": 5,
         "comment": "매수 신호 생성 임계값 설정"
+    },
+    "entry_timing": {
+        "max_price_diff_from_open": 2.0,
+        "preferred_price_diff_from_open": 1.0,
+        "timing_score_weights": {
+            "excellent": 30,
+            "good": 20,
+            "fair": 10,
+            "poor": 0
+        },
+        "comment": "시가 근처 매수 조건 설정 (시가 대비 ±2% 이내)"
+    },
+    "pattern_validity": {
+        "max_age_hours": 24,
+        "min_confidence_threshold": 0.65,
+        "min_strength_threshold": 70,
+        "check_pattern_completion": true,
+        "comment": "기존 패턴 유효성 검증 조건"
+    },
+    "quick_buy_decision": {
+        "enabled": true,
+        "use_cached_ohlcv": true,
+        "fallback_to_comprehensive": true,
+        "score_weights": {
+            "pattern_confidence": 20,
+            "pattern_strength": 20,
+            "timing_quality": 30,
+            "signal_strength": 20,
+            "entry_priority": 10
+        },
+        "performance_optimization": {
+            "skip_intraday_analysis": true,
+            "use_current_data_only": true,
+            "minimal_api_calls": true
+        },
+        "comment": "빠른 매수 판단 설정 - 장전 패턴분석 + 현재가격 기반"
     },
     "market_condition_adjustments": {
         "comment": "시장 상황에 따른 매매 전략 조정",
