@@ -444,10 +444,7 @@ class CandleTradeManager:
             # 5. 매수 체결 시간 설정
             self._setup_buy_execution_time(candidate)
 
-            # 6. 🆕 candle_trades 테이블에 기존 보유 종목 ENTRY 기록 생성
-            await self._save_existing_holding_to_candle_trades(candidate, buy_price, quantity)
-
-            # 7. stock_manager에 추가
+            # 6. stock_manager에 추가
             success = self.stock_manager.add_candidate(candidate)
 
             if success:
@@ -462,9 +459,21 @@ class CandleTradeManager:
             return False
 
     async def _analyze_holding_candle_patterns(self, stock_code: str, stock_name: str, current_price: float) -> Optional[Dict]:
-        """🔄 기존 보유 종목의 실시간 캔들 패턴 분석 (🆕 캐싱 활용)"""
+        """🔄 기존 보유 종목의 패턴 정보 분석 - DB에서 읽어오거나 기본값 반환"""
         try:
-            logger.debug(f"🔄 {stock_code} 실시간 캔들 패턴 분석 시작")
+            logger.debug(f"🔄 {stock_code} 보유 종목 패턴 정보 분석 시작")
+
+            # 🆕 1단계: DB에서 기존 매수 패턴 정보 조회
+            db_pattern_info = await self._get_pattern_info_from_db(stock_code)
+            if db_pattern_info:
+                pattern_type = db_pattern_info.get('strongest_pattern', {}).get('type', 'UNKNOWN')
+                confidence = db_pattern_info.get('strongest_pattern', {}).get('confidence', 0.5)
+                logger.info(f"📚 {stock_code} DB에서 패턴 정보 복원: {pattern_type} "
+                           f"(신뢰도: {confidence:.2f})")
+                return db_pattern_info
+
+            # 🆕 2단계: DB에 정보가 없으면 OHLCV 데이터 캐싱만 수행
+            logger.debug(f"📊 {stock_code} DB에 패턴 정보 없음 - 캐싱 후 기본값 반환")
 
             # 🆕 기존 _all_stocks에서 캐시된 데이터 확인
             ohlcv_data = None
@@ -474,7 +483,7 @@ class CandleTradeManager:
                 if ohlcv_data is not None:
                     logger.debug(f"📄 {stock_code} 캐시된 일봉 데이터 사용")
 
-            # 캐시에 없으면 API 호출
+            # 캐시에 없으면 API 호출해서 캐싱만 수행
             if ohlcv_data is None:
                 from ..api.kis_market_api import get_inquire_daily_itemchartprice
                 ohlcv_data = get_inquire_daily_itemchartprice(
@@ -489,45 +498,98 @@ class CandleTradeManager:
                     self.stock_manager._all_stocks[stock_code].cache_ohlcv_data(ohlcv_data)
                     logger.debug(f"📥 {stock_code} 일봉 데이터 조회 및 캐싱 완료")
 
-            if ohlcv_data is None or ohlcv_data.empty:
-                logger.debug(f"❌ {stock_code} OHLCV 데이터 조회 실패")
-                return None
-
-            # 캔들 패턴 분석
-            pattern_result : List[CandlePatternInfo] = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
-
-            if not pattern_result or len(pattern_result) == 0:
-                logger.debug(f"❌ {stock_code} 캔들 패턴 감지 실패")
-                return None
-
-            # 가장 강한 패턴 선택
-            strongest_pattern = max(pattern_result, key=lambda p: p.strength)
-
-            # 매매 신호 생성
-            trade_signal, signal_strength = self._generate_trade_signal_from_patterns(pattern_result)
-
-            result = {
-                'patterns_detected': True,
-                'patterns': pattern_result,
-                'strongest_pattern': {
-                    'type': strongest_pattern.pattern_type.value,
-                    'strength': strongest_pattern.strength,
-                    'confidence': strongest_pattern.confidence,
-                    'description': strongest_pattern.description
-                },
-                'trade_signal': trade_signal,
-                'signal_strength': signal_strength,
-                'analysis_time': datetime.now().isoformat()
-            }
-
-            logger.info(f"✅ {stock_code} 캔들 패턴 분석 완료: {strongest_pattern.pattern_type.value} "
-                       f"(강도: {strongest_pattern.strength}, 신뢰도: {strongest_pattern.confidence:.2f})")
-
-            return result
+            # 🆕 3단계: 기본값 반환 (실시간 분석 생략)
+            logger.info(f"⚠️ {stock_code} 패턴 정보 없음 - 기본값 반환")
+            return self._get_default_pattern_info(stock_code, stock_name, current_price)
 
         except Exception as e:
-            logger.error(f"❌ {stock_code} 캔들 패턴 분석 오류: {e}")
+            logger.error(f"❌ {stock_code} 패턴 정보 분석 오류: {e}")
+            # 오류시에도 기본값 반환
+            return self._get_default_pattern_info(stock_code, stock_name, current_price)
+
+    async def _get_pattern_info_from_db(self, stock_code: str) -> Optional[Dict]:
+        """🏛️ DB에서 종목의 매수 패턴 정보 조회"""
+        try:
+            # 최근 매수 거래에서 패턴 정보 조회
+            recent_buy_trade = self.trade_db.get_trade_history(
+                stock_code=stock_code, 
+                days=5,  # 최근 5일 
+                trade_type='BUY'
+            )
+            
+            if not recent_buy_trade:
+                return None
+            
+            # 가장 최근 매수 거래
+            latest_trade = recent_buy_trade[0]
+            
+            # 패턴 정보가 있는지 확인
+            pattern_type = latest_trade.get('pattern_type')
+            if not pattern_type:
+                return None
+            
+            # 패턴 정보 구성
+            from .candle_trade_candidate import TradeSignal
+            
+            result = {
+                'patterns_detected': True,
+                'patterns': [],  # 실제 패턴 객체는 없지만 호환성 유지
+                'strongest_pattern': {
+                    'type': pattern_type,
+                    'strength': latest_trade.get('pattern_strength', 70),
+                    'confidence': latest_trade.get('pattern_confidence', 0.7),
+                    'description': f"DB에서 복원된 {pattern_type} 패턴"
+                },
+                'trade_signal': TradeSignal.BUY,  # 이미 매수한 상태
+                'signal_strength': latest_trade.get('pattern_strength', 70),
+                'analysis_time': latest_trade.get('timestamp', datetime.now().isoformat()),
+                'source': 'database_restore',
+                'trade_id': latest_trade.get('id'),
+                'rsi_value': latest_trade.get('rsi_value'),
+                'macd_value': latest_trade.get('macd_value'),
+                'volume_ratio': latest_trade.get('volume_ratio')
+            }
+            
+            logger.info(f"📚 {stock_code} DB 패턴 정보 복원 성공: {pattern_type}")
+            return result
+            
+        except Exception as e:
+            logger.debug(f"DB 패턴 정보 조회 오류 ({stock_code}): {e}")
             return None
+
+    def _get_default_pattern_info(self, stock_code: str, stock_name: str, current_price: float) -> Dict:
+        """🔧 기본 패턴 정보 반환 (패턴 감지 실패시)"""
+        try:
+            from .candle_trade_candidate import TradeSignal
+            
+            # 기본 패턴 정보 생성
+            default_result = {
+                'patterns_detected': False,
+                'patterns': [],
+                'strongest_pattern': {
+                    'type': 'UNKNOWN',
+                    'strength': 50,
+                    'confidence': 0.5,
+                    'description': '패턴 정보 없음 - 기본 설정 적용'
+                },
+                'trade_signal': TradeSignal.HOLD,
+                'signal_strength': 50,
+                'analysis_time': datetime.now().isoformat(),
+                'source': 'default_fallback'
+            }
+            
+            logger.info(f"🔧 {stock_code} 기본 패턴 정보 적용")
+            return default_result
+            
+        except Exception as e:
+            logger.error(f"기본 패턴 정보 생성 오류: {e}")
+            # 최소한의 정보라도 반환
+            return {
+                'patterns_detected': False,
+                'patterns': [],
+                'strongest_pattern': {'type': 'UNKNOWN', 'strength': 50, 'confidence': 0.5},
+                'source': 'error_fallback'
+            }
 
     def _generate_trade_signal_from_patterns(self, patterns: List[CandlePatternInfo]) -> Tuple:
         """패턴 목록에서 매매 신호 생성 - candle_analyzer로 위임"""
@@ -1774,102 +1836,3 @@ class CandleTradeManager:
 
         except Exception as e:
             logger.error(f"❌ {candidate.stock_code} 주문 취소 처리 오류: {e}")
-
-    async def _save_existing_holding_to_candle_trades(self, candidate: CandleTradeCandidate, 
-                                                    buy_price: float, quantity: int):
-        """🆕 기존 보유 종목을 candle_trades 테이블에 ENTRY 기록으로 저장"""
-        try:
-            if not self.trade_db:
-                logger.debug(f"📚 {candidate.stock_code} DB 없음 - 기존 보유 candle_trades 저장 스킵")
-                return
-
-            # candidate_id 찾기 또는 생성
-            candidate_id = candidate.metadata.get('db_id')
-            
-            if not candidate_id:
-                # candle_candidates 테이블에 기록이 없으면 생성
-                pattern_type = 'existing_holding'
-                if candidate.detected_patterns and len(candidate.detected_patterns) > 0:
-                    pattern_type = candidate.detected_patterns[0].pattern_type.value
-
-                candidate_id = self.trade_db.record_candle_candidate(
-                    stock_code=candidate.stock_code,
-                    stock_name=candidate.stock_name,
-                    current_price=int(candidate.current_price),
-                    pattern_type=pattern_type,
-                    pattern_strength=candidate.detected_patterns[0].strength if candidate.detected_patterns else 0.5,
-                    signal_strength='MEDIUM',
-                    entry_reason='기존 보유 종목 (프로그램 시작 시 감지)',
-                    risk_score=50,  # 중간 위험도
-                    target_price=int(buy_price * 1.05),  # 5% 목표
-                    stop_loss_price=int(buy_price * 0.95)  # 5% 손절
-                )
-                
-                if candidate_id > 0:
-                    candidate.metadata['db_id'] = candidate_id
-                    logger.info(f"📚 {candidate.stock_code} candle_candidates 기록 생성 완료 (ID: {candidate_id})")
-                else:
-                    logger.warning(f"⚠️ {candidate.stock_code} candle_candidates 기록 생성 실패")
-                    return
-
-            # 패턴 정보 추출
-            pattern_matched = 'existing_holding'
-            if candidate.detected_patterns and len(candidate.detected_patterns) > 0:
-                pattern_matched = candidate.detected_patterns[0].pattern_type.value
-
-            # 매수 체결 시간 (추정 또는 실제)
-            buy_execution_time = candidate.performance.buy_execution_time or datetime.now(self.korea_tz)
-
-            # candle_trades 테이블에 ENTRY 기록 저장
-            trade_id = self.trade_db.record_candle_trade(
-                candidate_id=candidate_id,
-                trade_type='ENTRY',
-                stock_code=candidate.stock_code,
-                stock_name=candidate.stock_name,
-                quantity=quantity,
-                price=int(buy_price),
-                total_amount=int(buy_price * quantity),
-                decision_reason='기존 보유 종목 (프로그램 시작 시 기록)',
-                pattern_matched=pattern_matched,
-                order_id='EXISTING_HOLDING',  # 기존 보유 종목 식별자
-                entry_price=int(buy_price),
-                profit_loss=0,
-                profit_rate=0.0,
-                hold_duration=0,
-                market_condition='NORMAL',
-                rsi_value=candidate.metadata.get('technical_indicators', {}).get('rsi'),
-                macd_value=candidate.metadata.get('technical_indicators', {}).get('macd'),
-                volume_ratio=candidate.metadata.get('technical_indicators', {}).get('volume_ratio')
-            )
-
-            if trade_id > 0:
-                logger.info(f"📚 {candidate.stock_code} 기존 보유 candle_trades ENTRY 기록 완료 (ID: {trade_id})")
-                candidate.metadata['candle_trade_entry_id'] = trade_id
-                
-                # candle_candidates 상태를 ENTERED로 업데이트
-                if candidate_id:
-                    try:
-                        # 상태 업데이트를 위한 직접 SQL 실행
-                        with self.trade_db._get_connection() as conn:
-                            cursor = conn.cursor()
-                            korea_tz = timezone(timedelta(hours=9))
-                            current_time_kr = datetime.now(korea_tz).strftime('%Y-%m-%d %H:%M:%S')
-                            
-                            cursor.execute("""
-                                UPDATE candle_candidates SET
-                                    status = 'ENTERED', 
-                                    executed_at = ?,
-                                    updated_at = ?
-                                WHERE id = ?
-                            """, (current_time_kr, current_time_kr, candidate_id))
-                            
-                            logger.debug(f"📚 {candidate.stock_code} candle_candidates 상태 ENTERED로 업데이트")
-                    except Exception as e:
-                        logger.warning(f"⚠️ {candidate.stock_code} candle_candidates 상태 업데이트 실패: {e}")
-            else:
-                logger.warning(f"⚠️ {candidate.stock_code} 기존 보유 candle_trades 저장 실패")
-
-        except Exception as e:
-            logger.error(f"❌ {candidate.stock_code} 기존 보유 candle_trades 저장 오류: {e}")
-            import traceback
-            logger.error(f"❌ 상세 오류:\n{traceback.format_exc()}")

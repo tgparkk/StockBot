@@ -860,7 +860,7 @@ class SellPositionManager:
             holding_minutes = holding_hours * 60
 
             # 1. 긴급 상황 체크 (최소 보유시간 무시)
-            emergency_check = self._check_emergency_conditions(position)
+            emergency_check = self.manager.candle_analyzer._check_emergency_conditions(position)
             if emergency_check['is_emergency']:
                 logger.warning(f"🚨 {position.stock_code} 긴급상황 감지 - 최소시간 무시: {emergency_check['reason']}")
                 return {'can_exit': True, 'reason': 'emergency', 'detail': emergency_check['reason']}
@@ -954,7 +954,7 @@ class SellPositionManager:
             # 오류시 기본 패턴별 최소시간 반환
             return self._get_pattern_min_holding_time(position)
 
-    # 🆕 긴급 상황 체크는 candle_analyzer로 통합됨 (중복 제거)
+
 
     def _get_pattern_min_holding_time(self, position: CandleTradeCandidate) -> float:
         """패턴별 최소 보유시간 가져오기 (분 단위)"""
