@@ -1837,35 +1837,3 @@ class CandleAnalyzer:
         except Exception as e:
             logger.error(f"최소 보유시간 체크 오류: {e}")
             return {'can_exit': True, 'reason': 'error', 'detail': str(e)}
-
-    def fix_existing_holdings_max_hours(self, stock_manager) -> int:
-        """🔧 기존 보유 종목들의 잘못된 max_holding_hours 수정"""
-        try:
-            fixed_count = 0
-            
-            if not hasattr(stock_manager, '_all_stocks'):
-                return 0
-                
-            for stock_code, candidate in stock_manager._all_stocks.items():
-                if (candidate.status == CandleStatus.ENTERED and 
-                    candidate.risk_management and 
-                    candidate.risk_management.max_holding_hours <= 0):
-                    
-                    # 패턴별 올바른 max_holding_hours 계산
-                    _, _, correct_max_hours, _ = self._get_pattern_based_target(candidate)
-                    
-                    # 수정 적용
-                    old_hours = candidate.risk_management.max_holding_hours
-                    candidate.risk_management.max_holding_hours = correct_max_hours
-                    
-                    logger.info(f"🔧 {stock_code} max_holding_hours 수정: {old_hours}h → {correct_max_hours}h")
-                    fixed_count += 1
-            
-            if fixed_count > 0:
-                logger.info(f"✅ 총 {fixed_count}개 종목의 max_holding_hours 수정 완료")
-            
-            return fixed_count
-            
-        except Exception as e:
-            logger.error(f"기존 보유 종목 max_holding_hours 수정 오류: {e}")
-            return 0

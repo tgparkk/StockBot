@@ -51,6 +51,7 @@
     "max_holding_hours": 72,
     "min_holding_minutes": 1440,
     "emergency_stop_loss_pct": 5.0,
+    "validate_actual_holding_before_sell": false,
     "min_holding_override_conditions": {
         "high_profit_target": 2.0,
         "pattern_reversal": true,
@@ -74,7 +75,7 @@
         "bullish_engulfing": {
             "target": 3.0,
             "stop": 2.0,
-            "max_hours": 60,
+            "max_hours": 48,
             "min_minutes": 1440,
             "description": "상승장악형: 데이트레이딩 지향, 24시간 최소 보유"
         }

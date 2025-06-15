@@ -32,25 +32,6 @@ class BuyOpportunityEvaluator:
         try:
             # 🔍 전체 종목 상태 분석
             all_stocks = self.manager.stock_manager._all_stocks.values()
-            #status_summary = {}
-            #ready_status_summary = {}
-
-            #for candidate in all_stocks:
-            #    status = candidate.status.value
-            #    status_summary[status] = status_summary.get(status, 0) + 1
-
-                # is_ready_for_entry() 결과 분석
-            #    is_ready = candidate.is_ready_for_entry()
-            #    ready_key = f"{status}_ready={is_ready}"
-            #    ready_status_summary[ready_key] = ready_status_summary.get(ready_key, 0) + 1
-
-                # BUY_READY 상태인 종목 상세 정보
-                #if status == "BUY_READY":
-                #    logger.info(f"🔍 {candidate.stock_code} BUY_READY 상태: is_ready={is_ready}, "
-                #               f"신호={candidate.trade_signal.value}, 강도={candidate.signal_strength}")
-
-            # logger.info(f"📊 전체 종목 상태: {status_summary}")
-            # logger.info(f"📊 준비 상태 분석: {ready_status_summary}")
 
             # 🎯 매수 준비 상태인 종목들만 필터링 (이미 모든 검증 완료됨) + 중복 주문 방지
             buy_ready_candidates = []
