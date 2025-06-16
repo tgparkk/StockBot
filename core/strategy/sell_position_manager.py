@@ -181,130 +181,49 @@ class SellPositionManager:
         except Exception as e:
             logger.error(f"개별 포지션 관리 오류 ({position.stock_code}): {e}")
 
-    def _get_pattern_based_target(self, position: CandleTradeCandidate) -> Tuple[float, float, int, bool]:
-        """🎯 캔들 패턴별 수익률 목표, 손절, 시간 설정 결정 (패턴 우선)"""
-        try:
-            # 🔍 디버깅: 각 조건 값 확인
-            restored_from_db = position.metadata.get('restored_from_db', False)
-            original_entry_source = position.metadata.get('original_entry_source')
-            detected_patterns_count = len(position.detected_patterns)
-
-            # 1. 캔들 전략으로 매수한 종목인지 확인
-            is_candle_strategy = (
-                restored_from_db or  # DB에서 복원됨
-                original_entry_source == 'candle_strategy' or  # 캔들 전략 매수
-                detected_patterns_count > 0  # 패턴 정보가 있음
-            )
-
-            if not is_candle_strategy:
-                # 수동/앱 매수 종목: 큰 수익/손실 허용 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
-                logger.warning(f"⚠️ {position.stock_code} 패턴 미발견 매수 종목으로 분류됨 - 기본 설정 적용")
-                logger.warning(f"   모든 조건이 False: restored_from_db={restored_from_db}, "
-                             f"original_entry_source={original_entry_source}, patterns={detected_patterns_count}")
-                return 3.0, 3.0, 24, False
-
-            # 2. 🔄 실시간 캔들 패턴 재분석 (🆕 캐싱 활용)
-            original_pattern = None
-
-            # 🆕 캐시된 일봉 데이터 우선 사용
-            ohlcv_data = position.get_ohlcv_data()
-
-            if ohlcv_data is None:
-                # 캐시에 없으면 API 호출
-                try:
-                    from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                    ohlcv_data = get_inquire_daily_itemchartprice(
-                        output_dv="2",
-                        itm_no=position.stock_code,
-                        period_code="D",
-                        adj_prc="1"
-                    )
-
-                    # 🆕 조회 성공시 캐싱
-                    if ohlcv_data is not None and not ohlcv_data.empty:
-                        position.cache_ohlcv_data(ohlcv_data)
-                        #logger.debug(f"📥 {position.stock_code} 일봉 데이터 조회 및 캐싱 완료")
-                    else:
-                        logger.debug(f"❌ {position.stock_code} 일봉 데이터 조회 실패")
-
-                except Exception as e:
-                    logger.debug(f"일봉 데이터 조회 오류 ({position.stock_code}): {e}")
-                    ohlcv_data = None
-            else:
-                logger.debug(f"📄 {position.stock_code} 캐시된 일봉 데이터 사용")
-
-            # 🆕 실시간 캔들 패턴 분석 (캐시된 데이터 활용)
-            if ohlcv_data is not None and not ohlcv_data.empty:
-                try:
-                    pattern_result = self.manager.pattern_detector.analyze_stock_patterns(position.stock_code, ohlcv_data)
-                    if pattern_result and len(pattern_result) > 0:
-                        strongest_pattern = max(pattern_result, key=lambda p: p.strength)
-                        original_pattern = strongest_pattern.pattern_type.value
-                        #logger.debug(f"🔄 {position.stock_code} 실시간 패턴 분석: {original_pattern} (강도: {strongest_pattern.strength})")
-                except Exception as e:
-                    logger.debug(f"패턴 분석 오류 ({position.stock_code}): {e}")
-
-            # DB에서 복원된 경우 (백업)
-            if not original_pattern and 'original_pattern_type' in position.metadata:
-                original_pattern = position.metadata['original_pattern_type']
-                logger.debug(f"📚 {position.stock_code} DB에서 패턴 복원: {original_pattern}")
-
-            # 기존 패턴 정보 활용 (백업)
-            elif not original_pattern and position.detected_patterns and len(position.detected_patterns) > 0:
-                strongest_pattern = max(position.detected_patterns, key=lambda p: p.strength)
-                original_pattern = strongest_pattern.pattern_type.value
-                logger.debug(f"📊 {position.stock_code} 기존 패턴 정보 활용: {original_pattern}")
-
-            # 3. 🎯 패턴별 설정이 RiskManagement보다 우선 적용
-            if original_pattern:
-                # 패턴명을 소문자로 변환하여 config에서 조회
-                pattern_key = original_pattern.lower().replace('_', '_')
-                pattern_config = self.manager.config['pattern_targets'].get(pattern_key)
-
-                if pattern_config:
-                    target_pct = pattern_config['target']
-                    stop_pct = pattern_config['stop']
-                    max_hours = pattern_config['max_hours']  # 🎯 패턴별 시간이 RiskManagement보다 우선
-
-                    # 🆕 morning_star 패턴 특별 로깅
-                    if pattern_key == 'morning_star':
-                        logger.info(f"⭐ {position.stock_code} Morning Star 패턴 감지: "
-                                   f"목표{target_pct}%, 손절{stop_pct}%, 96시간(4일) 보유")
-
-                        # 🎯 RiskManagement의 max_holding_hours 무시하고 패턴 설정 우선 적용
-                        if position.risk_management and position.risk_management.max_holding_hours != 96:
-                            logger.info(f"📝 {position.stock_code} RiskManagement 시간 설정 재정의: "
-                                       f"{position.risk_management.max_holding_hours}h → 96h (Morning Star 우선)")
-                            # RiskManagement 값도 업데이트
-                            position.risk_management.max_holding_hours = 96
-
-                    logger.debug(f"📊 {position.stock_code} 패턴 '{original_pattern}' - "
-                                f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
-                    return target_pct, stop_pct, max_hours, True
-                else:
-                    return 3.0, 3.0, 12, True
-
-            # 4. 기본값: 캔들 전략이지만 패턴 정보 없음 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
-            logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용")
-            return 3.0, 3.0, 12, True
-
-        except Exception as e:
-            logger.error(f"패턴별 설정 결정 오류 ({position.stock_code}): {e}")
-            # 오류시 안전하게 기본값 반환 (🎯 3% 목표, 3% 손절) - 사용자 수정 반영
-            return 3.0, 3.0, 24, False
-
-    def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
-        """🆕 패턴별 시간 청산 조건 체크 - CandleAnalyzer로 위임"""
-        try:
-            # CandleAnalyzer의 동일한 함수로 위임
-            return self.manager.candle_analyzer._should_time_exit_pattern_based(position, max_hours)
-        except Exception as e:
-            logger.error(f"❌ {position.stock_code} 패턴별 시간 청산 체크 오류: {e}")
-            return False
-
     async def _execute_exit(self, position: CandleTradeCandidate, exit_price: float, reason: str) -> bool:
         """매도 청산 실행 - 간소화된 버전"""
         try:
+            # 🆕 사전 체크: 이미 EXITED 상태이거나 체결 완료 확인된 종목은 스킵
+            if position.status == CandleStatus.EXITED or position.metadata.get('final_exit_confirmed', False):
+                logger.debug(f"⏭️ {position.stock_code} 이미 매도 완료 - 실행 생략")
+                return False
+            
+            # 🆕 실제 보유 여부 사전 체크 (API 오류 방지)
+            try:
+                from ..api.kis_market_api import get_existing_holdings
+                holdings = get_existing_holdings()
+                
+                actual_holding = False
+                actual_quantity = 0
+                
+                if holdings:
+                    for holding in holdings:
+                        if holding.get('stock_code') == position.stock_code:
+                            actual_quantity = holding.get('quantity', 0)
+                            if actual_quantity > 0:
+                                actual_holding = True
+                            break
+                
+                if not actual_holding or actual_quantity <= 0:
+                    logger.warning(f"⚠️ {position.stock_code} 실제 보유 없음 (보유수량: {actual_quantity}) - EXITED 상태로 변경")
+                    position.status = CandleStatus.EXITED
+                    position.metadata['auto_exit_reason'] = '실제보유없음_자동종료'
+                    position.metadata['final_exit_confirmed'] = True
+                    self.manager.stock_manager.update_candidate(position)
+                    return False
+                    
+                # 수량 불일치 확인
+                system_quantity = position.performance.entry_quantity or 0
+                if actual_quantity != system_quantity:
+                    logger.warning(f"⚠️ {position.stock_code} 수량 불일치: 시스템={system_quantity}주, 실제={actual_quantity}주")
+                    # 실제 수량으로 업데이트
+                    position.performance.entry_quantity = actual_quantity
+                    
+            except Exception as e:
+                logger.debug(f"실제 보유 확인 오류 ({position.stock_code}): {e}")
+                # API 오류시에도 계속 진행 (기존 로직 유지)
+
             # 🕐 거래 시간 체크
             current_time = datetime.now().time()
             trading_start = datetime.strptime(self.manager.config['trading_start_time'], '%H:%M').time()
@@ -349,6 +268,16 @@ class SellPositionManager:
                     result = self.manager.trade_executor.execute_sell_signal(signal)
                     if not result.success:
                         logger.error(f"❌ 매도 주문 실패: {stock_code} - {result.error_message}")
+                        
+                        # 🆕 특정 오류 코드에 대한 자동 처리
+                        error_msg = result.error_message or ""
+                        if "주문 가능한 수량을 초과" in error_msg or "APBK0400" in error_msg:
+                            logger.warning(f"⚠️ {stock_code} 이미 매도 완료된 것으로 추정 - EXITED 상태로 변경")
+                            position.status = CandleStatus.EXITED
+                            position.metadata['auto_exit_reason'] = '주문수량초과오류_자동종료'
+                            position.metadata['final_exit_confirmed'] = True
+                            self.manager.stock_manager.update_candidate(position)
+                        
                         return False
 
                     # 매도 주문 성공시 PENDING_ORDER 상태로 변경
@@ -371,7 +300,7 @@ class SellPositionManager:
             return False
 
         except Exception as e:
-            logger.error(f"❌ 매도 청산 실행 오류 ({position.stock_code}): {e}")
+            logger.error(f"❌ 매도 실행 오류 ({position.stock_code}): {e}")
             return False
 
     def _calculate_safe_sell_price(self, current_price: float, reason: str) -> int:
@@ -453,7 +382,7 @@ class SellPositionManager:
             trend_based_update = self._calculate_trend_based_adjustments(position, current_price, ohlcv_data)
 
             # 🆕 4단계: 종합 판단 및 업데이트
-            self._apply_dynamic_adjustments(position, current_price, pattern_update, profit_based_update, trend_based_update)
+            # self._apply_dynamic_adjustments(position, current_price, pattern_update, profit_based_update, trend_based_update)
 
         except Exception as e:
             logger.error(f"동적 목표/손절 조정 오류 ({position.stock_code}): {e}")
@@ -834,7 +763,7 @@ class SellPositionManager:
 
             if stocks_to_remove:
                 logger.info(f"🧹 조정 이력 정리: {len(stocks_to_remove)}개 종목")
-
+                
         except Exception as e:
             logger.error(f"조정 이력 정리 오류: {e}")
 

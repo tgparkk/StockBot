@@ -342,24 +342,82 @@ class TradeExecutor:
             return 0
 
     def _calculate_buy_price(self, current_price: int) -> int:
-        """간소화된 매수 지정가 계산"""
+        """시가 고려 매수 지정가 계산 - 과도한 고가 매수 방지"""
         try:
-            # 0.2% 프리미엄 적용
-            target_price = int(current_price * (1 + self.buy_premium))
+            # 🆕 시가 정보 조회 시도
+            today_open = self._get_today_open_price_safe(current_price)
+            
+            # 기본 매수가 계산 (현재가 + 0.2% 프리미엄)
+            basic_buy_price = int(current_price * (1 + self.buy_premium))
+            
+            # 🆕 시가 기준 매수가 계산 (시가 + 0.5% 프리미엄)
+            open_based_price = int(today_open * 1.005) if today_open > 0 else basic_buy_price
+            
+            # 🎯 두 가격 중 더 적절한 가격 선택
+            if today_open > 0:
+                # 시가 대비 현재가 상승률 계산
+                price_rise_pct = ((current_price - today_open) / today_open) * 100
+                
+                if price_rise_pct > 1.0:  # 시가 대비 1% 이상 상승
+                    # 급등 상황: 시가 기준 가격과 현재가 기준 가격 중 낮은 것 선택
+                    target_price = min(open_based_price, basic_buy_price)
+                    logger.debug(f"💰 급등 상황 매수가: 시가{today_open:,}원 → 현재가{current_price:,}원 "
+                               f"(+{price_rise_pct:.2f}%) → 주문가{target_price:,}원 (제한적용)")
+                else:
+                    # 정상 상황: 기본 로직 사용
+                    target_price = basic_buy_price
+                    logger.debug(f"💰 정상 상황 매수가: 현재가{current_price:,}원 → 주문가{target_price:,}원")
+            else:
+                # 시가 정보 없음: 기본 로직 사용
+                target_price = basic_buy_price
+                logger.debug(f"💰 시가정보없음 매수가: 현재가{current_price:,}원 → 주문가{target_price:,}원")
 
             # 틱 단위 조정
             final_price = self._adjust_to_tick_size(target_price)
 
-            # 최대 5% 제한 (현재가의 105% 이하)
-            max_buy_price = int(current_price * 1.05)
+            # 🆕 최대 제한 강화 (시가 기준 3% 또는 현재가 기준 2% 중 낮은 것)
+            if today_open > 0:
+                max_price_from_open = int(today_open * 1.03)  # 시가 기준 3%
+                max_price_from_current = int(current_price * 1.02)  # 현재가 기준 2%
+                max_buy_price = min(max_price_from_open, max_price_from_current)
+            else:
+                max_buy_price = int(current_price * 1.02)  # 현재가 기준 2%로 축소
+
             final_price = min(final_price, max_buy_price)
 
-            logger.debug(f"💰 매수가 계산: 현재가{current_price:,}원 → 주문가{final_price:,}원")
+            # 🆕 상세 로깅
+            if today_open > 0:
+                open_diff_pct = ((final_price - today_open) / today_open) * 100
+                current_diff_pct = ((final_price - current_price) / current_price) * 100
+                logger.debug(f"💰 최종 매수가: {final_price:,}원 "
+                           f"(시가대비 {open_diff_pct:+.2f}%, 현재가대비 {current_diff_pct:+.2f}%)")
+            else:
+                current_diff_pct = ((final_price - current_price) / current_price) * 100
+                logger.debug(f"💰 최종 매수가: {final_price:,}원 (현재가대비 {current_diff_pct:+.2f}%)")
+
             return final_price
 
         except Exception as e:
             logger.error(f"매수가 계산 오류: {e}")
-            return int(current_price * 1.002)  # 오류시 0.2% 프리미엄
+            return int(current_price * 1.002)  # 오류시 최소 프리미엄
+
+    def _get_today_open_price_safe(self, current_price: int) -> int:
+        """🆕 안전한 당일 시가 조회"""
+        try:
+            # 캔들 시스템에서 시가 정보 전달받은 경우 사용
+            if hasattr(self, '_cached_open_price') and self._cached_open_price > 0:
+                return self._cached_open_price
+            
+            # 임시: 현재가 기준 추정 (실제로는 API에서 조회)
+            # TODO: KIS API를 통한 실제 시가 조회 구현
+            estimated_open = current_price  # 폴백: 현재가를 시가로 간주
+            
+            logger.debug(f"📊 시가 정보: 추정 시가 {estimated_open:,}원 (현재가 기준)")
+            return estimated_open
+            
+        except Exception as e:
+            logger.debug(f"시가 조회 오류: {e}")
+            return 0  # 실패시 0 반환
 
     def _calculate_sell_price(self, current_price: int) -> int:
         """간소화된 매도 지정가 계산"""

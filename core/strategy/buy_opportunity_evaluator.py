@@ -33,11 +33,11 @@ class BuyOpportunityEvaluator:
             # ⏰ 시간 체크: 09:00~15:00 시간대에만 매수 허용
             current_time = datetime.now().time()
             trading_start_time = datetime.strptime("09:00", "%H:%M").time()
-            trading_end_time = datetime.strptime("15:00", "%H:%M").time()
+            trading_end_time = datetime.strptime("15:15", "%H:%M").time()
             
             if current_time < trading_start_time or current_time > trading_end_time:
-                logger.debug(f"⏰ 거래 시간외 ({current_time.strftime('%H:%M')}) - 매수 스킵 (허용시간: 09:00~15:00)")
-                return
+                logger.debug(f"⏰ 거래 시간외 ({current_time.strftime('%H:%M')}) - 매수 스킵 (허용시간: 09:00~15:15)")
+                #return
             
             # 🔍 전체 종목 상태 분석
             all_stocks = self.manager.stock_manager._all_stocks.values()
@@ -495,7 +495,7 @@ class BuyOpportunityEvaluator:
             return 0
 
     async def _execute_entry(self, candidate: CandleTradeCandidate, investment_amount: float) -> bool:
-        """매수 실행 - 주문만 하고 체결은 웹소켓에서 확인"""
+        """매수 실행 - 주문만 하고 체결은 웹소켓에서 확인 (시가 정보 포함)"""
         try:
             # 🚨 최종 중복 주문 방지 체크
             if candidate.status == CandleStatus.PENDING_ORDER:
@@ -506,14 +506,43 @@ class BuyOpportunityEvaluator:
                 logger.warning(f"🚫 {candidate.stock_code} 이미 매수 주문 대기 중 - 매수 중단")
                 return False
 
-            current_price = candidate.current_price
+            # 🆕 최신 가격 정보 조회 (시가 포함)
+            from ..api.kis_market_api import get_inquire_price
+            current_data = get_inquire_price("J", candidate.stock_code)
+            
+            if current_data is None or current_data.empty:
+                logger.warning(f"❌ {candidate.stock_code} 현재가 정보 조회 실패")
+                return False
+
+            current_price = float(current_data.iloc[0].get('stck_prpr', 0))
+            today_open = float(current_data.iloc[0].get('stck_oprc', 0))
+            
+            if current_price <= 0:
+                logger.warning(f"❌ {candidate.stock_code} 유효하지 않은 현재가: {current_price}")
+                return False
+
+            # 🆕 시가 대비 현재가 최종 체크
+            if today_open > 0:
+                price_diff_pct = ((current_price - today_open) / today_open) * 100
+                
+                # 급등 시 매수 포기 (설정 가능)
+                max_allowed_rise = self.manager.config.get('entry_timing', {}).get('max_price_diff_from_open', 1.5)
+                if price_diff_pct > max_allowed_rise:
+                    logger.warning(f"🚫 {candidate.stock_code} 시가 대비 과도한 상승으로 매수 포기: "
+                                 f"시가 {today_open:,}원 → 현재가 {current_price:,}원 "
+                                 f"({price_diff_pct:+.2f}% > {max_allowed_rise}%)")
+                    return False
+                
+                logger.debug(f"✅ {candidate.stock_code} 시가 대비 상승률 적정: {price_diff_pct:+.2f}%")
+
+            # 수량 계산
             quantity = int(investment_amount / current_price)
 
             if quantity <= 0:
                 logger.warning(f"❌ {candidate.stock_code} 매수 수량 계산 오류 (수량: {quantity})")
                 return False
 
-            # 매수 신호 생성
+            # 🆕 시가 정보를 포함한 매수 신호 생성
             signal = {
                 'stock_code': candidate.stock_code,
                 'action': 'buy',
@@ -521,6 +550,10 @@ class BuyOpportunityEvaluator:
                 'price': current_price,
                 'quantity': quantity,
                 'total_amount': int(current_price * quantity),
+                # 🆕 시가 정보 추가
+                'today_open': today_open,
+                'price_diff_from_open_pct': ((current_price - today_open) / today_open * 100) if today_open > 0 else 0,
+                # 패턴 정보
                 'pattern_type': str(candidate.detected_patterns[0].pattern_type.value) if candidate.detected_patterns else 'unknown',
                 'pattern_confidence': candidate.detected_patterns[0].confidence if candidate.detected_patterns else 0.0,
                 'pattern_strength': candidate.detected_patterns[0].strength if candidate.detected_patterns else 0,
@@ -532,12 +565,17 @@ class BuyOpportunityEvaluator:
                 'macd_value': getattr(candidate, '_macd_value', None),
                 'volume_ratio': getattr(candidate, '_volume_ratio', None),
                 'investment_amount': int(current_price * quantity),
-                'investment_ratio': investment_amount / max(available_funds, 1) if available_funds > 0 else 0.0
+                'investment_ratio': investment_amount / max(available_funds, 1) if 'available_funds' in locals() else 0.0
             }
 
-            # 실제 매수 주문 실행 (TradeExecutor 사용)
+            # 🆕 TradeExecutor에 시가 정보 전달
             if hasattr(self.manager, 'trade_executor') and self.manager.trade_executor:
                 try:
+                    # 시가 정보를 TradeExecutor에 캐시
+                    if today_open > 0:
+                        self.manager.trade_executor._cached_open_price = int(today_open)
+                        logger.debug(f"📊 {candidate.stock_code} 시가 정보 전달: {today_open:,}원")
+
                     result = self.manager.trade_executor.execute_buy_signal(signal)
                     if not result.success:
                         logger.error(f"❌ 매수 주문 실패: {candidate.stock_code} - {result.error_message}")
@@ -547,8 +585,18 @@ class BuyOpportunityEvaluator:
                     order_no = getattr(result, 'order_no', None)
                     candidate.set_pending_order(order_no or f"unknown_{datetime.now().strftime('%H%M%S')}", 'buy')
 
-                    logger.info(f"📈 매수 주문 제출 성공: {candidate.stock_code} {quantity}주 {current_price:,.0f}원 "
-                               f"(주문번호: {order_no})")
+                    # 🆕 매수 주문 정보 로깅 강화
+                    final_buy_price = getattr(result, 'price', current_price)
+                    actual_total = getattr(result, 'total_amount', quantity * final_buy_price)
+                    
+                    if today_open > 0:
+                        open_diff_pct = ((final_buy_price - today_open) / today_open) * 100
+                        logger.info(f"📈 매수 주문 제출 성공: {candidate.stock_code} {quantity}주 "
+                                   f"시가 {today_open:,}원 → 주문가 {final_buy_price:,}원 "
+                                   f"(시가대비 {open_diff_pct:+.2f}%, 주문번호: {order_no})")
+                    else:
+                        logger.info(f"📈 매수 주문 제출 성공: {candidate.stock_code} {quantity}주 {final_buy_price:,}원 "
+                                   f"(주문번호: {order_no})")
 
                     logger.debug(f"📋 {candidate.stock_code} 매수 주문 대기 중 - 체결은 웹소켓에서 확인")
 

@@ -123,7 +123,7 @@ class CandleTradeManager:
             logger.info("🕯️ 캔들 기반 매매 시스템 시작")
 
             # 기존 보유 종목 웹소켓 모니터링 설정
-            await self.setup_existing_holdings_monitoring()
+            #await self.setup_existing_holdings_monitoring()
 
             # 거래일 초기화
             await self._initialize_trading_day()
@@ -983,6 +983,15 @@ class CandleTradeManager:
                     if candidate.performance and candidate.performance.pnl_pct is not None:
                         profit_info = f" (수익률: {candidate.performance.pnl_pct:+.2f}%)"
 
+                    # 🆕 웹소켓 구독 해제
+                    if self.websocket_manager and stock_code in self.subscribed_stocks:
+                        try:
+                            await self.websocket_manager.unsubscribe_stock(stock_code)
+                            self.subscribed_stocks.discard(stock_code)
+                            logger.debug(f"📡 {stock_code} 웹소켓 구독 해제 완료")
+                        except Exception as ws_error:
+                            logger.debug(f"웹소켓 구독 해제 오류 ({stock_code}): {ws_error}")
+
                     # _all_stocks에서 제거
                     del self.stock_manager._all_stocks[stock_code]
                     cleanup_count += 1
@@ -994,9 +1003,20 @@ class CandleTradeManager:
 
             if cleanup_count > 0:
                 logger.info(f"🧹 EXITED 종목 정리 완료: {cleanup_count}개 제거 (메모리 절약)")
+                
+                # 🆕 정리 후 상태 로깅
+                remaining_count = len(self.stock_manager._all_stocks)
+                status_summary = {}
+                for candidate in self.stock_manager._all_stocks.values():
+                    status = candidate.status.value
+                    status_summary[status] = status_summary.get(status, 0) + 1
+                
+                logger.debug(f"🔍 정리 후 _all_stocks 상태: {status_summary} (총 {remaining_count}개)")
 
         except Exception as e:
             logger.error(f"❌ EXITED 종목 정리 오류: {e}")
+            import traceback
+            logger.error(f"상세 오류:\n{traceback.format_exc()}")
 
     # ========== 🆕 체결 확인 처리 ==========
 
@@ -1271,24 +1291,41 @@ class CandleTradeManager:
                 if candidate.status not in [CandleStatus.PENDING_ORDER, CandleStatus.EXITED]  # 주문 대기 중이거나 매도 완료된 종목 제외
             ]
 
+            # 🆕 상세 상태별 분석 로깅
+            all_status_count = {}
+            for candidate in self.stock_manager._all_stocks.values():
+                status = candidate.status.value
+                all_status_count[status] = all_status_count.get(status, 0) + 1
+
+            logger.debug(f"🔍 _all_stocks 전체 상태: {all_status_count} (총 {len(self.stock_manager._all_stocks)}개)")
+
             if not all_candidates:
-                logger.debug("📊 평가할 종목이 없습니다")
+                logger.debug("📊 평가할 종목이 없습니다 (PENDING_ORDER, EXITED 제외)")
                 return
 
             # 상태별 분류
             watching_candidates = [c for c in all_candidates if c.status == CandleStatus.WATCHING or c.status == CandleStatus.BUY_READY or c.status == CandleStatus.SCANNING]
             entered_candidates = [c for c in all_candidates if c.status == CandleStatus.ENTERED]
 
-            logger.info(f"🔄 신호 재평가: 관찰{len(watching_candidates)}개, 진입{len(entered_candidates)}개 "
-                       f"(PENDING_ORDER 제외)")
+            # 🆕 상세 디버깅 로깅
+            watching_status_detail = {}
+            for c in watching_candidates:
+                status = c.status.value
+                watching_status_detail[status] = watching_status_detail.get(status, 0) + 1
+
+            logger.debug(f"🔄 신호 재평가 대상: 관찰{len(watching_candidates)}개{watching_status_detail}, 진입{len(entered_candidates)}개")
 
             # 🎯 1. 관찰 중인 종목들 재평가 (우선순위 높음)
             if watching_candidates:
                 logger.debug(f"📊 관찰 중인 종목 재평가: {len(watching_candidates)}개")
+                
+                # 🆕 관찰 종목 상세 정보 로깅
+                for i, c in enumerate(watching_candidates[:5]):  # 처음 5개만 로깅
+                    logger.debug(f"   {i+1}. {c.stock_code}({c.stock_name}): {c.status.value} - 신호:{c.trade_signal.value if c.trade_signal else 'None'}")
 
                 # 🆕 통합된 신호 업데이트 및 상태 전환 처리
                 watch_updated = await self._batch_evaluate_watching_stocks(watching_candidates)
-                logger.debug(f"✅ 관찰 종목 처리 완료: {watch_updated}개")
+                logger.debug(f"✅ 관찰 종목 처리 완료: {watch_updated}개 업데이트")
 
             # 🎯 2. 진입한 종목들 재평가 (매도 신호 중심)
             if entered_candidates:
@@ -1298,6 +1335,8 @@ class CandleTradeManager:
 
         except Exception as e:
             logger.error(f"주기적 신호 재평가 오류: {e}")
+            import traceback
+            logger.error(f"상세 오류:\n{traceback.format_exc()}")
 
     async def _batch_evaluate_watching_stocks(self, candidates: List[CandleTradeCandidate]) -> int:
         """🆕 관찰 중인 종목들 통합 처리 - 신호 업데이트 및 상태 전환"""

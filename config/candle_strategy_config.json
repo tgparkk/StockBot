@@ -178,13 +178,13 @@
         }
     },
     "trading_thresholds": {
-        "min_buy_signal_score": 70,
-        "min_strong_buy_score": 85,
-        "min_pattern_strength": 70,
-        "min_pattern_confidence": 0.65,
-        "min_quick_buy_score": 75,
+        "min_buy_signal_score": 75,
+        "min_strong_buy_score": 90,
+        "min_pattern_strength": 75,
+        "min_pattern_confidence": 0.70,
+        "min_quick_buy_score": 80,
         "max_daily_trades": 5,
-        "comment": "매수 신호 생성 임계값 설정"
+        "comment": "매수 신호 생성 임계값 설정 - 더 엄격한 기준 적용"
     },
     "entry_timing": {
         "max_price_diff_from_open": 2.0,
