@@ -352,7 +352,24 @@ class KISWebSocketMessageHandler:
                     except Exception as simple_parse_error:
                         logger.debug(f"간단 파싱 실패: {simple_parse_error}")
 
-                await self.candle_trade_manager.handle_execution_confirmation(execution_data)
+                # 🆕 체결 확인 처리 실행 (비동기 처리)
+                try:
+                    await self.candle_trade_manager.handle_execution_confirmation(execution_data)
+                    logger.debug("✅ CandleTradeManager 체결 확인 처리 완료")
+                    
+                    # 🆕 매도 체결인 경우 즉시 EXITED 종목 정리 트리거
+                    if (execution_data.get('parsed_success') and 
+                        execution_data.get('order_type') in ['SELL', '매도', '01']):
+                        
+                        stock_code = execution_data.get('stock_code', '')
+                        if stock_code:
+                            logger.info(f"🧹 {stock_code} 매도 체결 완료 - 즉시 정리 트리거")
+                            # cleanup_exited_positions를 백그라운드에서 실행
+                            import asyncio
+                            asyncio.create_task(self.candle_trade_manager.cleanup_exited_positions())
+                            
+                except Exception as handle_error:
+                    logger.error(f"❌ CandleTradeManager 체결 확인 처리 오류: {handle_error}")
             else:
                 logger.debug("💡 CandleTradeManager가 설정되지 않음 - _all_stocks 업데이트 생략")
 

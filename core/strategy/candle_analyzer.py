@@ -407,14 +407,14 @@ class CandleAnalyzer:
 
             # 🆕 매도 신호 분석 상세 로깅
             if focus_on_exit:
-                logger.info(f"🔍 {candidate.stock_code} 매도 신호 분석 완료:")
-                logger.info(f"   📊 포지션 분석: {position_signals.get('signal', 'unknown')} (should_exit: {position_signals.get('should_exit', False)})")
-                logger.info(f"   ⏰ 시간 분석: {pattern_time_signals.get('signal', 'unknown')} (보유: {pattern_time_signals.get('holding_hours', 0):.1f}h)")
-                logger.info(f"   🎯 최종 신호: {final_signal.value} (강도: {signal_strength})")
+                logger.debug(f"🔍 {candidate.stock_code} 매도 신호 분석 완료:")
+                logger.debug(f"   📊 포지션 분석: {position_signals.get('signal', 'unknown')} (should_exit: {position_signals.get('should_exit', False)})")
+                logger.debug(f"   ⏰ 시간 분석: {pattern_time_signals.get('signal', 'unknown')} (보유: {pattern_time_signals.get('holding_hours', 0):.1f}h)")
+                logger.debug(f"   🎯 최종 신호: {final_signal.value} (강도: {signal_strength})")
                 
                 # 24시간 내 보유 종목 특별 로깅
                 if position_signals.get('within_24h', False):
-                    logger.info(f"   ⏰ 24시간 내 보유 종목 - 강제 HOLD 적용됨")
+                    logger.debug(f"   ⏰ 24시간 내 보유 종목 - 강제 HOLD 적용됨")
 
             return {
                 'new_signal': final_signal,
@@ -548,40 +548,81 @@ class CandleAnalyzer:
             return {'passed': False, 'fail_reason': f'체크 오류: {str(e)}'}
 
     def _check_entry_timing_conditions(self, candidate: CandleTradeCandidate, current_price: float, current_data: Any) -> Dict:
-        """⏰ 진입 타이밍 조건 체크 (시가 근처 매수)"""
+        """⏰ 진입 타이밍 조건 체크 (시가 근처 매수) - 강화 버전"""
         try:
             # 오늘 시가 가져오기
             today_open = float(current_data.iloc[0].get('stck_oprc', 0))
             if today_open <= 0:
-                return {'good_timing': False, 'reason': '시가 정보 없음'}
+                return {'good_timing': False, 'reason': '시가 정보 없음', 'today_open': 0}
 
             # 시가 대비 현재가 위치 계산
             price_diff_pct = ((current_price - today_open) / today_open) * 100
 
-            # 🎯 시가 근처 매수 조건 (config에서 설정)
-            max_price_diff_pct = self.config.get('entry_timing', {}).get('max_price_diff_from_open', 2.0)  # 기본 2%
+            # 🎯 더 엄격한 시가 근처 매수 조건
+            max_price_diff_pct = self.config.get('entry_timing', {}).get('max_price_diff_from_open', 1.5)  # 기본 1.5%로 축소
+            excellent_threshold = self.config.get('entry_timing', {}).get('excellent_threshold', 0.5)  # 0.5% 이내는 최우수
+            good_threshold = self.config.get('entry_timing', {}).get('good_threshold', 1.0)  # 1.0% 이내는 양호
             
-            if abs(price_diff_pct) <= max_price_diff_pct:
-                timing_quality = 'excellent' if abs(price_diff_pct) <= 1.0 else 'good'
+            # 🆕 하락시에는 더 관대하게, 상승시에는 더 엄격하게
+            if price_diff_pct > 0:  # 상승한 경우
+                # 상승시에는 더 엄격 (최대 1.0%)
+                max_allowed_pct = min(max_price_diff_pct, 1.0)
+                warning_threshold = 0.8  # 0.8% 이상 상승시 경고
+            else:  # 하락한 경우  
+                # 하락시에는 더 관대 (최대 2.0%)
+                max_allowed_pct = max(max_price_diff_pct, 2.0)
+                warning_threshold = 1.5  # 1.5% 이상 하락시 경고
+
+            # 📊 타이밍 품질 평가
+            abs_diff = abs(price_diff_pct)
+            
+            if abs_diff <= excellent_threshold:
+                timing_quality = 'excellent'
+                timing_score = 100
+            elif abs_diff <= good_threshold:
+                timing_quality = 'good'  
+                timing_score = 80
+            elif abs_diff <= max_allowed_pct:
+                timing_quality = 'acceptable'
+                timing_score = 60
+            else:
+                timing_quality = 'poor'
+                timing_score = 20
+
+            # 🚨 매수 가능 여부 최종 판단
+            if abs_diff <= max_allowed_pct:
+                reason = f'시가 근처 매수 가능 (시가대비 {price_diff_pct:+.2f}%)'
+                
+                # 🆕 경고 메시지 추가
+                if price_diff_pct > warning_threshold:
+                    reason += f' [주의: 시가 대비 {price_diff_pct:.2f}% 상승]'
+                elif price_diff_pct < -warning_threshold:
+                    reason += f' [하락 진입: 시가 대비 {price_diff_pct:.2f}% 하락]'
+                
                 return {
                     'good_timing': True,
-                    'reason': f'시가 근처 매수 가능 (시가대비 {price_diff_pct:+.2f}%)',
+                    'reason': reason,
                     'timing_quality': timing_quality,
+                    'timing_score': timing_score,
                     'price_diff_pct': price_diff_pct,
-                    'today_open': today_open
+                    'today_open': today_open,
+                    'suggested_buy_price': min(today_open * 1.005, current_price * 1.002),  # 🆕 추천 매수가
+                    'max_allowed_diff': max_allowed_pct
                 }
             else:
                 return {
                     'good_timing': False,
-                    'reason': f'시가에서 너무 멀어짐 (시가대비 {price_diff_pct:+.2f}% > ±{max_price_diff_pct}%)',
+                    'reason': f'시가에서 너무 멀어짐 (시가대비 {price_diff_pct:+.2f}% > 한도 ±{max_allowed_pct:.1f}%)',
                     'timing_quality': 'poor',
+                    'timing_score': 0,
                     'price_diff_pct': price_diff_pct,
-                    'today_open': today_open
+                    'today_open': today_open,
+                    'max_allowed_diff': max_allowed_pct
                 }
 
         except Exception as e:
             logger.error(f"진입 타이밍 체크 오류: {e}")
-            return {'good_timing': False, 'reason': f'타이밍 체크 오류: {str(e)}'}
+            return {'good_timing': False, 'reason': f'타이밍 체크 오류: {str(e)}', 'today_open': 0}
 
     def _validate_existing_patterns(self, candidate: CandleTradeCandidate, current_price: float) -> Dict:
         """📊 기존 패턴 유효성 간단 재확인"""
@@ -1361,7 +1402,7 @@ class CandleAnalyzer:
 
             # 🆕 24시간 내 보유 종목은 무조건 HOLD (사용자 요구사항)
             if focus_on_exit and position_signals.get('within_24h', False):
-                logger.info(f"⏰ 24시간 내 보유 종목 - 강제 HOLD 신호 반환 (점수 계산 무시)")
+                logger.debug(f"⏰ 24시간 내 보유 종목 - 강제 HOLD 신호 반환 (점수 계산 무시)")
                 return TradeSignal.HOLD, 30  # 낮은 점수로 HOLD 확정
 
             # 가중치 설정 (캔들패턴 중심)

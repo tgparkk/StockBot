@@ -68,6 +68,7 @@ class MarketScanner:
             # 🎯 3. 장후에는 스캔 안함 (15:30 이후)
             else:
                 logger.debug("🌙 장후 시간 - 스캔 생략")
+                await self.scan_intraday_movers("0001")  # 새로운 함수
                 return
 
             self._last_scan_time = current_time
@@ -120,10 +121,23 @@ class MarketScanner:
             new_candidates_count = 0
             for stock_code in unique_candidates:
                 try:
-                    # 이미 관리 중인 종목은 제외
+                    # 🆕 관리 중인 종목 중에서도 신호 업데이트가 필요한 상태는 처리
+                    skip_analysis = False
                     if (hasattr(self.manager, 'stock_manager') and 
                         hasattr(self.manager.stock_manager, '_all_stocks') and
                         stock_code in self.manager.stock_manager._all_stocks):
+                        
+                        existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
+                        
+                        # 🔧 중요한 상태(ENTERED, PENDING_ORDER, EXITED)는 스캔에서 제외
+                        if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER, CandleStatus.EXITED]:
+                            skip_analysis = True
+                        
+                        # 🔄 WATCHING, SCANNING, BUY_READY 상태는 신호 업데이트를 위해 분석 계속
+                        else:
+                            logger.debug(f"🔄 {stock_code} 기존 관리 종목 신호 업데이트: {existing_candidate.status.value}")
+                    
+                    if skip_analysis:
                         continue
 
                     # 빠른 패턴 분석
