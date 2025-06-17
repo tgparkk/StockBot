@@ -46,11 +46,6 @@
     "base_priority_multiplier": 0.5,
     "max_single_investment_ratio": 0.2,
     "max_position_size_pct": 25,
-    "default_stop_loss_pct": 2.5,
-    "default_target_profit_pct": 3.0,
-    "max_holding_hours": 72,
-    "min_holding_minutes": 1440,
-    "emergency_stop_loss_pct": 4.5,
     "validate_actual_holding_before_sell": false,
     "min_holding_override_conditions": {
         "high_profit_target": 2.0,
@@ -86,20 +81,6 @@
             "min_minutes": 480,
             "description": "아침샛별: 4일 데이터, 음봉+도지/팽이+강한양봉, 1일 보유, 가장 강한 반전신호"
         }
-    },
-    "time_exit_rules": {
-        "profit_exit_hours": 36,
-        "min_profit_for_time_exit": 1.5,
-        "market_close_exit_minutes": 30,
-        "overnight_avoid": false,
-        "weekend_gap_risk": true,
-        "loss_situation_time_exit_block": true,
-        "pattern_strength_multiplier": {
-            "high": 1.5,
-            "medium": 1.0,
-            "low": 0.7
-        },
-        "description": "수익 중 시간 청산: 36시간 후 1.5% 이상 수익시만, 손실시 차단"
     },
     "execution_time_strategy": {
         "use_execution_time": true,

@@ -307,16 +307,19 @@ class CandleAnalyzer:
             target_price = candidate.risk_management.target_price
             stop_loss_price = candidate.risk_management.stop_loss_price
 
+            # 패턴별 목표/손절 기준 가져오기
+            target_profit_pct, stop_loss_pct, _, _ = self._get_pattern_based_target(candidate)
+
             if current_price >= target_price:
                 signal = 'target_reached'
                 risk_level = 'profit_secure'
             elif current_price <= stop_loss_price:
                 signal = 'stop_loss'
                 risk_level = 'high_risk'
-            elif pnl_pct >= self.config.get('default_target_profit_pct', 3.0):  # 기본 3% 수익
+            elif pnl_pct >= target_profit_pct:
                 signal = 'profit_target'
                 risk_level = 'profit_zone'
-            elif pnl_pct <= -self.config.get('default_stop_loss_pct', 3.0):  # 기본 3% 손실
+            elif pnl_pct <= -stop_loss_pct:
                 signal = 'loss_limit'
                 risk_level = 'loss_zone'
             elif pnl_pct >= 1.0:
@@ -405,16 +408,12 @@ class CandleAnalyzer:
                 pattern_time_signals, pattern_risk_signals, position_signals, focus_on_exit
             )
 
-            # 🆕 매도 신호 분석 상세 로깅
+            # 매도 신호 분석 상세 로깅
             if focus_on_exit:
                 logger.debug(f"🔍 {candidate.stock_code} 매도 신호 분석 완료:")
                 logger.debug(f"   📊 포지션 분석: {position_signals.get('signal', 'unknown')} (should_exit: {position_signals.get('should_exit', False)})")
                 logger.debug(f"   ⏰ 시간 분석: {pattern_time_signals.get('signal', 'unknown')} (보유: {pattern_time_signals.get('holding_hours', 0):.1f}h)")
                 logger.debug(f"   🎯 최종 신호: {final_signal.value} (강도: {signal_strength})")
-                
-                # 24시간 내 보유 종목 특별 로깅
-                if position_signals.get('within_24h', False):
-                    logger.debug(f"   ⏰ 24시간 내 보유 종목 - 강제 HOLD 적용됨")
 
             return {
                 'new_signal': final_signal,
@@ -1172,7 +1171,7 @@ class CandleAnalyzer:
             return 1.0
 
     def _analyze_candle_exit_conditions(self, candidate: CandleTradeCandidate, current_price: float, pattern_change_analysis: Dict) -> Dict:
-        """🎯 단순화된 매도 조건 분석 - 24시간 내에는 긴급손절 또는 목표달성시에만 매도"""
+        """🎯 새로운 매도 조건 분석 - 패턴별 target/stop 기준으로 단순화"""
         try:
             # 기본 매도 조건들
             should_exit = False
@@ -1180,14 +1179,6 @@ class CandleAnalyzer:
             exit_priority = 'normal'
 
             logger.debug(f"🔍 {candidate.stock_code} 매도 조건 분석 시작 (현재가: {current_price:,}원)")
-
-            # 🆕 패턴별 설정 가져오기
-            target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(candidate)
-            
-            # 🆕 긴급 손절 기준 (config에서 가져오기)
-            emergency_stop_loss_pct = self.config.get('risk_management', {}).get('emergency_stop_loss_pct', 6.0)
-            
-            logger.debug(f"📊 {candidate.stock_code} 매도 기준: 목표{target_profit_pct}%, 긴급손절{emergency_stop_loss_pct}%, 최대{max_hours}h")
 
             # 🚨 1. 패턴 반전 감지시 즉시 매도 (최우선)
             if pattern_change_analysis.get('action_required') == 'immediate_exit':
@@ -1225,91 +1216,44 @@ class CandleAnalyzer:
             pnl_pct = ((current_price - candidate.performance.entry_price) / candidate.performance.entry_price) * 100
             logger.debug(f"💰 {candidate.stock_code} 현재 수익률: {pnl_pct:+.2f}% (진입가: {candidate.performance.entry_price:,}원)")
 
-            # 🎯 4. 단순화된 매도 조건 (사용자 제안)
+            # 🎯 4. 패턴별 설정 가져오기
+            target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(candidate)
+            logger.debug(f"📊 {candidate.stock_code} 패턴별 설정: 목표{target_profit_pct}%, 손절{stop_loss_pct}%, 최대{max_hours}h")
+
+            # 🎯 5. 새로운 매도 판단 로직
+            # 5-1. 목표 수익률 도달시 즉시 매도
+            if pnl_pct >= target_profit_pct:
+                should_exit = True
+                exit_reasons.append(f'목표 수익률 달성 ({target_profit_pct}%)')
+                exit_priority = 'high'
+                logger.info(f"🎯 {candidate.stock_code} 목표 수익률 달성: {pnl_pct:+.2f}% >= {target_profit_pct}%")
             
-            # 4-1. 24시간 이내: 오직 긴급손절 또는 목표달성시에만 매도
-            if holding_hours < 24.0:
-                logger.info(f"⏰ {candidate.stock_code} 24시간 이내 보유 ({holding_hours:.1f}h) - 제한적 매도 조건 적용")
-                
-                # 긴급 손절 체크 (emergency_stop_loss_pct 초과)
-                if pnl_pct <= -emergency_stop_loss_pct:
-                    should_exit = True
-                    exit_reasons.append(f'긴급 손절 ({emergency_stop_loss_pct}% 초과 손실)')
-                    exit_priority = 'emergency'
-                    logger.warning(f"🚨 {candidate.stock_code} 긴급 손절: {pnl_pct:+.2f}% <= -{emergency_stop_loss_pct}%")
-                
-                # 목표 수익 달성 체크 (high_profit_target 또는 패턴별 목표)
-                elif pnl_pct >= target_profit_pct:
-                    should_exit = True
-                    exit_reasons.append(f'목표 수익 달성 ({target_profit_pct}%)')
-                    exit_priority = 'high'
-                    logger.info(f"🎯 {candidate.stock_code} 목표 수익 달성: {pnl_pct:+.2f}% >= {target_profit_pct}%")
-                
-                # 목표가 도달 체크 (RiskManagement 기반)
-                elif (hasattr(candidate, 'risk_management') and candidate.risk_management and
-                      hasattr(candidate.risk_management, 'target_price') and 
-                      candidate.risk_management.target_price > 0 and
-                      current_price >= candidate.risk_management.target_price):
-                    should_exit = True
-                    exit_reasons.append('목표가 도달')
-                    exit_priority = 'high'
-                    logger.info(f"🎯 {candidate.stock_code} 목표가 도달: {current_price:,} >= {candidate.risk_management.target_price:,}")
-                
-                else:
-                    # 24시간 이내에는 다른 모든 매도 조건 무시
-                    logger.info(f"⏰ {candidate.stock_code} 24시간 이내 보유 지속 - 긴급손절({pnl_pct:+.2f}% > -{emergency_stop_loss_pct}%) 및 목표미달({pnl_pct:+.2f}% < {target_profit_pct}%)")
-                    return {
-                        'signal': 'hold', 
-                        'should_exit': False, 
-                        'exit_reasons': ['24시간 이내 보유 지속'], 
-                        'exit_priority': 'normal',
-                        'holding_hours': holding_hours,
-                        'pnl_pct': pnl_pct,
-                        'within_24h': True  # 🆕 24시간 내 보유 명시적 표시
-                    }
+            # 5-2. 손절 기준 도달시 즉시 매도
+            elif pnl_pct <= -stop_loss_pct:
+                should_exit = True
+                exit_reasons.append(f'손절 기준 도달 ({stop_loss_pct}%)')
+                exit_priority = 'high'
+                logger.info(f"🛑 {candidate.stock_code} 손절 기준 도달: {pnl_pct:+.2f}% <= -{stop_loss_pct}%")
             
-            # 4-2. 24시간 초과: 기존 모든 매도 조건 적용
+            # 5-3. stop~target 사이에서 24시간 초과시 강제 매도
+            elif holding_hours >= 24.0:
+                should_exit = True
+                exit_reasons.append('24시간 보유 완료')
+                exit_priority = 'normal'
+                logger.info(f"⏰ {candidate.stock_code} 24시간 보유 완료: {holding_hours:.1f}h >= 24h")
+            
+            # 5-4. stop~target 사이에서 24시간 내면 보유 지속
             else:
-                logger.debug(f"⏰ {candidate.stock_code} 24시간 초과 보유 ({holding_hours:.1f}h) - 전체 매도 조건 적용")
-                
-                # 목표 수익 달성
-                if pnl_pct >= target_profit_pct:
-                    should_exit = True
-                    exit_reasons.append(f'목표 수익 달성 ({target_profit_pct}%)')
-                    exit_priority = 'high'
-                    logger.info(f"🎯 {candidate.stock_code} 목표 수익 달성: {pnl_pct:+.2f}% >= {target_profit_pct}%")
-                
-                # 일반 손절 (24시간 후에는 일반 손절도 허용)
-                elif pnl_pct <= -stop_loss_pct:
-                    should_exit = True
-                    exit_reasons.append(f'손절 ({stop_loss_pct}%)')
-                    exit_priority = 'high'
-                    logger.info(f"🛑 {candidate.stock_code} 손절 조건: {pnl_pct:+.2f}% <= -{stop_loss_pct}%")
-                
-                # 목표가/손절가 도달 (RiskManagement 기반)
-                elif hasattr(candidate, 'risk_management') and candidate.risk_management:
-                    if (hasattr(candidate.risk_management, 'target_price') and 
-                        candidate.risk_management.target_price > 0 and
-                        current_price >= candidate.risk_management.target_price):
-                        should_exit = True
-                        exit_reasons.append('목표가 도달')
-                        exit_priority = 'high'
-                        logger.info(f"🎯 {candidate.stock_code} 목표가 도달: {current_price:,} >= {candidate.risk_management.target_price:,}")
-                    
-                    elif (hasattr(candidate.risk_management, 'stop_loss_price') and 
-                          candidate.risk_management.stop_loss_price > 0 and
-                          current_price <= candidate.risk_management.stop_loss_price):
-                        should_exit = True
-                        exit_reasons.append('손절가 도달')
-                        exit_priority = 'high'
-                        logger.info(f"🛑 {candidate.stock_code} 손절가 도달: {current_price:,} <= {candidate.risk_management.stop_loss_price:,}")
-                
-                # 최대 보유시간 초과 (강제 청산)
-                elif holding_hours >= max_hours:
-                    should_exit = True
-                    exit_reasons.append(f'최대 보유시간 초과 ({max_hours}h)')
-                    exit_priority = 'normal'
-                    logger.info(f"⏰ {candidate.stock_code} 최대 보유시간 초과: {holding_hours:.1f}h >= {max_hours}h")
+                logger.info(f"⏸️ {candidate.stock_code} 보유 지속: 수익률 {pnl_pct:+.2f}% ({-stop_loss_pct}% ~ {target_profit_pct}% 범위), 보유시간 {holding_hours:.1f}h/24h")
+                return {
+                    'signal': 'hold', 
+                    'should_exit': False, 
+                    'exit_reasons': ['목표 범위 내 24시간 보유'], 
+                    'exit_priority': 'normal',
+                    'holding_hours': holding_hours,
+                    'pnl_pct': pnl_pct,
+                    'target_range': f"{-stop_loss_pct}% ~ {target_profit_pct}%"
+                }
 
             # 신호 결정
             if should_exit:
@@ -1330,7 +1274,9 @@ class CandleAnalyzer:
                 'exit_reasons': exit_reasons,
                 'exit_priority': exit_priority,
                 'holding_hours': holding_hours,
-                'pnl_pct': pnl_pct
+                'pnl_pct': pnl_pct,
+                'target_profit_pct': target_profit_pct,
+                'stop_loss_pct': stop_loss_pct
             }
 
         except Exception as e:
@@ -1400,11 +1346,6 @@ class CandleAnalyzer:
             if pattern_change_analysis.get('action_required') == 'immediate_exit':
                 return TradeSignal.STRONG_SELL, 95
 
-            # 🆕 24시간 내 보유 종목은 무조건 HOLD (사용자 요구사항)
-            if focus_on_exit and position_signals.get('within_24h', False):
-                logger.debug(f"⏰ 24시간 내 보유 종목 - 강제 HOLD 신호 반환 (점수 계산 무시)")
-                return TradeSignal.HOLD, 30  # 낮은 점수로 HOLD 확정
-
             # 가중치 설정 (캔들패턴 중심)
             if focus_on_exit:
                 # 매도 신호 중심 - 패턴 반전이 중요
@@ -1431,17 +1372,9 @@ class CandleAnalyzer:
             # 🔧 technical_harmony는 float이므로 0~100 스케일로 변환
             technical_score = technical_harmony * 100 if isinstance(technical_harmony, (int, float)) else 50
 
-            # 🆕 24시간 내 보유 종목의 시간 신호 무시
+            # 시간 신호 처리
             time_signal = pattern_time_signals.get('signal', 'normal')
-            holding_hours = pattern_time_signals.get('holding_hours', 0)
-            
-            if focus_on_exit and holding_hours < 24.0:
-                # 24시간 내에는 시간 신호를 중립(50점)으로 고정
-                time_score = 50
-                logger.debug(f"⏰ 24시간 내 보유 - 시간 신호 무시 (원래: {time_signal} → 중립 50점)")
-            else:
-                # 24시간 초과 또는 매수 신호에서는 정상 처리
-                time_score = self._get_signal_score(time_signal, 'time')
+            time_score = self._get_signal_score(time_signal, 'time')
             
             risk_score = self._get_signal_score(pattern_risk_signals.get('signal', 'neutral'), 'risk')
             position_score = self._get_signal_score(position_signals.get('signal', 'wait'), 'position')
@@ -1471,7 +1404,7 @@ class CandleAnalyzer:
                     time_score * weights['time']
                 )
 
-            # 🆕 디버깅 로그 (매도 신호 중심)
+            # 디버깅 로그 (매도 신호 중심)
             if focus_on_exit:
                 logger.debug(f"🧮 매도 신호 계산: 패턴변화({pattern_change_score:.0f}×{weights['pattern_change']:.1f}) + "
                            f"리스크({risk_score:.0f}×{weights['risk']:.1f}) + "
@@ -2009,99 +1942,3 @@ class CandleAnalyzer:
             logger.debug(f"패턴별 리스크 조건 분석 오류: {e}")
             return {'signal': 'neutral', 'risk_level': 'medium', 'pattern_risk_adjustments': []}
 
-    def _check_emergency_conditions(self, candidate: CandleTradeCandidate) -> Dict:
-        """🚨 긴급 상황 체크 (최소 보유시간 무시 조건) - 단순화"""
-        try:
-            current_pnl = candidate.performance.pnl_pct or 0.0
-            emergency_threshold = self.config.get('emergency_stop_loss_pct', 6.0)  # 기본 6%
-            override_conditions = self.config.get('min_holding_override_conditions', {})
-
-            # 1. 높은 수익시 즉시 매도 (최소 보유시간 무시)
-            high_profit_target = override_conditions.get('high_profit_target', 3.5)
-            if current_pnl >= high_profit_target:
-                return {
-                    'is_emergency': True,
-                    'reason': f'high_profit_target_{high_profit_target}%',
-                    'detail': f'목표수익달성: {current_pnl:.2f}%'
-                }
-
-            # 2. 긴급 손절 임계값 체크 (시장급락, 하한가근접 모두 포함)
-            if current_pnl <= -emergency_threshold:
-                # 손실 정도에 따른 세부 분류
-                if current_pnl <= -15.0:
-                    detail = f'하한가근접: {current_pnl:.2f}%'
-                elif current_pnl <= -10.0:
-                    detail = f'큰손실: {current_pnl:.2f}%'
-                else:
-                    detail = f'긴급손절: {current_pnl:.2f}%'
-                
-                return {
-                    'is_emergency': True,
-                    'reason': f'emergency_stop_loss_{emergency_threshold}%',
-                    'detail': detail
-                }
-
-            return {'is_emergency': False, 'reason': 'normal', 'detail': '정상'}
-
-        except Exception as e:
-            logger.error(f"긴급 상황 체크 오류: {e}")
-            return {'is_emergency': False, 'reason': 'error', 'detail': str(e)}
-
-    def _check_min_holding_time(self, candidate: CandleTradeCandidate, stop_loss_pct: float) -> Dict:
-        """⏰ 최소 보유시간 체크 (노이즈 거래 방지)"""
-        try:
-            if not candidate.performance or not candidate.performance.entry_time:
-                return {'can_exit': True, 'reason': 'no_entry_time'}
-
-            current_time = datetime.now(self.korea_tz)
-            entry_time = candidate.performance.entry_time
-            
-            # timezone 통일
-            if entry_time.tzinfo is None:
-                entry_time = entry_time.replace(tzinfo=self.korea_tz)
-
-            # 보유 시간 계산 (분 단위)
-            holding_minutes = (current_time - entry_time).total_seconds() / 60
-
-            # config에서 최소 보유시간 가져오기
-            min_holding_minutes = self.config.get('min_holding_minutes', 1440)  # 기본 24시간
-
-            # 패턴별 최소 보유시간 확인
-            if candidate.detected_patterns:
-                pattern_type = candidate.detected_patterns[0].pattern_type.value.lower()
-                pattern_config = self.config.get('pattern_targets', {}).get(pattern_type, {})
-                pattern_min_minutes = pattern_config.get('min_minutes', min_holding_minutes)
-                min_holding_minutes = min(min_holding_minutes, pattern_min_minutes)
-
-            # 긴급 상황 체크
-            emergency_check = self._check_emergency_conditions(candidate)
-            if emergency_check['is_emergency']:
-                return {
-                    'can_exit': True, 
-                    'reason': 'emergency',
-                    'detail': emergency_check['detail'],
-                    'holding_minutes': holding_minutes,
-                    'min_required': min_holding_minutes
-                }
-
-            # 최소 보유시간 체크
-            if holding_minutes >= min_holding_minutes:
-                return {
-                    'can_exit': True, 
-                    'reason': 'time_passed',
-                    'holding_minutes': holding_minutes,
-                    'min_required': min_holding_minutes
-                }
-            else:
-                remaining_minutes = min_holding_minutes - holding_minutes
-                return {
-                    'can_exit': False, 
-                    'reason': f'min_holding_time_not_met',
-                    'detail': f'{remaining_minutes:.0f}분 더 보유 필요',
-                    'holding_minutes': holding_minutes,
-                    'min_required': min_holding_minutes
-                }
-
-        except Exception as e:
-            logger.error(f"최소 보유시간 체크 오류: {e}")
-            return {'can_exit': True, 'reason': 'error', 'detail': str(e)}

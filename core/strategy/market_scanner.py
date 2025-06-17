@@ -121,7 +121,7 @@ class MarketScanner:
             new_candidates_count = 0
             for stock_code in unique_candidates:
                 try:
-                    # 🆕 관리 중인 종목 중에서도 신호 업데이트가 필요한 상태는 처리
+                    # 🚨 이미 보유/주문 중인 종목은 스캔에서 제외 (중복 매수 방지)
                     skip_analysis = False
                     if (hasattr(self.manager, 'stock_manager') and 
                         hasattr(self.manager.stock_manager, '_all_stocks') and
@@ -129,8 +129,14 @@ class MarketScanner:
                         
                         existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
                         
-                        # 🔧 중요한 상태(ENTERED, PENDING_ORDER, EXITED)는 스캔에서 제외
-                        if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER, CandleStatus.EXITED]:
+                        # 🚨 이미 보유/주문 중인 종목은 스캔에서 완전 제외 (중복 매수 방지)
+                        if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                            logger.debug(f"🚫 {stock_code} 이미 보유/주문 중 - 스캔 제외 ({existing_candidate.status.value})")
+                            skip_analysis = True
+                        
+                        # 🔧 EXITED 상태도 스캔에서 제외 (당일 재매수 방지)
+                        elif existing_candidate.status == CandleStatus.EXITED:
+                            logger.debug(f"🚫 {stock_code} 당일 매도 완료 종목 - 스캔 제외 (재매수 방지)")
                             skip_analysis = True
                         
                         # 🔄 WATCHING, SCANNING, BUY_READY 상태는 신호 업데이트를 위해 분석 계속
@@ -438,10 +444,11 @@ class MarketScanner:
                 position_size_pct = 10
 
             # 손절가/목표가 계산 - 패턴별 세부 설정 적용
-            stop_loss_pct = self.config['default_stop_loss_pct']
-            target_profit_pct = self.config['default_target_profit_pct']
+            # 기본값 설정 (패턴이 없는 경우)
+            stop_loss_pct = 3.0  # 기본 3% 손절
+            target_profit_pct = 3.0  # 기본 3% 목표
 
-            # 🆕 패턴별 목표 설정 적용
+            # 🆕 패턴별 목표 설정 적용 (우선순위)
             if candidate.primary_pattern:
                 pattern_name = candidate.primary_pattern.pattern_type.value.lower()
                 pattern_config = self.config['pattern_targets'].get(pattern_name)
@@ -450,6 +457,10 @@ class MarketScanner:
                     target_profit_pct = pattern_config['target']
                     stop_loss_pct = pattern_config['stop']
                     logger.debug(f"📊 {candidate.stock_code} 패턴별 목표 적용: {pattern_name} - 목표:{target_profit_pct}%, 손절:{stop_loss_pct}%")
+                else:
+                    logger.debug(f"📊 {candidate.stock_code} 패턴별 설정 없음, 기본값 사용: 목표:{target_profit_pct}%, 손절:{stop_loss_pct}%")
+            else:
+                logger.debug(f"📊 {candidate.stock_code} 패턴 없음, 기본값 사용: 목표:{target_profit_pct}%, 손절:{stop_loss_pct}%")
 
             stop_loss_price = current_price * (1 - stop_loss_pct / 100)
             target_price = current_price * (1 + target_profit_pct / 100)
@@ -457,8 +468,8 @@ class MarketScanner:
             # 추적 손절 설정
             trailing_stop_pct = stop_loss_pct * 0.6  # 손절의 60% 수준
 
-            # 최대 보유 시간 (패턴별 조정)
-            max_holding_hours = self.config['max_holding_hours']
+            # 최대 보유 시간 (패턴별만 사용)
+            max_holding_hours = 24  # 기본값 (패턴이 없는 경우)
             if candidate.primary_pattern:
                 pattern_name = candidate.primary_pattern.pattern_type.value.lower()
                 pattern_config = self.config['pattern_targets'].get(pattern_name)
@@ -476,6 +487,9 @@ class MarketScanner:
                         max_holding_hours = 4   # 망치형은 짧게
                     elif candidate.primary_pattern.pattern_type == PatternType.DOJI:
                         max_holding_hours = 2   # 도지는 매우 짧게
+                    logger.debug(f"📊 {candidate.stock_code} 패턴별 기본 보유시간: {pattern_name} - {max_holding_hours}시간")
+            else:
+                logger.debug(f"📊 {candidate.stock_code} 패턴 없음, 기본 보유시간: {max_holding_hours}시간")
 
             # 위험도 점수 계산
             risk_score = self.manager.candle_analyzer.calculate_risk_score({'stck_prpr': current_price})

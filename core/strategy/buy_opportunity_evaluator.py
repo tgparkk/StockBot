@@ -39,12 +39,26 @@ class BuyOpportunityEvaluator:
                 logger.debug(f"⏰ 거래 시간외 ({current_time.strftime('%H:%M')}) - 매수 스킵 (허용시간: 09:00~15:15)")
                 #return
             
+            # 🚨 이미 보유 중인 종목 목록 확보 (중복 매수 방지)
+            already_owned_stocks = set()
+            for candidate in self.manager.stock_manager._all_stocks.values():
+                if candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                    already_owned_stocks.add(candidate.stock_code)
+            
+            if already_owned_stocks:
+                logger.debug(f"🚫 이미 보유/주문 중인 종목: {len(already_owned_stocks)}개 - {', '.join(list(already_owned_stocks)[:5])}")
+            
             # 🔍 전체 종목 상태 분석
             all_stocks = self.manager.stock_manager._all_stocks.values()
 
             # 🎯 매수 준비 상태인 종목들만 필터링 (이미 모든 검증 완료됨) + 중복 주문 방지
             buy_ready_candidates = []
             for candidate in all_stocks:
+                # 🚨 이미 보유 중인 종목 제외 (최우선 체크)
+                if candidate.stock_code in already_owned_stocks:
+                    logger.debug(f"🚫 {candidate.stock_code} 이미 보유/주문 중 - 매수 제외")
+                    continue
+                
                 if not candidate.is_ready_for_entry():
                     continue
 
