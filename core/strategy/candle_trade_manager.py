@@ -1095,8 +1095,17 @@ class CandleTradeManager:
                 'execution_data': execution_data
             }
 
-            # 🆕 8. candle_trades 테이블에 매수 기록 저장
-            await self._save_candle_trade_to_db(candidate, 'ENTRY', executed_price, executed_quantity, order_no, '매수 체결 완료')
+            # 🆕 8. candle_trades 테이블에 매수 기록 저장 (패턴/신호 정보 포함)
+            buy_reason = f'매수 체결 완료'
+            if candidate.trade_signal:
+                buy_reason += f' (신호: {candidate.trade_signal.value}'
+                if hasattr(candidate, 'signal_strength') and candidate.signal_strength:
+                    buy_reason += f', 강도: {candidate.signal_strength}'
+                buy_reason += ')'
+            
+            # 🆕 TradeDatabase의 강화된 메서드 사용
+            if self.trade_db:
+                self.trade_db.save_candle_trade_enhanced(candidate, 'ENTRY', executed_price, executed_quantity, order_no, buy_reason)
 
             # 9. stock_manager 업데이트
             self.stock_manager.update_candidate(candidate)
@@ -1161,12 +1170,13 @@ class CandleTradeManager:
                 'execution_data': execution_data
             }
 
-            # 🆕 9. candle_trades 테이블에 매도 기록 저장
-            await self._save_candle_trade_to_db(
-                candidate, 'EXIT', executed_price, executed_quantity, order_no, 
-                f'매도 체결 완료 (수익률: {profit_pct:.2f}%)',
-                profit_loss=profit_loss, profit_rate=profit_pct
-            )
+            # 🆕 9. TradeDatabase의 강화된 메서드 사용
+            if self.trade_db:
+                sell_reason = f'매도 체결 완료 (수익률: {profit_pct:.2f}%)'
+                self.trade_db.save_candle_trade_enhanced(
+                    candidate, 'EXIT', executed_price, executed_quantity, order_no, 
+                    sell_reason, profit_loss=profit_loss, profit_rate=profit_pct
+                )
 
             # 10. stock_manager 업데이트
             self.stock_manager.update_candidate(candidate)
@@ -1191,76 +1201,7 @@ class CandleTradeManager:
         except Exception as e:
             logger.error(f"❌ 매도 체결 처리 오류 ({candidate.stock_code}): {e}")
 
-    async def _save_candle_trade_to_db(self, candidate: CandleTradeCandidate, trade_type: str,
-                                     executed_price: float, executed_quantity: int, order_no: str,
-                                     decision_reason: str, profit_loss: int = 0, profit_rate: float = 0.0):
-        """🆕 candle_trades 테이블에 거래 기록 저장"""
-        try:
-            if not self.trade_db:
-                logger.debug(f"📚 {candidate.stock_code} DB 없음 - candle_trades 저장 스킵")
-                return
 
-            # candidate_id 찾기 (candle_candidates 테이블에서)
-            candidate_id = candidate.metadata.get('db_id')
-            if not candidate_id:
-                # DB에서 찾기 시도
-                candidates = self.trade_db.get_candle_candidates(status=None, days=7)
-                for cand in candidates:
-                    if cand['stock_code'] == candidate.stock_code:
-                        candidate_id = cand['id']
-                        candidate.metadata['db_id'] = candidate_id
-                        break
-
-            if not candidate_id:
-                logger.warning(f"⚠️ {candidate.stock_code} candidate_id를 찾을 수 없음 - candle_trades 저장 실패")
-                return
-
-            # 패턴 정보 추출
-            pattern_matched = None
-            if candidate.detected_patterns and len(candidate.detected_patterns) > 0:
-                pattern_matched = candidate.detected_patterns[0].pattern_type.value
-
-            # 보유 시간 계산 (매도인 경우)
-            hold_duration = 0
-            if trade_type == 'EXIT' and candidate.performance.entry_time:
-                entry_time = candidate.performance.entry_time
-                current_time = datetime.now(self.korea_tz)
-                if entry_time.tzinfo is None:
-                    entry_time = entry_time.replace(tzinfo=self.korea_tz)
-                hold_duration = int((current_time - entry_time).total_seconds() / 60)  # 분 단위
-
-            # candle_trades 테이블에 저장
-            trade_id = self.trade_db.record_candle_trade(
-                candidate_id=candidate_id,
-                trade_type=trade_type,
-                stock_code=candidate.stock_code,
-                stock_name=candidate.stock_name,
-                quantity=executed_quantity,
-                price=int(executed_price),
-                total_amount=int(executed_price * executed_quantity),
-                decision_reason=decision_reason,
-                pattern_matched=pattern_matched,
-                order_id=order_no,
-                entry_price=int(candidate.performance.entry_price) if candidate.performance.entry_price else None,
-                profit_loss=profit_loss,
-                profit_rate=profit_rate,
-                hold_duration=hold_duration,
-                market_condition='NORMAL',  # 추후 시장 상황 분석 결과로 대체 가능
-                rsi_value=candidate.metadata.get('technical_indicators', {}).get('rsi'),
-                macd_value=candidate.metadata.get('technical_indicators', {}).get('macd'),
-                volume_ratio=candidate.metadata.get('technical_indicators', {}).get('volume_ratio')
-            )
-
-            if trade_id > 0:
-                logger.info(f"📚 {candidate.stock_code} candle_trades 저장 완료: {trade_type} (ID: {trade_id})")
-                candidate.metadata['candle_trade_id'] = trade_id
-            else:
-                logger.warning(f"⚠️ {candidate.stock_code} candle_trades 저장 실패")
-
-        except Exception as e:
-            logger.error(f"❌ {candidate.stock_code} candle_trades 저장 오류: {e}")
-            import traceback
-            logger.error(f"❌ 상세 오류:\n{traceback.format_exc()}")
 
     # ========== 🆕 주기적 신호 재평가 시스템 ==========
 
@@ -1426,79 +1367,124 @@ class CandleTradeManager:
             return 0
 
     async def _batch_evaluate_entered_stocks(self, candidates: List[CandleTradeCandidate]) -> int:
-        """진입한 종목들 배치 재평가 (매도 신호 중심) - current_data 최적화"""
+        """🆕 진입한 종목들 단순 매도 조건 체크 (패턴별 target/stop/max_hours 기준)"""
         try:
             updated_count = 0
             batch_size = 10
 
-            # 5개씩 배치로 나누어 처리
+            # 배치로 나누어 처리 (API 부하 방지)
             for i in range(0, len(candidates), batch_size):
                 batch = candidates[i:i + batch_size]
 
-                # 🆕 배치 시작 시 가격 정보 조회
-                current_data_dict = {}
+                # 🚀 배치 시작 시 가격 정보만 조회 (분석 생략)
+                current_prices = {}
                 for candidate in batch:
                     try:
                         from ..api.kis_market_api import get_inquire_price
                         current_data = get_inquire_price("J", candidate.stock_code)
                         if current_data is not None and not current_data.empty:
-                            current_data_dict[candidate.stock_code] = current_data
+                            current_price = float(current_data.iloc[0].get('stck_prpr', 0))
+                            if current_price > 0:
+                                current_prices[candidate.stock_code] = current_price
                     except Exception as e:
                         logger.debug(f"가격 조회 오류 ({candidate.stock_code}): {e}")
                         continue
 
-                # 배치 내 모든 종목을 동시에 분석 (current_data 전달)
-                analysis_tasks = [
-                    self.candle_analyzer.comprehensive_signal_analysis(
-                        candidate,
-                        focus_on_exit=True,
-                        current_data=current_data_dict.get(candidate.stock_code)
-                    )
-                    for candidate in batch
-                ]
-
-                # 병렬로 실행하고 결과 받기
-                analysis_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
-
-                # 결과 처리
-                for candidate, analysis_result in zip(batch, analysis_results):
+                # 🎯 각 종목별 단순 매도 조건 체크
+                for candidate in batch:
                     try:
-                        # 예외 처리
-                        if isinstance(analysis_result, Exception):
-                            logger.debug(f"진입 종목 재평가 오류 ({candidate.stock_code}): {analysis_result}")
+                        current_price = current_prices.get(candidate.stock_code)
+                        if not current_price:
                             continue
 
-                        # 타입 확인 후 처리
-                        if analysis_result and isinstance(analysis_result, dict) and self._should_update_exit_signal(candidate, analysis_result):
+                        # 🚀 단순 매도 조건 체크 (복잡한 분석 생략)
+                        should_sell, sell_reason, new_signal = self._check_simple_sell_conditions(candidate, current_price)
+
+                        if should_sell and new_signal != candidate.trade_signal:
                             # 매도 신호 업데이트
                             old_signal = candidate.trade_signal
-                            candidate.trade_signal = analysis_result['new_signal']
-                            candidate.signal_strength = analysis_result['signal_strength']
+                            candidate.trade_signal = new_signal
+                            candidate.signal_strength = 85 if new_signal == TradeSignal.STRONG_SELL else 70
                             candidate.signal_updated_at = datetime.now(self.korea_tz)
 
-                            logger.info(f"🔄 {candidate.stock_code} 매도신호 업데이트: "
-                                       f"{old_signal.value} → {candidate.trade_signal.value} "
-                                       f"(강도:{candidate.signal_strength})")
+                            logger.info(f"🔄 {candidate.stock_code} 단순 매도 조건: "
+                                       f"{old_signal.value} → {new_signal.value} ({sell_reason})")
                             updated_count += 1
 
-                            # 강한 매도 신호시 즉시 매도 검토
-                            if candidate.trade_signal in [TradeSignal.STRONG_SELL, TradeSignal.SELL]:
-                                logger.info(f"🎯 {candidate.stock_code} 강한 매도 신호 - 즉시 매도 검토")
-                                # _manage_existing_positions에서 처리되도록 함
-
                     except Exception as e:
-                        logger.debug(f"진입 종목 재평가 결과 처리 오류 ({candidate.stock_code}): {e}")
+                        logger.debug(f"진입 종목 단순 체크 오류 ({candidate.stock_code}): {e}")
                         continue
 
-                # 배치 간 짧은 간격 (API 부하 방지)
+                # 배치 간 짧은 간격
                 if i + batch_size < len(candidates):
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
+
+            if updated_count > 0:
+                logger.debug(f"✅ 진입 종목 단순 매도 체크 완료: {updated_count}개 업데이트")
 
             return updated_count
 
         except Exception as e:
-            logger.error(f"진입 종목 배치 재평가 오류: {e}")
+            logger.error(f"진입 종목 단순 매도 체크 오류: {e}")
             return 0
+
+    def _check_simple_sell_conditions(self, candidate: CandleTradeCandidate, current_price: float) -> Tuple[bool, str, TradeSignal]:
+        """🚀 단순 매도 조건 체크 (패턴별 target/stop/max_hours 기준만)"""
+        try:
+            # 진입가 정보 확인
+            if not candidate.performance.entry_price:
+                logger.debug(f"⚠️ {candidate.stock_code} 진입가 정보 없음")
+                return False, "진입가 정보 없음", TradeSignal.HOLD
+
+            # 진입 시간 확인
+            if not candidate.performance.entry_time:
+                logger.debug(f"⚠️ {candidate.stock_code} 진입 시간 정보 없음")
+                return False, "진입 시간 정보 없음", TradeSignal.HOLD
+
+            # 🎯 1. 수익률 계산
+            entry_price = candidate.performance.entry_price
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+
+            # 🎯 2. 보유 시간 계산 (거래시간 기준)
+            entry_time = candidate.performance.entry_time
+            current_time = datetime.now(self.korea_tz)
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=self.korea_tz)
+
+            from .candle_analyzer import calculate_business_hours_analyzer
+            holding_hours = calculate_business_hours_analyzer(entry_time, current_time)
+
+            # 🎯 3. 패턴별 목표/손절/시간 기준 가져오기
+            target_profit_pct, stop_loss_pct, max_hours, is_pattern_based = self.candle_analyzer._get_pattern_based_target(candidate)
+
+            logger.debug(f"🔍 {candidate.stock_code} 단순 체크: 수익률 {pnl_pct:+.2f}% "
+                        f"(목표:{target_profit_pct}%, 손절:{stop_loss_pct}%), "
+                        f"보유시간 {holding_hours:.1f}h/{max_hours}h")
+
+            # 🎯 4. 매도 조건 체크 (우선순위별)
+            
+            # 4-1. 목표 수익률 달성 → 즉시 매도
+            if pnl_pct >= target_profit_pct:
+                return True, f"목표 수익률 달성 ({pnl_pct:+.2f}% >= {target_profit_pct}%)", TradeSignal.STRONG_SELL
+            
+            # 4-2. 손절 기준 도달 → 즉시 매도  
+            elif pnl_pct <= -stop_loss_pct:
+                return True, f"손절 기준 도달 ({pnl_pct:+.2f}% <= -{stop_loss_pct}%)", TradeSignal.STRONG_SELL
+            
+            # 4-3. 24시간 보유 완료 → 강제 매도
+            elif holding_hours >= 24.0:
+                return True, f"24시간 보유 완료 ({holding_hours:.1f}h)", TradeSignal.SELL
+            
+            # 4-4. 목표 범위 내 + 24시간 미만 → 보유 지속
+            else:
+                logger.debug(f"⏸️ {candidate.stock_code} 보유 지속: 수익률 {pnl_pct:+.2f}% "
+                           f"({-stop_loss_pct}% ~ {target_profit_pct}% 범위), "
+                           f"보유시간 {holding_hours:.1f}h/24h")
+                return False, f"목표 범위 내 보유 지속", TradeSignal.HOLD
+
+        except Exception as e:
+            logger.error(f"❌ {candidate.stock_code} 단순 매도 조건 체크 오류: {e}")
+            return False, f"체크 오류: {str(e)}", TradeSignal.HOLD
 
     def _should_update_signal(self, candidate: CandleTradeCandidate, analysis_result: Dict) -> bool:
         """신호 업데이트 필요 여부 판단 (개선된 버전) - comprehensive_signal_analysis용"""

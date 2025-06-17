@@ -144,9 +144,6 @@ class SellPositionManager:
                         logger.debug(f"⏭️ {position.stock_code} 최근 보유 확인 실패 - 포지션 관리 생략")
                         return
 
-            # 🎯 이미 candle_trade_manager에서 매도 신호 분석 완료됨
-            # comprehensive_signal_analysis(focus_on_exit=True)에서 _analyze_candle_exit_conditions 실행됨
-            
             current_price = position.current_price
             
             # 🆕 업데이트된 매도 신호 확인 (중복 분석 방지)
@@ -176,7 +173,8 @@ class SellPositionManager:
             else:
                 # 🆕 동적 추적 손절 업데이트 (매도하지 않을 때만)
                 if position.performance.entry_price:
-                    self._update_trailing_stop(position, current_price)
+                    #self._update_trailing_stop(position, current_price)
+                    pass
 
         except Exception as e:
             logger.error(f"개별 포지션 관리 오류 ({position.stock_code}): {e}")
