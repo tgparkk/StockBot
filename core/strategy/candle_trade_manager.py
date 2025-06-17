@@ -854,24 +854,6 @@ class CandleTradeManager:
             logger.debug(f"❌ {stock_code} 실제 매수 시간 조회 오류: {e}")
             return None
 
-    def _log_holding_setup_completion(self, candidate: CandleTradeCandidate):
-        """보유 종목 설정 완료 로그"""
-        try:
-            if candidate.performance.entry_price and candidate.performance.pnl_pct is not None:
-                source_info = candidate.metadata.get('risk_management_source', 'unknown')
-
-                logger.info(f"📊 {candidate.stock_code} 기존 보유 종목 설정 완료 ({source_info}):")
-                logger.info(f"   - 진입가: {candidate.performance.entry_price:,.0f}원")
-                logger.info(f"   - 수량: {candidate.performance.entry_quantity:,}주")
-                logger.info(f"   - 현재가: {candidate.current_price:,.0f}원")
-                logger.info(f"   - 수익률: {candidate.performance.pnl_pct:+.2f}%")
-                logger.info(f"   - 목표가: {candidate.risk_management.target_price:,.0f}원")
-                logger.info(f"   - 손절가: {candidate.risk_management.stop_loss_price:,.0f}원")
-            else:
-                logger.warning(f"⚠️ {candidate.stock_code} PerformanceTracking 설정 미완료 - 재확인 필요")
-
-        except Exception as e:
-            logger.error(f"설정 완료 로그 오류: {e}")
 
     async def _subscribe_holding_websocket(self, stock_code: str, stock_name: str) -> bool:
         """보유 종목 웹소켓 구독"""
@@ -1629,8 +1611,6 @@ class CandleTradeManager:
         try:
             stats = self.stock_manager.get_summary_stats()
 
-            # 🆕 시장상황 정보 포함
-            market_condition = self.market_analyzer.get_current_condition()
 
             return {
                 'is_running': self.is_running,
@@ -1644,63 +1624,13 @@ class CandleTradeManager:
                 'market_scanner': self.market_scanner.get_scan_status() if hasattr(self, 'market_scanner') else None,
                 'daily_stats': self.daily_stats,
                 'config': self.config,
-                # 🆕 시장 상황 정보 추가 (Dict 타입 처리)
-                'market_condition': self._format_market_condition_dict(market_condition)
+            
             }
 
         except Exception as e:
             logger.error(f"상태 조회 오류: {e}")
             return {'error': str(e)}
 
-    def _format_market_condition_dict(self, market_condition) -> Dict[str, Any]:
-        """시장 상황 정보를 Dict로 안전하게 포맷팅"""
-        try:
-            # Dict 타입인 경우 (analyze_market_condition 결과)
-            if isinstance(market_condition, dict):
-                investor_sentiment = market_condition.get('investor_sentiment', {})
-                return {
-                    'market_trend': market_condition.get('market_trend', 'neutral_market'),
-                    'investor_sentiment': {
-                        'foreign_buying': investor_sentiment.get('foreign_buying', False),
-                        'institution_buying': investor_sentiment.get('institution_buying', False),
-                        'overall_sentiment': investor_sentiment.get('overall_sentiment', 'neutral')
-                    },
-                    'volatility': market_condition.get('volatility', 'low_volatility'),
-                    'market_strength_score': 50.0,  # 기본값
-                    'market_risk_level': 'medium',  # 기본값
-                    'last_updated': market_condition.get('timestamp', ''),
-                    'data_quality': 'good',
-                    'confidence_score': 0.7
-                }
-            
-            # MarketCondition 객체인 경우 (기존 방식)
-            else:
-                return {
-                    'kospi_trend': market_condition.kospi_trend.value,
-                    'kosdaq_trend': market_condition.kosdaq_trend.value,
-                    'kospi_change_pct': market_condition.kospi_change_pct,
-                    'kosdaq_change_pct': market_condition.kosdaq_change_pct,
-                    'volatility': market_condition.volatility.value,
-                    'volume_condition': market_condition.volume_condition.value,
-                    'foreign_flow': market_condition.foreign_flow.value,
-                    'institution_flow': market_condition.institution_flow.value,
-                    'market_strength_score': self.market_analyzer.get_market_strength_score(),
-                    'market_risk_level': self.market_analyzer.get_market_risk_level(),
-                    'last_updated': market_condition.last_updated.strftime('%H:%M:%S'),
-                    'data_quality': market_condition.data_quality,
-                    'confidence_score': market_condition.confidence_score
-                }
-        except Exception as e:
-            logger.warning(f"⚠️ 시장 상황 포맷팅 오류: {e} - 기본값 반환")
-            return {
-                'market_trend': 'neutral_market',
-                'volatility': 'low_volatility',
-                'market_strength_score': 50.0,
-                'market_risk_level': 'medium',
-                'last_updated': datetime.now().strftime('%H:%M:%S'),
-                'data_quality': 'limited',
-                'confidence_score': 0.5
-            }
 
     def get_active_positions(self) -> List[Dict[str, Any]]:
         """활성 포지션 조회"""

@@ -788,12 +788,6 @@ class SellPositionManager:
             holding_hours = calculate_business_hours(reference_time, current_time)
             holding_minutes = holding_hours * 60
 
-            # 1. 긴급 상황 체크 (최소 보유시간 무시)
-            emergency_check = self.manager.candle_analyzer._check_emergency_conditions(position)
-            if emergency_check['is_emergency']:
-                logger.warning(f"🚨 {position.stock_code} 긴급상황 감지 - 최소시간 무시: {emergency_check['reason']}")
-                return {'can_exit': True, 'reason': 'emergency', 'detail': emergency_check['reason']}
-
             # 🆕 2. 매수체결시간 기반 캔들전략 적용
             execution_strategy = self.manager.config.get('execution_time_strategy', {})
             if execution_strategy.get('use_execution_time', False) and position.performance.buy_execution_time:
@@ -883,13 +877,11 @@ class SellPositionManager:
             # 오류시 기본 패턴별 최소시간 반환
             return self._get_pattern_min_holding_time(position)
 
-
-
     def _get_pattern_min_holding_time(self, position: CandleTradeCandidate) -> float:
         """패턴별 최소 보유시간 가져오기 (분 단위)"""
         try:
-            # 기본 최소 보유시간 (캔들패턴 전략에 맞게 하루로 설정)
-            default_min_minutes = self.manager.config.get('min_holding_minutes', 1440)
+            # 기본 최소 보유시간 (패턴이 없는 경우만 사용)
+            default_min_minutes = 1440  # 24시간
 
             # 캔들 전략 종목인지 확인
             is_candle_strategy = (
