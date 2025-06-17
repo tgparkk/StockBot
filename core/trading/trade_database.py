@@ -1569,13 +1569,27 @@ class TradeDatabase:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
-                # 기술적 신호들을 JSON으로 저장
+                # 🆕 기술적 신호 및 패턴 정보를 JSON으로 저장
                 technical_signals = json.dumps({
+                    # 기술적 지표
                     'rsi': additional_data.get('rsi_value'),
                     'macd': additional_data.get('macd_value'),
                     'volume_ratio': additional_data.get('volume_ratio'),
                     'support_level': additional_data.get('support_level'),
-                    'resistance_level': additional_data.get('resistance_level')
+                    'resistance_level': additional_data.get('resistance_level'),
+                    
+                    # 🆕 패턴 정보
+                    'pattern_strength': additional_data.get('pattern_strength'),
+                    'pattern_confidence': additional_data.get('pattern_confidence'),
+                    
+                    # 🆕 신호 정보
+                    'signal_strength': additional_data.get('signal_strength'),
+                    'entry_priority': additional_data.get('entry_priority'),
+                    'trade_signal': additional_data.get('trade_signal'),
+                    
+                    # 🆕 추가 메타데이터
+                    'analysis_timestamp': datetime.now().isoformat(),
+                    'data_source': 'candle_trade_manager'
                 }, ensure_ascii=False)
 
                 # 🆕 한국시간 사용
@@ -1933,3 +1947,134 @@ class TradeDatabase:
                 return cursor.rowcount > 0
 
         return self._execute_with_retry(_update_status)
+
+    def save_candle_trade_enhanced(self, candidate, trade_type: str,
+                                 executed_price: float, executed_quantity: int, order_no: str,
+                                 decision_reason: str, profit_loss: int = 0, profit_rate: float = 0.0):
+        """🆕 캔들 거래 기록 저장 (강화된 버전 - CandleTradeManager에서 이전)"""
+        def _save_enhanced_trade():
+            try:
+                if not self:
+                    logger.debug(f"📚 {candidate.stock_code} DB 없음 - candle_trades 저장 스킵")
+                    return 0
+
+                # candidate_id 찾기 (candle_candidates 테이블에서)
+                candidate_id = candidate.metadata.get('db_id')
+                if not candidate_id:
+                    # DB에서 찾기 시도
+                    candidates = self.get_candle_candidates(status=None, days=7)
+                    for cand in candidates:
+                        if cand['stock_code'] == candidate.stock_code:
+                            candidate_id = cand['id']
+                            candidate.metadata['db_id'] = candidate_id
+                            break
+
+                if not candidate_id:
+                    logger.warning(f"⚠️ {candidate.stock_code} candidate_id를 찾을 수 없음 - candle_trades 저장 실패")
+                    return 0
+
+                # 🆕 개선된 패턴 정보 추출
+                pattern_matched = None
+                pattern_strength = None
+                pattern_confidence = None
+                
+                if candidate.detected_patterns and len(candidate.detected_patterns) > 0:
+                    strongest_pattern = candidate.detected_patterns[0]
+                    pattern_matched = strongest_pattern.pattern_type.value
+                    pattern_strength = getattr(strongest_pattern, 'strength', None)
+                    pattern_confidence = getattr(strongest_pattern, 'confidence', None)
+                
+                # 🆕 신호 강도 및 점수 정보 추출
+                signal_strength = getattr(candidate, 'signal_strength', None)
+                entry_priority = getattr(candidate, 'entry_priority', None)
+                trade_signal = candidate.trade_signal.value if candidate.trade_signal else 'UNKNOWN'
+
+                # 🆕 개선된 기술적 지표 정보 추출
+                technical_indicators = candidate.metadata.get('technical_indicators', {})
+                latest_analysis = candidate.metadata.get('latest_analysis_result', {})
+                
+                # 여러 소스에서 기술적 지표 값 추출 시도
+                rsi_value = (technical_indicators.get('rsi') or 
+                            latest_analysis.get('rsi_value') or
+                            candidate.metadata.get('rsi_value'))
+                
+                macd_value = (technical_indicators.get('macd') or 
+                             latest_analysis.get('macd_value') or
+                             candidate.metadata.get('macd_value'))
+                
+                volume_ratio = (technical_indicators.get('volume_ratio') or 
+                               latest_analysis.get('volume_ratio') or
+                               candidate.metadata.get('volume_ratio'))
+
+                # 보유 시간 계산 (매도인 경우)
+                hold_duration = 0
+                if trade_type == 'EXIT' and candidate.performance.entry_time:
+                    from datetime import datetime, timezone, timedelta
+                    korea_tz = timezone(timedelta(hours=9))
+                    
+                    entry_time = candidate.performance.entry_time
+                    current_time = datetime.now(korea_tz)
+                    if entry_time.tzinfo is None:
+                        entry_time = entry_time.replace(tzinfo=korea_tz)
+                    hold_duration = int((current_time - entry_time).total_seconds() / 60)  # 분 단위
+
+                # 🆕 시장 상황 정보 추출 (TradeDatabase에서는 기본값 사용)
+                market_condition = 'NORMAL'
+
+                # 🆕 강화된 정보로 candle_trades 테이블에 저장
+                trade_id = self.record_candle_trade(
+                    candidate_id=candidate_id,
+                    trade_type=trade_type,
+                    stock_code=candidate.stock_code,
+                    stock_name=candidate.stock_name,
+                    quantity=executed_quantity,
+                    price=int(executed_price),
+                    total_amount=int(executed_price * executed_quantity),
+                    decision_reason=decision_reason,
+                    pattern_matched=pattern_matched,
+                    order_id=order_no,
+                    # 기본 정보들은 **additional_data로 전달
+                    entry_price=int(candidate.performance.entry_price) if candidate.performance.entry_price else None,
+                    profit_loss=profit_loss,
+                    profit_rate=profit_rate,
+                    hold_duration=hold_duration,
+                    market_condition=market_condition,
+                    rsi_value=rsi_value,
+                    macd_value=macd_value,
+                    volume_ratio=volume_ratio,
+                    # 🆕 패턴 및 신호 정보 (JSON으로 저장됨)
+                    pattern_strength=pattern_strength,
+                    pattern_confidence=pattern_confidence,
+                    signal_strength=signal_strength,
+                    entry_priority=entry_priority,
+                    trade_signal=trade_signal,
+                    # 🆕 추가 메타데이터
+                    support_level=candidate.metadata.get('support_level'),
+                    resistance_level=candidate.metadata.get('resistance_level'),
+                    stop_loss_triggered=False,
+                    target_achieved=False,
+                    trailing_stop_triggered=False
+                )
+
+                # 🆕 디버깅을 위한 상세 로깅
+                logger.debug(f"📊 {candidate.stock_code} DB 저장 정보: "
+                            f"패턴={pattern_matched}({pattern_strength}), "
+                            f"신호={trade_signal}({signal_strength}), "
+                            f"RSI={rsi_value}, MACD={macd_value}, "
+                            f"거래량비율={volume_ratio}")
+
+                if trade_id > 0:
+                    logger.info(f"📚 {candidate.stock_code} candle_trades 저장 완료: {trade_type} (ID: {trade_id})")
+                    candidate.metadata['candle_trade_id'] = trade_id
+                    return trade_id
+                else:
+                    logger.warning(f"⚠️ {candidate.stock_code} candle_trades 저장 실패")
+                    return 0
+
+            except Exception as e:
+                logger.error(f"❌ {candidate.stock_code} candle_trades 저장 오류: {e}")
+                import traceback
+                logger.error(f"❌ 상세 오류:\n{traceback.format_exc()}")
+                return 0
+
+        return self._execute_with_retry(_save_enhanced_trade)

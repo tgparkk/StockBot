@@ -123,9 +123,8 @@ class MarketScanner:
                 try:
                     # 🚨 이미 보유/주문 중인 종목은 스캔에서 제외 (중복 매수 방지)
                     skip_analysis = False
-                    if (hasattr(self.manager, 'stock_manager') and 
-                        hasattr(self.manager.stock_manager, '_all_stocks') and
-                        stock_code in self.manager.stock_manager._all_stocks):
+
+                    if stock_code in self.manager.stock_manager._all_stocks:
                         
                         existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
                         
@@ -142,6 +141,7 @@ class MarketScanner:
                         # 🔄 WATCHING, SCANNING, BUY_READY 상태는 신호 업데이트를 위해 분석 계속
                         else:
                             logger.debug(f"🔄 {stock_code} 기존 관리 종목 신호 업데이트: {existing_candidate.status.value}")
+                        
                     
                     if skip_analysis:
                         continue
@@ -281,7 +281,7 @@ class MarketScanner:
 
             # 기본 정보 추출
             current_price = float(current_info.iloc[0].get('stck_prpr', 0))
-            stock_name = current_info.iloc[0].get('hts_kor_isnm', f'{stock_code}')
+            stock_name = current_info.iloc[0].get('prdt_name', f'{stock_code}')
 
             if current_price <= 0:
                 return None
@@ -295,9 +295,7 @@ class MarketScanner:
             use_cached_data = False
 
             # 🚀 candle_trade_manager의 stock_manager._all_stocks에서 캐시된 데이터 우선 확인
-            if (hasattr(self.manager, 'stock_manager') and
-                hasattr(self.manager.stock_manager, '_all_stocks') and
-                stock_code in self.manager.stock_manager._all_stocks):
+            if stock_code in self.manager.stock_manager._all_stocks:
                 existing_candidate = self.manager.stock_manager._all_stocks[stock_code]
 
                 # 🔧 중요한 상태(ENTERED, PENDING_ORDER)는 스캔에서 제외
@@ -309,6 +307,7 @@ class MarketScanner:
                 if ohlcv_data is not None and not ohlcv_data.empty:
                     use_cached_data = True
 
+                    
             # 캐시에 없으면 API 호출 (timeout 설정으로 성능 향상)
             if ohlcv_data is None or ohlcv_data.empty:
                 try:
