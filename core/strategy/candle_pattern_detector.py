@@ -3,6 +3,8 @@
 """
 import pandas as pd
 import numpy as np
+import json
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from utils.logger import setup_logger
@@ -43,10 +45,85 @@ class CandlePatternDetector:
             'downtrend_strength_min': 0.015,     # 하락추세 최소 강도 1.5% (기존 0.5%에서 강화)
             'min_confidence': 0.65,              # 최소 신뢰도 65% (기존 60%에서 강화)
         }
+        
+        # 🆕 Config 파일 경로 및 캐시
+        self.config_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
+            'config', 'candle_strategy_config.json'
+        )
+        self._config_cache = None
+        self._config_last_loaded = None
+
+    def _load_config(self) -> Dict:
+        """🆕 Config 파일 로드 (캐싱 적용)"""
+        try:
+            # 캐시된 설정이 있고 5분 이내라면 재사용
+            if (self._config_cache and self._config_last_loaded and 
+                (datetime.now() - self._config_last_loaded).seconds < 300):
+                return self._config_cache
+                
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                
+            self._config_cache = config
+            self._config_last_loaded = datetime.now()
+            
+            logger.debug("📄 Config 파일 로드 완료")
+            return config
+            
+        except Exception as e:
+            logger.error(f"Config 파일 로드 실패: {e}")
+            # 기본값 반환
+            return {
+                "pattern_targets": {
+                    "hammer": {"target": 1.8, "stop": 1.5},
+                    "bullish_engulfing": {"target": 2.3, "stop": 2.0},
+                    "piercing_line": {"target": 1.8, "stop": 1.5},
+                    "morning_star": {"target": 2.5, "stop": 2.5}
+                }
+            }
+
+    def _get_pattern_config(self, pattern_type: PatternType) -> Dict:
+        """🆕 패턴별 Config 값 조회"""
+        config = self._load_config()
+        pattern_targets = config.get('pattern_targets', {})
+        
+        # PatternType enum을 문자열로 변환
+        pattern_key = pattern_type.value
+        
+        if pattern_key in pattern_targets:
+            target_config = pattern_targets[pattern_key]
+            return {
+                'target_price_ratio': 1.0 + (target_config.get('target', 2.0) / 100.0),
+                'stop_loss_ratio': 1.0 - (target_config.get('stop', 2.0) / 100.0),
+                'max_hours': target_config.get('max_hours', 24),
+                'min_minutes': target_config.get('min_minutes', 720)
+            }
+        else:
+            # 기본값
+            logger.warning(f"⚠️ {pattern_key} 패턴 Config 없음, 기본값 사용")
+            return {
+                'target_price_ratio': 1.02,  # 2% 목표
+                'stop_loss_ratio': 0.98,     # 2% 손절
+                'max_hours': 24,
+                'min_minutes': 720
+            }
 
     def analyze_stock_patterns(self, stock_code: str, ohlcv_data: pd.DataFrame,
                              volume_data: Optional[pd.DataFrame] = None) -> List[CandlePatternInfo]:
-        """🎯 개선된 패턴 분석 - 더 실용적인 조건들로 변경"""
+        """
+        🎯 캔들 패턴 분석 - Config 파일 기반 목표/손절 설정
+        
+        📈 매수 타이밍 설명:
+        - 망치형/상승장악형/관통형/아침샛별 패턴이 감지되면
+        - **반전 신호로 판단하여 다음날 시가에 매수 시도**
+        - 즉, 하락추세 중 반전 패턴 출현 → 즉시 매수 (반전 전 매수)
+        - detected_at=1 (어제 캔들에서 패턴 감지) → 오늘 시가 매수
+        
+        🎯 Config 연동:
+        - target_price_ratio, stop_loss_ratio는 candle_strategy_config.json에서 로드
+        - 패턴별로 다른 목표/손절 비율 적용 가능
+        """
         try:
             if ohlcv_data is None or ohlcv_data.empty:
                 logger.warning(f"🔍 {stock_code}: OHLCV 데이터 없음")
@@ -243,313 +320,13 @@ class CandlePatternDetector:
             logger.error(f"기본 데이터 전처리 오류: {e}")
             return pd.DataFrame()
 
-    def _detect_hammer_pattern_new(self, df: pd.DataFrame, stock_code: str) -> List[CandlePatternInfo]:
-        """🔨 망치형 패턴 감지 - 5일 데이터 기준"""
-        patterns = []
-        
-        try:
-            # 어제 캔들(index=1)에서 패턴 확인 (오늘은 index=0)
-            yesterday_idx = 1
-            if yesterday_idx >= len(df):
-                logger.debug(f"🔨 {stock_code} 망치형: 어제 데이터 없음 (인덱스 {yesterday_idx} >= {len(df)})")
-                return patterns
-                
-            yesterday = df.iloc[yesterday_idx]
-            
-            # 🆕 디버깅: 어제 캔들 정보
-            logger.debug(f"🔨 {stock_code} 망치형 분석 - 어제: O={yesterday.get('open', 0):.0f}, "
-                        f"H={yesterday.get('high', 0):.0f}, L={yesterday.get('low', 0):.0f}, "
-                        f"C={yesterday.get('close', 0):.0f}")
-            
-            # 망치형 기본 조건
-            body_size = abs(yesterday['close'] - yesterday['open'])
-            total_range = yesterday['high'] - yesterday['low']
-            lower_shadow = min(yesterday['open'], yesterday['close']) - yesterday['low']
-            upper_shadow = yesterday['high'] - max(yesterday['open'], yesterday['close'])
-            
-            # 🆕 디버깅: 캔들 구성 요소
-            logger.debug(f"🔨 {stock_code} 캔들 구성: 몸통={body_size:.0f}, 전체범위={total_range:.0f}, "
-                        f"아래꼬리={lower_shadow:.0f}, 윗꼬리={upper_shadow:.0f}")
-            
-            if total_range <= 0:
-                logger.debug(f"🔨 {stock_code} 망치형 실패: 전체 범위가 0")
-                return patterns
-                
-            lower_shadow_ratio = lower_shadow / total_range
-            upper_shadow_ratio = upper_shadow / total_range
-            body_ratio = body_size / total_range
-            
-            # 🆕 디버깅: 비율 정보
-            logger.debug(f"🔨 {stock_code} 비율: 아래꼬리={lower_shadow_ratio:.2f}, "
-                        f"윗꼬리={upper_shadow_ratio:.2f}, 몸통={body_ratio:.2f}")
-            
-            # 🆕 완화된 망치형 조건: 긴 아래꼬리 + 작은 몸통 + 짧은 윗꼬리
-            hammer_conditions = {
-                'lower_shadow': lower_shadow_ratio >= 0.5,  # 🔧 60% → 50%로 완화
-                'body_size': body_ratio <= 0.4,            # 🔧 30% → 40%로 완화  
-                'upper_shadow': upper_shadow_ratio <= 0.15  # 🔧 10% → 15%로 완화
-            }
-            
-            # 🆕 디버깅: 각 조건 체크
-            for condition, result in hammer_conditions.items():
-                logger.debug(f"🔨 {stock_code} 조건 {condition}: {'✅' if result else '❌'}")
-            
-            if all(hammer_conditions.values()):
-                logger.debug(f"🔨 {stock_code} 망치형 기본 조건 통과 - 하락추세 확인 중...")
-                
-                # 🆕 완화된 하락추세 확인 (5일간)
-                downtrend_strength = self._check_downtrend_simple(df, yesterday_idx, 5)
-                logger.debug(f"🔨 {stock_code} 하락추세 강도: {downtrend_strength:.2f} (기준: 0.2)")
-                
-                if downtrend_strength > 0.2:  # 🔧 30% → 20%로 완화
-                    # 종가가 상단부에 있는지 확인
-                    close_position = (yesterday['close'] - yesterday['low']) / total_range
-                    logger.debug(f"🔨 {stock_code} 종가 위치: {close_position:.2f} (기준: 0.4)")
-                    
-                    if close_position >= 0.4:  # 🔧 50% → 40%로 완화
-                        confidence = 0.5 + (lower_shadow_ratio * 0.3) + (downtrend_strength * 0.2)  # 🔧 기본 신뢰도 0.6 → 0.5
-                        strength = int(60 + (lower_shadow_ratio * 20) + (downtrend_strength * 20))  # 🔧 기본 강도 70 → 60
-                        
-                        pattern = CandlePatternInfo(
-                            pattern_type=PatternType.HAMMER,
-                            confidence=min(confidence, 0.95),
-                            strength=min(strength, 100),
-                            description=f"망치형 패턴 - 아래꼬리: {lower_shadow_ratio:.1%}, 하락추세: {downtrend_strength:.1%}",
-                            detected_at=yesterday_idx,
-                            support_price=yesterday['low'],
-                            target_price=yesterday['close'] * 1.05,  # 5% 목표
-                            metadata={
-                                'lower_shadow_ratio': lower_shadow_ratio,
-                                'body_ratio': body_ratio,
-                                'upper_shadow_ratio': upper_shadow_ratio,
-                                'downtrend_strength': downtrend_strength,
-                                'close_position': close_position
-                            }
-                        )
-                        
-                        patterns.append(pattern)
-                        logger.info(f"🔨 {stock_code} 망치형 패턴 발견! 신뢰도: {confidence:.2f}, 강도: {strength}")
-                    else:
-                        logger.debug(f"🔨 {stock_code} 망치형 실패: 종가 위치 부족 ({close_position:.2f} < 0.4)")
-                else:
-                    logger.debug(f"🔨 {stock_code} 망치형 실패: 하락추세 부족 ({downtrend_strength:.2f} < 0.2)")
-            else:
-                failed_conditions = [k for k, v in hammer_conditions.items() if not v]
-                logger.debug(f"🔨 {stock_code} 망치형 실패: 기본 조건 미충족 ({', '.join(failed_conditions)})")
+# 🗑️ 기존 _detect_hammer_pattern_new 함수 제거 (사용하지 않음)
 
-            return patterns
+# 🗑️ 기존 _detect_bullish_engulfing_pattern_new 함수 제거 (사용하지 않음)
 
-        except Exception as e:
-            logger.error(f"🔨 {stock_code} 망치형 패턴 감지 오류: {e}")
-            return patterns
+# 🗑️ 기존 _detect_piercing_line_pattern_new 함수 제거 (사용하지 않음)
 
-    def _detect_bullish_engulfing_pattern_new(self, df: pd.DataFrame, stock_code: str) -> List[CandlePatternInfo]:
-        """📈 상승장악형 패턴 감지 - 4일 데이터 기준"""
-        patterns = []
-        
-        try:
-            # 어제 캔들(index=1)과 그 전날(index=2) 비교
-            if len(df) < 2:
-                logger.debug(f"📈 {stock_code} 상승장악형: 데이터 부족 ({len(df)}일 < 2일)")
-                return patterns
-                
-            yesterday = df.iloc[1]  # 어제 (장악하는 양봉)
-            day_before = df.iloc[2]  # 그 전날 (장악당하는 음봉)
-            
-            # 🆕 디버깅: 두 캔들 정보
-            logger.debug(f"📈 {stock_code} 상승장악형 분석:")
-            logger.debug(f"   전날: O={day_before.get('open', 0):.0f}, C={day_before.get('close', 0):.0f} ({'음봉' if day_before['close'] < day_before['open'] else '양봉'})")
-            logger.debug(f"   어제: O={yesterday.get('open', 0):.0f}, C={yesterday.get('close', 0):.0f} ({'양봉' if yesterday['close'] > yesterday['open'] else '음봉'})")
-            
-            # 🆕 완화된 조건 체크
-            day_before_is_bearish = day_before['close'] < day_before['open']  # 전날 음봉
-            yesterday_is_bullish = yesterday['close'] > yesterday['open']      # 어제 양봉
-            
-            engulfing_conditions = {
-                'day_before_bearish': day_before_is_bearish,
-                'yesterday_bullish': yesterday_is_bullish
-            }
-            
-            # 🆕 디버깅: 기본 조건 체크
-            for condition, result in engulfing_conditions.items():
-                logger.debug(f"📈 {stock_code} 조건 {condition}: {'✅' if result else '❌'}")
-            
-            if day_before_is_bearish and yesterday_is_bullish:
-                # 🆕 완화된 완전포함 조건: 어제 양봉이 전날 음봉을 완전히 포함
-                engulf_open = yesterday['open'] <= day_before['close']  # 🔧 < 에서 <= 로 완화
-                engulf_close = yesterday['close'] >= day_before['open']  # 🔧 > 에서 >= 로 완화
-                
-                logger.debug(f"📈 {stock_code} 포함 조건: 시가포함={'✅' if engulf_open else '❌'}, 종가포함={'✅' if engulf_close else '❌'}")
-                
-                if engulf_open and engulf_close:
-                    # 장악 강도 계산
-                    day_before_body = abs(day_before['open'] - day_before['close'])
-                    yesterday_body = abs(yesterday['open'] - yesterday['close'])
-                    engulfing_ratio = yesterday_body / day_before_body if day_before_body > 0 else 1
-                    
-                    logger.debug(f"📈 {stock_code} 장악 비율: {engulfing_ratio:.2f} (기준: 1.0)")
-                    
-                    if engulfing_ratio >= 1.0:  # 🔧 1.1 → 1.0으로 완화 (같은 크기도 허용)
-                        # 🆕 완화된 하락추세 확인
-                        downtrend_strength = self._check_downtrend_simple(df, 2, 4)  # 4일간 확인
-                        logger.debug(f"📈 {stock_code} 하락추세 강도: {downtrend_strength:.2f} (기준: 0.15)")
-                        
-                        if downtrend_strength > 0.15:  # 🔧 더 완화된 조건
-                            confidence = 0.6 + min((engulfing_ratio - 1) * 0.3, 0.3) + (downtrend_strength * 0.1)  # 🔧 기본 신뢰도 0.7 → 0.6
-                            strength = int(70 + min((engulfing_ratio - 1) * 15, 20) + (downtrend_strength * 10))  # 🔧 기본 강도 75 → 70
-                            
-                            pattern = CandlePatternInfo(
-                                pattern_type=PatternType.BULLISH_ENGULFING,
-                                confidence=min(confidence, 0.95),
-                                strength=min(strength, 100),
-                                description=f"상승장악형 패턴 - 장악비율: {engulfing_ratio:.2f}, 하락추세: {downtrend_strength:.2f}",
-                                detected_at=1,
-                                support_price=min(yesterday['low'], day_before['low']),
-                                target_price=yesterday['close'] * 1.03,  # 3% 목표 (강한 패턴)
-                                metadata={
-                                    'engulfing_ratio': engulfing_ratio,
-                                    'downtrend_strength': downtrend_strength,
-                                    'day_before_body': day_before_body,
-                                    'yesterday_body': yesterday_body
-                                }
-                            )
-                            patterns.append(pattern)
-                            logger.info(f"📈 {stock_code} 상승장악형 패턴 발견! 신뢰도: {confidence:.2f}, 강도: {strength}")
-                        else:
-                            logger.debug(f"📈 {stock_code} 상승장악형 실패: 하락추세 부족 ({downtrend_strength:.2f} < 0.15)")
-                    else:
-                        logger.debug(f"📈 {stock_code} 상승장악형 실패: 장악 비율 부족 ({engulfing_ratio:.2f} < 1.0)")
-                else:
-                    logger.debug(f"📈 {stock_code} 상승장악형 실패: 완전 포함 조건 미충족")
-            else:
-                failed_conditions = [k for k, v in engulfing_conditions.items() if not v]
-                logger.debug(f"📈 {stock_code} 상승장악형 실패: 기본 조건 미충족 ({', '.join(failed_conditions)})")
-                        
-        except Exception as e:
-            logger.error(f"📈 {stock_code} 상승장악형 패턴 감지 오류: {e}")
-            
-        return patterns
-
-    def _detect_piercing_line_pattern_new(self, df: pd.DataFrame, stock_code: str) -> List[CandlePatternInfo]:
-        """⚡ 관통형 패턴 감지 - 3일 데이터 기준"""
-        patterns = []
-        
-        try:
-            if len(df) < 2:
-                return patterns
-                
-            yesterday = df.iloc[1]  # 어제 (관통하는 양봉)
-            day_before = df.iloc[2]  # 그 전날 (강한 음봉)
-            
-            # 전날이 강한 음봉
-            day_before_body = abs(day_before['open'] - day_before['close'])
-            day_before_range = day_before['high'] - day_before['low']
-            
-            if (day_before['close'] < day_before['open'] and  # 전날 음봉
-                day_before_body / day_before_range >= 0.6):   # 몸통이 전체의 60% 이상 (강한 음봉)
-                
-                # 어제가 양봉이고 갭하락 후 반등
-                if (yesterday['close'] > yesterday['open'] and    # 어제 양봉
-                    yesterday['open'] < day_before['close']):     # 갭하락 시작
-                    
-                    # 관통 깊이 확인 (전날 몸통의 50% 이상 관통)
-                    penetration = yesterday['close'] - day_before['close']
-                    day_before_body_size = day_before['open'] - day_before['close']
-                    penetration_ratio = penetration / day_before_body_size if day_before_body_size > 0 else 0
-                    
-                    if penetration_ratio >= 0.5:  # 50% 이상 관통
-                        confidence = 0.65 + min(penetration_ratio * 0.2, 0.25)
-                        strength = int(70 + penetration_ratio * 20)
-                        
-                        pattern = CandlePatternInfo(
-                            pattern_type=PatternType.PIERCING_LINE,
-                            confidence=min(confidence, 0.9),
-                            strength=min(strength, 95),
-                            detected_at=1,
-                            trade_signal=TradeSignal.BUY,
-                            target_price_ratio=1.02,  # 2% 목표
-                            stop_loss_ratio=0.985,    # 1.5% 손절
-                            expected_duration_hours=24  # 당일-1일 보유
-                        )
-                        patterns.append(pattern)
-                        logger.debug(f"⚡ {stock_code} 관통형 패턴 감지 (관통률: {penetration_ratio:.2f})")
-                        
-        except Exception as e:
-            logger.debug(f"관통형 패턴 감지 오류 ({stock_code}): {e}")
-            
-        return patterns
-
-    def _detect_morning_star_pattern_new(self, df: pd.DataFrame, stock_code: str) -> List[CandlePatternInfo]:
-        """⭐ 아침샛별 패턴 감지 - 4일 데이터 기준"""
-        patterns = []
-        
-        try:
-            if len(df) < 3:
-                return patterns
-                
-            yesterday = df.iloc[1]      # 어제 (3일차 - 강한 양봉)
-            middle_day = df.iloc[2]     # 중간일 (두 번째 캔들 - 작은 몸통)
-            day_before = df.iloc[3] if len(df) > 3 else df.iloc[2]  # 그 전전날 (첫 번째 캔들 - 음봉)
-            
-            # 🔧 직접 계산 (전처리 데이터 의존성 제거)
-            
-            # 1. 첫 번째 캔들이 음봉 (완화)
-            day_before_bearish = day_before['close'] < day_before['open']
-            if not day_before_bearish:
-                return patterns
-                
-            # 2. 세 번째 캔들이 양봉 (완화)
-            yesterday_bullish = yesterday['close'] > yesterday['open']
-            if not yesterday_bullish:
-                return patterns
-                
-            # 🆕 3. 매우 완화된 중간일 조건 (작은 몸통)
-            middle_body = abs(middle_day['close'] - middle_day['open'])
-            middle_range = middle_day['high'] - middle_day['low']
-            middle_body_ratio = middle_body / middle_range if middle_range > 0 else 1.0
-            small_body_condition = middle_body_ratio <= 0.6  # 40% → 60%로 대폭 완화
-            
-            # 🆕 4. 갭 조건 거의 제거 (한국 시장 특성 반영)
-            gap_condition = True  # 갭 조건 거의 제거
-            
-            if small_body_condition and gap_condition:
-                # 🔧 하락 추세 조건 대폭 완화
-                simple_downtrend = self._check_simple_downtrend(df, 3, 5)
-                
-                # 🔧 하락 추세 0.5% 이상이면 OK (기존 10%)
-                if simple_downtrend >= 0.005:
-                    # 🔧 양봉 강도 확인 (대폭 완화)
-                    yesterday_body = abs(yesterday['close'] - yesterday['open'])
-                    yesterday_range = yesterday['high'] - yesterday['low']
-                    bullish_strength = yesterday_body / yesterday_range if yesterday_range > 0 else 0
-                    if bullish_strength >= 0.15:  # 30% → 15%로 대폭 완화
-                        confidence = 0.7 + (bullish_strength * 0.15) + (simple_downtrend * 0.1)
-                        strength = int(70 + (bullish_strength * 20) + (simple_downtrend * 10))
-                        
-                        pattern = CandlePatternInfo(
-                            pattern_type=PatternType.MORNING_STAR,
-                            confidence=min(confidence, 0.95),
-                            strength=min(strength, 95),
-                            description=f"아침샛별 - 중간몸통:{middle_body_ratio:.1%}, 양봉강도:{bullish_strength:.1%}",
-                            detected_at=1,
-                            target_price_ratio=1.06,  # 6% 목표
-                            stop_loss_ratio=0.95,     # 5% 손절
-                            metadata={
-                                'middle_body_ratio': middle_body_ratio,
-                                'bullish_strength': bullish_strength,
-                                'gap_condition': gap_condition,
-                                'simple_downtrend': simple_downtrend,
-                                'support_price': middle_day['low']
-                            }
-                        )
-                        
-                        patterns.append(pattern)
-                        logger.info(f"⭐ {stock_code} 아침샛별 패턴 발견! (완화된 조건)")
-                    
-        except Exception as e:
-            logger.error(f"아침샛별 패턴 감지 오류 ({stock_code}): {e}")
-            
-        return patterns
+# 🗑️ 기존 _detect_morning_star_pattern_new 함수 제거 (사용하지 않음)
 
     def _check_downtrend_simple(self, df: pd.DataFrame, start_idx: int, days: int) -> float:
         """🆕 개선된 하락추세 확인 - 더 관대한 조건"""
@@ -1117,19 +894,25 @@ class CandlePatternDetector:
                     confidence = 0.6 + (lower_shadow_ratio * 0.3) + (simple_downtrend * 0.1)
                     strength = int(60 + (lower_shadow_ratio * 25) + (simple_downtrend * 15))
                     
+                    # 🆕 Config에서 목표/손절 비율 로드
+                    pattern_config = self._get_pattern_config(PatternType.HAMMER)
+                    
                     pattern = CandlePatternInfo(
                         pattern_type=PatternType.HAMMER,
                         confidence=min(confidence, 0.9),
                         strength=min(strength, 95),
                         description=f"망치형 - 아래꼬리:{lower_shadow_ratio:.1%}, 하락추세:{simple_downtrend:.1%}",
                         detected_at=1,
-                        target_price_ratio=1.03,  # 3% 목표
-                        stop_loss_ratio=0.97,     # 3% 손절
+                        target_price_ratio=pattern_config['target_price_ratio'],  # Config 값 사용
+                        stop_loss_ratio=pattern_config['stop_loss_ratio'],        # Config 값 사용
+                        expected_duration_hours=pattern_config['max_hours'],      # Config 값 사용
                         metadata={
                             'lower_shadow_ratio': lower_shadow_ratio,
                             'body_ratio': body_ratio,
                             'simple_downtrend': simple_downtrend,
-                            'support_price': yesterday['low']
+                            'support_price': yesterday['low'],
+                            'config_target_pct': (pattern_config['target_price_ratio'] - 1.0) * 100,
+                            'config_stop_pct': (1.0 - pattern_config['stop_loss_ratio']) * 100
                         }
                     )
                     
@@ -1185,19 +968,25 @@ class CandlePatternDetector:
                     confidence = 0.65 + (size_ratio * 0.15) + (simple_downtrend * 0.1)
                     strength = int(65 + (size_ratio * 20) + (simple_downtrend * 15))
                     
+                    # 🆕 Config에서 목표/손절 비율 로드
+                    pattern_config = self._get_pattern_config(PatternType.BULLISH_ENGULFING)
+                    
                     pattern = CandlePatternInfo(
                         pattern_type=PatternType.BULLISH_ENGULFING,
                         confidence=min(confidence, 0.9),
                         strength=min(strength, 95),
                         description=f"상승장악형 - 크기비율:{size_ratio:.2f}, 하락추세:{simple_downtrend:.1%}",
                         detected_at=1,
-                        target_price_ratio=1.05,  # 5% 목표
-                        stop_loss_ratio=0.96,     # 4% 손절
+                        target_price_ratio=pattern_config['target_price_ratio'],  # Config 값 사용
+                        stop_loss_ratio=pattern_config['stop_loss_ratio'],        # Config 값 사용
+                        expected_duration_hours=pattern_config['max_hours'],      # Config 값 사용
                         metadata={
                             'size_ratio': size_ratio,
                             'engulfs_range': (engulfs_open, engulfs_close),
                             'simple_downtrend': simple_downtrend,
-                            'support_price': yesterday['low']
+                            'support_price': yesterday['low'],
+                            'config_target_pct': (pattern_config['target_price_ratio'] - 1.0) * 100,
+                            'config_stop_pct': (1.0 - pattern_config['stop_loss_ratio']) * 100
                         }
                     )
                     
@@ -1254,19 +1043,25 @@ class CandlePatternDetector:
                     confidence = 0.65 + (penetration_ratio * 0.2) + (simple_downtrend * 0.1)
                     strength = int(65 + (penetration_ratio * 25) + (simple_downtrend * 10))
                     
+                    # 🆕 Config에서 목표/손절 비율 로드
+                    pattern_config = self._get_pattern_config(PatternType.PIERCING_LINE)
+                    
                     pattern = CandlePatternInfo(
                         pattern_type=PatternType.PIERCING_LINE,
                         confidence=min(confidence, 0.9),
                         strength=min(strength, 95),
                         description=f"관통형 - 관통비율:{penetration_ratio:.1%}, 하락추세:{simple_downtrend:.1%}",
                         detected_at=1,
-                        target_price_ratio=1.04,  # 4% 목표
-                        stop_loss_ratio=0.97,     # 3% 손절
+                        target_price_ratio=pattern_config['target_price_ratio'],  # Config 값 사용
+                        stop_loss_ratio=pattern_config['stop_loss_ratio'],        # Config 값 사용
+                        expected_duration_hours=pattern_config['max_hours'],      # Config 값 사용
                         metadata={
                             'penetration_ratio': penetration_ratio,
                             'gap_down': gap_down,
                             'simple_downtrend': simple_downtrend,
-                            'support_price': yesterday['low']
+                            'support_price': yesterday['low'],
+                            'config_target_pct': (pattern_config['target_price_ratio'] - 1.0) * 100,
+                            'config_stop_pct': (1.0 - pattern_config['stop_loss_ratio']) * 100
                         }
                     )
                     

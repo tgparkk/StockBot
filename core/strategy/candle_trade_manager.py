@@ -448,6 +448,9 @@ class CandleTradeManager:
             success = self.stock_manager.add_candidate(candidate, strategy_source="existing_holding")
 
             if success:
+                # 🆕 7. candidate가 추가된 후 OHLCV 데이터 캐싱
+                await self._cache_ohlcv_data_for_holding(stock_code)
+                
                 logger.info(f"✅ {stock_code} 기존 보유 종목 CandleTradeCandidate 생성 완료 (전략:existing_holding)")
                 return True
             else:
@@ -458,52 +461,223 @@ class CandleTradeManager:
             logger.error(f"❌ 기존 보유 종목 CandleTradeCandidate 생성 실패 ({stock_code}): {e}")
             return False
 
-    async def _analyze_holding_candle_patterns(self, stock_code: str, stock_name: str, current_price: float) -> Optional[Dict]:
-        """🔄 기존 보유 종목의 패턴 정보 분석 - DB에서 읽어오거나 기본값 반환"""
+    async def _cache_ohlcv_data_for_holding(self, stock_code: str) -> bool:
+        """🆕 기존 보유 종목의 OHLCV 데이터 캐싱 및 패턴 재분석"""
         try:
-            logger.debug(f"🔄 {stock_code} 보유 종목 패턴 정보 분석 시작")
+            # candidate가 _all_stocks에 있는지 확인
+            if stock_code not in self.stock_manager._all_stocks:
+                logger.warning(f"⚠️ {stock_code} candidate가 _all_stocks에 없음 - 캐싱 불가")
+                return False
 
-            # 🆕 1단계: DB에서 기존 매수 패턴 정보 조회
-            db_pattern_info = await self._get_pattern_info_from_db(stock_code)
-            if db_pattern_info:
-                pattern_type = db_pattern_info.get('strongest_pattern', {}).get('type', 'UNKNOWN')
-                confidence = db_pattern_info.get('strongest_pattern', {}).get('confidence', 0.5)
-                logger.info(f"📚 {stock_code} DB에서 패턴 정보 복원: {pattern_type} "
-                           f"(신뢰도: {confidence:.2f})")
-                return db_pattern_info
+            candidate = self.stock_manager._all_stocks[stock_code]
+            
+            # 이미 캐시된 데이터가 있는지 확인
+            existing_data = candidate.get_ohlcv_data()
+            if existing_data is not None and not existing_data.empty:
+                logger.debug(f"📄 {stock_code} 이미 캐시된 OHLCV 데이터 존재")
+                # 🆕 캐시된 데이터로도 패턴 재분석 시도
+                await self._reanalyze_patterns_for_holding(candidate, existing_data)
+                return True
 
-            # 🆕 2단계: DB에 정보가 없으면 OHLCV 데이터 캐싱만 수행
-            logger.debug(f"📊 {stock_code} DB에 패턴 정보 없음 - 캐싱 후 기본값 반환")
+            # OHLCV 데이터 조회
+            logger.debug(f"📥 {stock_code} OHLCV 데이터 조회 시작")
+            from ..api.kis_market_api import get_inquire_daily_itemchartprice
+            ohlcv_data = get_inquire_daily_itemchartprice(
+                output_dv="2",  # 일자별 차트 데이터 배열
+                itm_no=stock_code,
+                period_code="D",  # 일봉
+                adj_prc="1"
+            )
 
-            # 🆕 기존 _all_stocks에서 캐시된 데이터 확인
-            ohlcv_data = None
-            if stock_code in self.stock_manager._all_stocks:
-                candidate = self.stock_manager._all_stocks[stock_code]
-                ohlcv_data = candidate.get_ohlcv_data()
-                if ohlcv_data is not None:
-                    logger.debug(f"📄 {stock_code} 캐시된 일봉 데이터 사용")
-
-            # 캐시에 없으면 API 호출해서 캐싱만 수행
-            if ohlcv_data is None:
-                from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                ohlcv_data = get_inquire_daily_itemchartprice(
-                    output_dv="2",  # 일자별 차트 데이터 배열
-                    itm_no=stock_code,
-                    period_code="D",  # 일봉
-                    adj_prc="1"
-                )
-
-                # 🆕 조회 성공시 캐싱 (candidate가 있다면)
-                if ohlcv_data is not None and not ohlcv_data.empty and stock_code in self.stock_manager._all_stocks:
-                    self.stock_manager._all_stocks[stock_code].cache_ohlcv_data(ohlcv_data)
-                    logger.debug(f"📥 {stock_code} 일봉 데이터 조회 및 캐싱 완료")
-
-            # 🆕 3단계: 기본값 반환 (실시간 분석 생략)
-            logger.info(f"⚠️ {stock_code} 패턴 정보 없음 - 기본값 반환")
-            return self._get_default_pattern_info(stock_code, stock_name, current_price)
+            if ohlcv_data is not None and not ohlcv_data.empty:
+                # 캐싱 수행
+                candidate.cache_ohlcv_data(ohlcv_data)
+                logger.info(f"✅ {stock_code} OHLCV 데이터 캐싱 완료 ({len(ohlcv_data)}일)")
+                
+                # 🆕 패턴 재분석 및 DB 저장
+                await self._reanalyze_patterns_for_holding(candidate, ohlcv_data)
+                
+                return True
+            else:
+                logger.warning(f"⚠️ {stock_code} OHLCV 데이터 조회 실패")
+                return False
 
         except Exception as e:
-            logger.error(f"❌ {stock_code} 패턴 정보 분석 오류: {e}")
+            logger.error(f"❌ {stock_code} OHLCV 데이터 캐싱 오류: {e}")
+            return False
+
+    async def _reanalyze_patterns_for_holding(self, candidate: CandleTradeCandidate, ohlcv_data) -> bool:
+        """🆕 기존 보유 종목의 패턴 재분석 및 DB 업데이트"""
+        try:
+            stock_code = candidate.stock_code
+            logger.debug(f"🔄 {stock_code} 패턴 재분석 시작")
+            
+            # 패턴 감지 시도
+            pattern_result = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
+            
+            if pattern_result and len(pattern_result) > 0:
+                # 🎯 패턴 감지 성공 - candidate에 패턴 정보 추가
+                strongest_pattern = max(pattern_result, key=lambda p: p.strength)
+                
+                # 기존 패턴 정보 대체
+                candidate.detected_patterns = pattern_result
+                candidate.primary_pattern = strongest_pattern
+                candidate.pattern_score = int(strongest_pattern.confidence * 100)
+                
+                # 🆕 DB에 패턴 정보 업데이트 (기존 거래 레코드 업데이트)
+                pattern_info = {
+                    'pattern_type': strongest_pattern.pattern_type.value,
+                    'pattern_confidence': strongest_pattern.confidence,
+                    'pattern_strength': strongest_pattern.strength,
+                    'rsi_value': None,  # 기술적 지표는 추후 추가 가능
+                    'macd_value': None,
+                    'volume_ratio': None
+                }
+                
+                # 🆕 기존 매수 거래 레코드에 패턴 정보 업데이트
+                await self._update_existing_trade_pattern_info(stock_code, pattern_info)
+                
+                logger.info(f"🎯 {stock_code} 패턴 재분석 성공: {strongest_pattern.pattern_type.value} "
+                           f"(신뢰도: {strongest_pattern.confidence:.2f}, 강도: {strongest_pattern.strength})")
+                
+                return True
+            else:
+                # 🔧 패턴 감지 실패 - 기본 패턴 정보라도 저장
+                logger.debug(f"📊 {stock_code} 패턴 재분석 실패 - 기본 패턴 정보 저장")
+                
+                default_pattern_info = {
+                    'pattern_type': 'REANALYZED_UNKNOWN',  # 재분석했지만 패턴 없음을 명시
+                    'pattern_confidence': 0.5,
+                    'pattern_strength': 50,
+                    'rsi_value': None,
+                    'macd_value': None,
+                    'volume_ratio': None
+                }
+                
+                await self._update_existing_trade_pattern_info(stock_code, default_pattern_info)
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ {stock_code} 패턴 재분석 오류: {e}")
+            return False
+
+    async def _update_existing_trade_pattern_info(self, stock_code: str, pattern_info: Dict) -> bool:
+        """🆕 기존 거래 레코드에 패턴 정보 업데이트"""
+        try:
+            # 최근 매수 거래 찾기
+            recent_trades = self.trade_db.get_trade_history(
+                stock_code=stock_code,
+                days=5,
+                trade_type='BUY'
+            )
+            
+            if not recent_trades:
+                logger.debug(f"📊 {stock_code} 최근 매수 거래 없음")
+                return False
+            
+            # 가장 최근 매수 거래 업데이트
+            latest_trade = recent_trades[0]
+            trade_id = latest_trade.get('id')
+            
+            if trade_id:
+                # 🆕 DB 업데이트 (직접 SQL 실행)
+                import sqlite3
+                
+                try:
+                    with self.trade_db._get_connection() as conn:
+                        cursor = conn.cursor()
+                        
+                        cursor.execute("""
+                            UPDATE trades 
+                            SET pattern_type = ?, 
+                                pattern_confidence = ?, 
+                                pattern_strength = ?,
+                                rsi_value = ?,
+                                macd_value = ?,
+                                volume_ratio = ?
+                            WHERE id = ? AND trade_type = 'BUY'
+                        """, (
+                            pattern_info['pattern_type'],
+                            pattern_info['pattern_confidence'],
+                            pattern_info['pattern_strength'],
+                            pattern_info['rsi_value'],
+                            pattern_info['macd_value'],
+                            pattern_info['volume_ratio'],
+                            trade_id
+                        ))
+                        
+                        conn.commit()
+                        
+                        if cursor.rowcount > 0:
+                            logger.info(f"📝 {stock_code} 거래 레코드 패턴 정보 업데이트 완료 (ID: {trade_id})")
+                            return True
+                        else:
+                            logger.warning(f"⚠️ {stock_code} 거래 레코드 업데이트 실패 (ID: {trade_id})")
+                            return False
+                            
+                except sqlite3.Error as e:
+                    logger.error(f"❌ {stock_code} DB 업데이트 오류: {e}")
+                    return False
+            else:
+                logger.warning(f"⚠️ {stock_code} 거래 ID 없음")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ {stock_code} 거래 패턴 정보 업데이트 오류: {e}")
+            return False
+
+    async def _analyze_holding_candle_patterns(self, stock_code: str, stock_name: str, current_price: float) -> Optional[Dict]:
+        """🔄 기존 보유 종목의 패턴 정보 분석 - 종목 선정과 동일한 방식 사용"""
+        try:
+            logger.debug(f"🔄 {stock_code} 보유 종목 패턴 재분석 시작")
+
+            # 🆕 종목 선정과 동일한 패턴 분석 수행
+            from .market_scanner import MarketScanner
+            
+            # MarketScanner 인스턴스 생성 (기존 설정 재사용)
+            market_scanner = MarketScanner(
+                manager=self,
+                pattern_detector=self.pattern_detector,
+                pattern_manager=self.pattern_manager
+            )
+            
+            # 🎯 핵심: analyze_stock_for_patterns 함수 재사용
+            candidate_result = await market_scanner.analyze_stock_for_patterns(stock_code, "KOSPI")
+            
+            if candidate_result and candidate_result.detected_patterns:
+                # 성공적으로 패턴 분석 완료
+                strongest_pattern = max(candidate_result.detected_patterns, key=lambda p: p.strength)
+                
+                logger.info(f"🔄 {stock_code} 패턴 재분석 성공: {strongest_pattern.pattern_type.value} "
+                           f"(신뢰도: {strongest_pattern.confidence:.2f}, 강도: {strongest_pattern.strength})")
+                
+                # 기존 형식으로 변환하여 반환
+                return {
+                    'patterns_detected': True,
+                    'strongest_pattern': {
+                        'type': strongest_pattern.pattern_type.value,
+                        'confidence': strongest_pattern.confidence,
+                        'strength': strongest_pattern.strength,
+                        'description': strongest_pattern.description
+                    },
+                    'all_patterns': [
+                        {
+                            'type': p.pattern_type.value,
+                            'confidence': p.confidence,
+                            'strength': p.strength
+                        } for p in candidate_result.detected_patterns
+                    ],
+                    'analysis_source': 'reanalysis_with_market_scanner',
+                    'trade_signal': candidate_result.trade_signal.value if candidate_result.trade_signal else 'HOLD',
+                    'signal_strength': candidate_result.signal_strength or 0
+                }
+            else:
+                # 패턴 분석 실패 또는 패턴 없음
+                logger.debug(f"📊 {stock_code} 패턴 재분석 결과 없음 - 기본값 반환")
+                return self._get_default_pattern_info(stock_code, stock_name, current_price)
+
+        except Exception as e:
+            logger.error(f"❌ {stock_code} 패턴 재분석 오류: {e}")
             # 오류시에도 기본값 반환
             return self._get_default_pattern_info(stock_code, stock_name, current_price)
 
@@ -1459,7 +1633,8 @@ class CandleTradeManager:
 
             logger.debug(f"🔍 {candidate.stock_code} 단순 체크: 수익률 {pnl_pct:+.2f}% "
                         f"(목표:{target_profit_pct}%, 손절:{stop_loss_pct}%), "
-                        f"보유시간 {holding_hours:.1f}h/{max_hours}h")
+                        f"보유시간 {holding_hours:.1f}h/{max_hours}h, "
+                        f"패턴기반:{is_pattern_based}")
 
             # 🎯 4. 매도 조건 체크 (우선순위별)
             
@@ -1477,7 +1652,17 @@ class CandleTradeManager:
             
             # 4-4. 목표 범위 내 + 24시간 미만 → 보유 지속
             else:
-                logger.debug(f"⏸️ {candidate.stock_code} 보유 지속: 수익률 {pnl_pct:+.2f}% "
+                # 🆕 패턴 정보 추가 로깅
+                pattern_info = ""
+                if candidate.detected_patterns and len(candidate.detected_patterns) > 0:
+                    strongest_pattern = max(candidate.detected_patterns, key=lambda p: p.strength)
+                    pattern_info = f" [{strongest_pattern.pattern_type.value}패턴]"
+                elif not is_pattern_based:
+                    pattern_info = " [수동매수]"
+                else:
+                    pattern_info = " [패턴정보없음]"
+
+                logger.info(f"⏸️ {candidate.stock_code}{pattern_info} 보유 지속: 수익률 {pnl_pct:+.2f}% "
                            f"({-stop_loss_pct}% ~ {target_profit_pct}% 범위), "
                            f"보유시간 {holding_hours:.1f}h/24h")
                 return False, f"목표 범위 내 보유 지속", TradeSignal.HOLD

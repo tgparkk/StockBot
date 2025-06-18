@@ -1435,7 +1435,7 @@ class CandleAnalyzer:
             if not is_candle_strategy:
                 # 수동/앱 매수 종목: 큰 수익/손실 허용 (🎯 10% 목표, 5% 손절)
                 logger.debug(f"📊 {position.stock_code} 수동 매수 종목 - 기본 설정 적용")
-                return 2.0, 3.0, 24, False
+                return 1.4, 2.0, 24, False
 
             # 2. 🔄 실시간 캔들 패턴 재분석 (🆕 캐시된 데이터 활용)
             original_pattern = None
@@ -1481,16 +1481,18 @@ class CandleAnalyzer:
                                 f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
                     return target_pct, stop_pct, max_hours, True
                 else:
-                    return 2.0, 2.0, 24, True
+                    logger.debug(f"📊 {position.stock_code} 패턴 '{original_pattern}' Config 없음 - 기본 설정 적용 (목표:1.5%, 손절:2.0%)")
+                    return 1.4, 2.0, 24, True
 
             # 4. 기본값: 캔들 전략이지만 패턴 정보 없음 (🎯 큰 수익/손실 허용)
-            logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용")
-            return 2.0, 2.0, 6, True
+            logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용 (목표:1.5%, 손절:2.0%)")
+            return 1.4, 2.0, 6, True
 
         except Exception as e:
             logger.error(f"패턴별 설정 결정 오류 ({position.stock_code}): {e}")
             # 오류시 안전하게 기본값 반환 (🎯 큰 수익/손실 허용)
-            return 2.0, 2.0, 24, False
+            logger.debug(f"📊 {position.stock_code} 오류로 인한 기본 설정 적용 (목표:1.5%, 손절:2.0%)")
+            return 1.4, 2.0, 24, False
 
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
         """🆕 단순화된 시간 기반 매도 판단 - 24시간 내에는 시간 매도 금지"""
