@@ -15,12 +15,12 @@ logger = setup_logger(__name__)
 class PatternManager:
     """🎯 패턴 감지 통합 관리자"""
 
-    def __init__(self):
-        # 두 개의 전용 감지기 초기화
-        self.premarket_detector = CandlePatternDetector()      # 장전 전용
-        self.realtime_detector = RealtimePatternDetector()     # 실시간 전용
+    def __init__(self, premarket_detector: CandlePatternDetector, realtime_detector: RealtimePatternDetector):
+        # 외부에서 생성된 감지기 인스턴스 사용
+        self.premarket_detector = premarket_detector    # 장전 전용
+        self.realtime_detector = realtime_detector      # 실시간 전용
         
-        logger.info("🎯 PatternManager 초기화 완료 - 장전/실시간 감지기 준비")
+        logger.info("🎯 PatternManager 초기화 완료 - 외부 감지기 인스턴스 연결")
 
     def analyze_patterns(self, stock_code: str, 
                         current_price: float,

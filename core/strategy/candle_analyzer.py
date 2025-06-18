@@ -1121,119 +1121,6 @@ class CandleAnalyzer:
             logger.error(f"가격 위치 요인 계산 오류: {e}")
             return 1.0
 
-    def _analyze_candle_exit_conditions(self, candidate: CandleTradeCandidate, current_price: float, pattern_change_analysis: Dict) -> Dict:
-        """🎯 새로운 매도 조건 분석 - 패턴별 target/stop 기준으로 단순화"""
-        try:
-            # 기본 매도 조건들
-            should_exit = False
-            exit_reasons = []
-            exit_priority = 'normal'
-
-            logger.debug(f"🔍 {candidate.stock_code} 매도 조건 분석 시작 (현재가: {current_price:,}원)")
-
-            # 🚨 1. 패턴 반전 감지시 즉시 매도 (최우선)
-            if pattern_change_analysis.get('action_required') == 'immediate_exit':
-                should_exit = True
-                exit_reasons.append('강한 패턴 반전 감지')
-                exit_priority = 'emergency'
-                logger.warning(f"🚨 {candidate.stock_code} 강한 패턴 반전 감지 - 즉시 매도")
-                return {
-                    'signal': 'strong_sell',
-                    'should_exit': should_exit,
-                    'exit_reasons': exit_reasons,
-                    'exit_priority': exit_priority,
-                    'pattern_reversal_exit': True
-                }
-
-            # 🆕 2. 보유 시간 계산 (거래시간 기준)
-            if not candidate.performance.entry_time:
-                logger.debug(f"⚠️ {candidate.stock_code} 진입 시간 정보 없음 - 매도 조건 스킵")
-                return {'signal': 'hold', 'should_exit': False, 'exit_reasons': [], 'exit_priority': 'normal'}
-
-            entry_time = candidate.performance.entry_time
-            current_time = datetime.now(self.korea_tz)
-            if entry_time.tzinfo is None:
-                entry_time = entry_time.replace(tzinfo=self.korea_tz)
-
-            # 거래시간 기준 보유 시간 계산
-            holding_hours = calculate_business_hours_analyzer(entry_time, current_time)
-            logger.debug(f"⏰ {candidate.stock_code} 보유시간: {holding_hours:.1f}h (거래시간만)")
-
-            # 🆕 3. 수익률 계산
-            if not candidate.performance.entry_price:
-                logger.debug(f"⚠️ {candidate.stock_code} 진입가 정보 없음 - 매도 조건 스킵")
-                return {'signal': 'hold', 'should_exit': False, 'exit_reasons': [], 'exit_priority': 'normal'}
-
-            pnl_pct = ((current_price - candidate.performance.entry_price) / candidate.performance.entry_price) * 100
-            logger.debug(f"💰 {candidate.stock_code} 현재 수익률: {pnl_pct:+.2f}% (진입가: {candidate.performance.entry_price:,}원)")
-
-            # 🎯 4. 패턴별 설정 가져오기
-            target_profit_pct, stop_loss_pct, max_hours, pattern_based = self._get_pattern_based_target(candidate)
-            logger.debug(f"📊 {candidate.stock_code} 패턴별 설정: 목표{target_profit_pct}%, 손절{stop_loss_pct}%, 최대{max_hours}h")
-
-            # 🎯 5. 새로운 매도 판단 로직
-            # 5-1. 목표 수익률 도달시 즉시 매도
-            if pnl_pct >= target_profit_pct:
-                should_exit = True
-                exit_reasons.append(f'목표 수익률 달성 ({target_profit_pct}%)')
-                exit_priority = 'high'
-                logger.info(f"🎯 {candidate.stock_code} 목표 수익률 달성: {pnl_pct:+.2f}% >= {target_profit_pct}%")
-            
-            # 5-2. 손절 기준 도달시 즉시 매도
-            elif pnl_pct <= -stop_loss_pct:
-                should_exit = True
-                exit_reasons.append(f'손절 기준 도달 ({stop_loss_pct}%)')
-                exit_priority = 'high'
-                logger.info(f"🛑 {candidate.stock_code} 손절 기준 도달: {pnl_pct:+.2f}% <= -{stop_loss_pct}%")
-            
-            # 5-3. stop~target 사이에서 24시간 초과시 강제 매도
-            elif holding_hours >= 24.0:
-                should_exit = True
-                exit_reasons.append('24시간 보유 완료')
-                exit_priority = 'normal'
-                logger.info(f"⏰ {candidate.stock_code} 24시간 보유 완료: {holding_hours:.1f}h >= 24h")
-            
-            # 5-4. stop~target 사이에서 24시간 내면 보유 지속
-            else:
-                logger.info(f"⏸️ {candidate.stock_code} 보유 지속: 수익률 {pnl_pct:+.2f}% ({-stop_loss_pct}% ~ {target_profit_pct}% 범위), 보유시간 {holding_hours:.1f}h/24h")
-                return {
-                    'signal': 'hold', 
-                    'should_exit': False, 
-                    'exit_reasons': ['목표 범위 내 24시간 보유'], 
-                    'exit_priority': 'normal',
-                    'holding_hours': holding_hours,
-                    'pnl_pct': pnl_pct,
-                    'target_range': f"{-stop_loss_pct}% ~ {target_profit_pct}%"
-                }
-
-            # 신호 결정
-            if should_exit:
-                if exit_priority == 'emergency':
-                    signal = 'strong_sell'
-                elif exit_priority == 'high':
-                    signal = 'strong_sell'
-                else:
-                    signal = 'sell'
-            else:
-                signal = 'hold'
-
-            logger.debug(f"🔍 {candidate.stock_code} 매도 조건 분석 완료: {signal} (우선순위: {exit_priority}, 이유: {exit_reasons})")
-
-            return {
-                'signal': signal,
-                'should_exit': should_exit,
-                'exit_reasons': exit_reasons,
-                'exit_priority': exit_priority,
-                'holding_hours': holding_hours,
-                'pnl_pct': pnl_pct,
-                'target_profit_pct': target_profit_pct,
-                'stop_loss_pct': stop_loss_pct
-            }
-
-        except Exception as e:
-            logger.error(f"❌ {candidate.stock_code} 매도 조건 분석 오류: {e}")
-            return {'signal': 'hold', 'should_exit': False, 'exit_reasons': [], 'exit_priority': 'normal'}
-
     def _analyze_candle_entry_conditions(self, candidate: CandleTradeCandidate, current_price: float, current_pattern_signals: Dict) -> Dict:
         """🎯 캔들패턴 기반 진입 조건 분석 (관찰 중인 종목용)"""
         try:
@@ -1481,18 +1368,18 @@ class CandleAnalyzer:
                                 f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
                     return target_pct, stop_pct, max_hours, True
                 else:
-                    logger.debug(f"📊 {position.stock_code} 패턴 '{original_pattern}' Config 없음 - 기본 설정 적용 (목표:1.5%, 손절:2.0%)")
-                    return 1.4, 2.0, 24, True
+                    logger.debug(f"📊 {position.stock_code} 패턴 '{original_pattern}' Config 없음 - 기본 설정 적용 (목표:1.2%, 손절:2.0%)")
+                    return 1.2, 2.0, 24, True
 
-            # 4. 기본값: 캔들 전략이지만 패턴 정보 없음 (🎯 큰 수익/손실 허용)
-            logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용 (목표:1.5%, 손절:2.0%)")
-            return 1.4, 2.0, 6, True
+            # 4. 기본값: 캔들 전략이지만 패턴 정보 없음 (🎯 작은 수익 목표로 조정)
+            logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용 (목표:1.2%, 손절:2.0%)")
+            return 1.2, 2.0, 6, True
 
         except Exception as e:
             logger.error(f"패턴별 설정 결정 오류 ({position.stock_code}): {e}")
-            # 오류시 안전하게 기본값 반환 (🎯 큰 수익/손실 허용)
-            logger.debug(f"📊 {position.stock_code} 오류로 인한 기본 설정 적용 (목표:1.5%, 손절:2.0%)")
-            return 1.4, 2.0, 24, False
+            # 오류시 안전하게 기본값 반환 (🎯 작은 수익 목표로 조정)
+            logger.debug(f"📊 {position.stock_code} 오류로 인한 기본 설정 적용 (목표:1.2%, 손절:2.0%)")
+            return 1.2, 2.0, 24, False
 
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
         """🆕 단순화된 시간 기반 매도 판단 - 24시간 내에는 시간 매도 금지"""
