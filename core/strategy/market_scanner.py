@@ -12,6 +12,7 @@ from .candle_trade_candidate import (
     CandlePatternInfo, EntryConditions, RiskManagement
 )
 from .price_position_filter import PricePositionFilter
+from .pattern_manager import PatternManager
 from utils.logger import setup_logger
 
 # 순환 import 방지를 위한 TYPE_CHECKING 사용
@@ -40,13 +41,37 @@ class MarketScanner:
         self.subscribed_stocks = candle_trade_manager.subscribed_stocks
         self.korea_tz = candle_trade_manager.korea_tz
 
+        # 🆕 PatternManager 초기화 (시간대별 전략 자동 전환)
+        self.pattern_manager = PatternManager()
+
         self._last_scan_time: Optional[datetime] = None
         self._scan_interval = 30  # 30초
         
         # 🆕 가격 위치 필터 초기화
         self.price_position_filter = PricePositionFilter(self.config)
 
-        logger.info("✅ MarketScanner 초기화 완료")
+        logger.info("✅ MarketScanner 초기화 완료 (PatternManager 포함)")
+
+    def _get_current_strategy_source(self) -> str:
+        """🆕 현재 시간대에 따른 전략 소스 결정"""
+        try:
+            current_time = datetime.now().time()
+            
+            # 08:00-08:59: 장전 전략
+            if current_time >= datetime.strptime("08:00", "%H:%M").time() and current_time <= datetime.strptime("08:59", "%H:%M").time():
+                return "premarket"
+            
+            # 09:00-15:30: 실시간 전략
+            elif current_time >= datetime.strptime("09:00", "%H:%M").time() and current_time <= datetime.strptime("15:30", "%H:%M").time():
+                return "realtime"
+            
+            # 15:31-07:59: 장전 전략 (다음날 준비)
+            else:
+                return "premarket"
+                
+        except Exception as e:
+            logger.error(f"전략 소스 결정 오류: {e}")
+            return "premarket"  # 기본값
 
     async def scan_and_detect_patterns(self):
         """🚀 스마트 종목 스캔 - 장전 전체 스캔 vs 장중 급등/급증 모니터링"""
@@ -149,9 +174,12 @@ class MarketScanner:
                     # 빠른 패턴 분석
                     candidate = await self.analyze_stock_for_patterns(stock_code, market_name)
                     
-                    if candidate and self.stock_manager.add_candidate(candidate):
+                    # 🆕 현재 시간대에 따른 전략 소스 결정
+                    strategy_source = self._get_current_strategy_source()
+                    
+                    if candidate and self.stock_manager.add_candidate(candidate, strategy_source=strategy_source):
                         new_candidates_count += 1
-                        logger.debug(f"✅ 장중 신규 후보: {candidate.stock_code}({candidate.stock_name})")
+                        logger.debug(f"✅ 장중 신규 후보: {candidate.stock_code}({candidate.stock_name}) - 전략:{strategy_source}")
 
                 except Exception as e:
                     logger.debug(f"장중 종목 분석 오류 ({stock_code}): {e}")
@@ -225,14 +253,16 @@ class MarketScanner:
 
             # 🆕 4. 선별된 후보들을 스톡 매니저에 추가
             pattern_found_count = 0
+            strategy_source = self._get_current_strategy_source()  # 🆕 전략 소스 결정
+            
             for result in top_candidates:
                 candidate = result['candidate']
-                if self.stock_manager.add_candidate(candidate):
+                if self.stock_manager.add_candidate(candidate, strategy_source=strategy_source):
                     pattern_found_count += 1
                     logger.debug(f"✅ {candidate.stock_code}({candidate.stock_name}) "
-                               f"패턴점수: {result['pattern_score']:.2f}")
+                               f"패턴점수: {result['pattern_score']:.2f} - 전략:{strategy_source}")
 
-            logger.info(f"🏆 {market_name} 최종 후보: {pattern_found_count}개 종목 추가")
+            logger.info(f"🏆 {market_name} 최종 후보: {pattern_found_count}개 종목 추가 (전략:{strategy_source})")
 
         except Exception as e:
             logger.error(f"시장 {market} 전체 스캔 오류: {e}")
@@ -333,13 +363,58 @@ class MarketScanner:
                 logger.debug(f"{stock_code}: OHLCV 데이터 없음")
                 return None
 
-            # 4. 캔들 패턴 분석 (async 제거)
-            pattern_result = self.pattern_detector.analyze_stock_patterns(stock_code, ohlcv_data)
+            # 4. 🆕 PatternManager를 통한 시간대별 패턴 분석
+            current_strategy_source = self._get_current_strategy_source()
+            
+            # 분봉 데이터 준비 (실시간 전략인 경우)
+            minute_data = None
+            if current_strategy_source == "realtime":
+                try:
+                    from ..api.kis_market_api import get_inquire_time_itemchartprice
+                    from datetime import datetime, timedelta
+
+                    # 🔧 현실적 제한: 최대 30분봉만 조회 가능
+                    now = datetime.now()
+                    thirty_minutes_ago = now - timedelta(minutes=30)
+                    input_hour = thirty_minutes_ago.strftime("%H%M%S")
+
+                    minute_data = get_inquire_time_itemchartprice(
+                        output_dv="2",              # 분봉 데이터 배열
+                        div_code="J",               # 주식
+                        itm_no=stock_code,
+                        input_hour=input_hour,      # 30분 전부터 조회
+                        past_data_yn="Y",           # 과거데이터포함
+                        etc_cls_code=""             # 기타구분코드
+                    )
+                    if minute_data is not None and not minute_data.empty:
+                        # 최신순 정렬
+                        minute_data = minute_data.sort_values('stck_cntg_hour', ascending=False).reset_index(drop=True)
+                        logger.debug(f"📊 {stock_code} 분봉 데이터 조회 성공: {len(minute_data)}개 (최대 30분)")
+                    else:
+                        logger.debug(f"📊 {stock_code} 분봉 데이터 없음")
+                        minute_data = None
+                except Exception as e:
+                    logger.debug(f"📊 {stock_code} 분봉 데이터 조회 실패: {e}")
+                    minute_data = None
+            
+            # PatternManager 통합 분석
+            pattern_analysis = self.pattern_manager.analyze_patterns(
+                stock_code=stock_code,
+                current_price=current_price,
+                daily_ohlcv=ohlcv_data,
+                minute_data=minute_data,
+                mode=current_strategy_source
+            )
+            
+            pattern_result = pattern_analysis.get('patterns', [])
             if not pattern_result or len(pattern_result) == 0:
                 return None
 
             # 5. 가장 강한 패턴 선택
             strongest_pattern = max(pattern_result, key=lambda p: p.strength)
+            
+            logger.debug(f"🔍 {stock_code} 패턴 분석 완료: {pattern_analysis.get('mode')} 모드, "
+                        f"{len(pattern_result)}개 패턴, 감지기: {pattern_analysis.get('detector_used')}")
 
             # 6. 후보 생성
             candidate = CandleTradeCandidate(
@@ -353,15 +428,56 @@ class MarketScanner:
             if ohlcv_data is not None:
                 candidate.cache_ohlcv_data(ohlcv_data)
 
+            # 🆕 분봉 데이터도 candidate에 캐싱 (실시간 전략용)
+            if minute_data is not None and not minute_data.empty:
+                # 분봉 데이터를 메타데이터에 저장
+                if not hasattr(candidate, 'metadata') or candidate.metadata is None:
+                    candidate.metadata = {}
+                candidate.metadata['minute_data_cached'] = True
+                candidate.metadata['minute_data_count'] = len(minute_data)
+                
+                # 🆕 분봉 데이터 캐싱 메서드 추가 (CandleTradeCandidate에 필요)
+                if hasattr(candidate, 'cache_minute_data'):
+                    candidate.cache_minute_data(minute_data)
+                else:
+                    # 임시로 메타데이터에 저장
+                    candidate.metadata['minute_ohlcv'] = minute_data.to_dict('records')
+                
+                logger.debug(f"📊 {stock_code} 분봉 데이터 캐싱 완료: {len(minute_data)}개")
+
             # 패턴 정보 추가
             for pattern in pattern_result:
                 candidate.add_pattern(pattern)
 
-            # 🆕 매매 신호 생성 및 설정
-            trade_signal, signal_strength = self._generate_trade_signal(pattern_result)
+            # 🆕 PatternManager 결과에서 매매 신호 가져오기
+            trade_signal = pattern_analysis.get('trade_signal', TradeSignal.HOLD)
+            signal_strength = pattern_analysis.get('signal_strength', 0)
+            
             candidate.trade_signal = trade_signal
             candidate.signal_strength = signal_strength
             candidate.signal_updated_at = datetime.now()
+            
+            # 🆕 매수 신호 발생시 상세 로깅 추가
+            if trade_signal in [TradeSignal.STRONG_BUY, TradeSignal.BUY]:
+                #logger.info(f"🚀 {stock_code} 매수 신호 발생! 신호:{trade_signal.value}, 강도:{signal_strength}, "
+                #           f"패턴:{strongest_pattern.pattern_type.value}, 신뢰도:{strongest_pattern.confidence:.2f}")
+                
+                # 진입 조건 사전 체크 로깅
+                logger.info(f"📋 {stock_code} 진입 조건 사전 체크:")
+                logger.info(f"   - 현재 상태: {candidate.status.value}")
+                logger.info(f"   - 매매 신호: {candidate.trade_signal.value}")
+                logger.info(f"   - 신호 강도: {candidate.signal_strength}")
+                logger.info(f"   - 패턴 수: {len(candidate.detected_patterns)}")
+                logger.info(f"   - 전략 소스: {current_strategy_source}")
+
+            # 🆕 전략 소스 메타데이터 추가
+            if not hasattr(candidate, 'metadata') or candidate.metadata is None:
+                candidate.metadata = {}
+            candidate.metadata.update({
+                'strategy_source': current_strategy_source,
+                'detector_used': pattern_analysis.get('detector_used'),
+                'analysis_mode': pattern_analysis.get('mode')
+            })
 
             # 🆕 진입 우선순위 계산
             candidate.entry_priority = self.manager.candle_analyzer.calculate_entry_priority(candidate)
@@ -369,27 +485,45 @@ class MarketScanner:
             # 🆕 리스크 관리 설정
             candidate.risk_management = self._calculate_risk_management(candidate)
 
-            # logger.info(f"✅ {stock_code}({stock_name}) 신호 생성: {trade_signal.value.upper()} "
-            #            f"(강도:{signal_strength}) 패턴:{strongest_pattern.pattern_type.value}")
+            # 🆕 신호 정보 메타데이터에 저장 (신호 고정용)
+            if not hasattr(candidate, 'metadata') or candidate.metadata is None:
+                candidate.metadata = {}
+            
+            candidate.metadata.update({
+                'pattern_detected_signal': candidate.trade_signal.value,
+                'pattern_detected_strength': candidate.signal_strength,
+                'pattern_detected_time': datetime.now().isoformat(),
+                'pattern_detected_price': candidate.current_price,
+                'signal_locked': True,  # 🔒 신호 고정 플래그
+                'lock_reason': f'패턴감지시점_신호고정_{strongest_pattern.pattern_type.value}'
+            })
 
-            # 7. 웹소켓 구독 (새로운 후보인 경우)
-            try:
-                if self.websocket_manager and stock_code not in self.subscribed_stocks:
-                    success = await self.websocket_manager.subscribe_stock(stock_code)
-                    if success:
-                        self.subscribed_stocks.add(stock_code)
-                        logger.info(f"📡 {stock_code} 웹소켓 구독 성공")
-            except Exception as ws_error:
-                if "ALREADY IN SUBSCRIBE" in str(ws_error):
-                    self.subscribed_stocks.add(stock_code)
+            # 🎯 패턴 감지 성공 - 후보 종목으로 등록
+            success = self.manager.stock_manager.add_candidate(candidate, strategy_source=current_strategy_source)
+            
+            if success:
+                logger.info(f"✅ {stock_code}({stock_name}) 패턴 감지: {strongest_pattern.description} 흐름: {strongest_pattern.pattern_type.value} 신뢰도:{strongest_pattern.confidence:.2f} 강도:{strongest_pattern.strength}점")
+                return candidate
+            else:
+                logger.warning(f"⚠️ {stock_code}({stock_name}) 패턴 감지했으나 후보 등록 실패: {strongest_pattern.description}")
+                # 🆕 등록 실패 이유 상세 분석
+                existing_candidate = self.manager.stock_manager.get_stock(stock_code)
+                if existing_candidate:
+                    existing_status = existing_candidate.status.value
+                    existing_source = existing_candidate.metadata.get('strategy_source', 'unknown') if existing_candidate.metadata else 'unknown'
+                    logger.warning(f"   📋 기존 종목 정보: 상태={existing_status}, 전략소스={existing_source}")
+                    
+                    # 중요 상태인지 확인
+                    if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                        logger.warning(f"   🚨 중요 상태 보호로 인한 등록 거부")
+                    
+                    # 전략 소스 충돌인지 확인
+                    if current_strategy_source != existing_source:
+                        logger.warning(f"   🔄 전략 소스 충돌: {existing_source} → {current_strategy_source}")
                 else:
-                    logger.warning(f"⚠️ {stock_code} 웹소켓 구독 오류: {ws_error}")
-
-            logger.info(f"✅ {stock_code}({stock_name}) 패턴 감지: {strongest_pattern.description} 흐름: {strongest_pattern.pattern_type.value} "
-                       f"신뢰도:{strongest_pattern.confidence:.2f} "
-                       f"강도:{strongest_pattern.strength}점")
-
-            return candidate
+                    logger.warning(f"   📊 관찰 한도 초과 또는 품질 기준 미달로 추정")
+                
+                return None
 
         except Exception as e:
             logger.error(f"❌ {stock_code} 패턴 분석 오류: {e}")
@@ -647,14 +781,49 @@ class MarketScanner:
             # 리스크 관리 설정
             candidate.risk_management = self._calculate_risk_management(candidate)
 
-            return {
-                'candidate': candidate,
-                'pattern_score': pattern_score,
-                'stock_info': stock_excel_info
-            }
+            # 🆕 신호 정보 메타데이터에 저장 (신호 고정용)
+            if not hasattr(candidate, 'metadata') or candidate.metadata is None:
+                candidate.metadata = {}
+            
+            candidate.metadata.update({
+                'pattern_detected_signal': candidate.trade_signal.value,
+                'pattern_detected_strength': candidate.signal_strength,
+                'pattern_detected_time': datetime.now().isoformat(),
+                'pattern_detected_price': candidate.current_price,
+                'signal_locked': True,  # 🔒 신호 고정 플래그
+                'lock_reason': f'패턴감지시점_신호고정_{strongest_pattern.pattern_type.value}'
+            })
 
-        except Exception:
-            return None  # 모든 예외에 대해 빠른 실패
+            # 🎯 패턴 감지 성공 - 후보 종목으로 등록
+            success = self.manager.stock_manager.add_candidate(candidate, strategy_source=current_strategy_source)
+            
+            if success:
+                logger.info(f"✅ {stock_code}({stock_name}) 패턴 감지: {strongest_pattern.description} 흐름: {strongest_pattern.pattern_type.value} 신뢰도:{strongest_pattern.confidence:.2f} 강도:{strongest_pattern.strength}점")
+                return candidate
+            else:
+                logger.warning(f"⚠️ {stock_code}({stock_name}) 패턴 감지했으나 후보 등록 실패: {strongest_pattern.description}")
+                # 🆕 등록 실패 이유 상세 분석
+                existing_candidate = self.manager.stock_manager.get_stock(stock_code)
+                if existing_candidate:
+                    existing_status = existing_candidate.status.value
+                    existing_source = existing_candidate.metadata.get('strategy_source', 'unknown') if existing_candidate.metadata else 'unknown'
+                    logger.warning(f"   📋 기존 종목 정보: 상태={existing_status}, 전략소스={existing_source}")
+                    
+                    # 중요 상태인지 확인
+                    if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
+                        logger.warning(f"   🚨 중요 상태 보호로 인한 등록 거부")
+                    
+                    # 전략 소스 충돌인지 확인
+                    if current_strategy_source != existing_source:
+                        logger.warning(f"   🔄 전략 소스 충돌: {existing_source} → {current_strategy_source}")
+                else:
+                    logger.warning(f"   📊 관찰 한도 초과 또는 품질 기준 미달로 추정")
+                
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ {stock_code} 패턴 분석 오류: {e}")
+            return None
 
     def _passes_enhanced_basic_filters(self, current_price: float, volume: int, 
                                      trading_value: int, listed_shares: int, stock_code: str) -> bool:

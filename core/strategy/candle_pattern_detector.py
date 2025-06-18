@@ -26,22 +26,22 @@ class CandlePatternDetector:
             PatternType.MORNING_STAR: 0.95,              # 아침샛별 - 4% 목표 (가장 강한 패턴)
         }
 
-        # 🎯 시가 매수 전략 임계값
+        # 🎯 시가 매수 전략 임계값 - 현실적으로 강화
         self.thresholds = {
-            'hammer_lower_shadow_min': 0.6,      # 망치형: 아래꼬리 최소 60%
-            'hammer_body_max': 0.3,              # 망치형: 몸통 최대 30%
-            'hammer_upper_shadow_max': 0.1,      # 망치형: 윗꼬리 최대 10%
+            'hammer_lower_shadow_min': 0.45,     # 망치형: 아래꼬리 최소 45% (기존 60%에서 약간 완화)
+            'hammer_body_max': 0.40,             # 망치형: 몸통 최대 40% (기존 30%에서 약간 완화)
+            'hammer_upper_shadow_max': 0.15,     # 망치형: 윗꼬리 최대 15% (기존 10%에서 약간 완화)
             
-            'engulfing_ratio_min': 1.1,          # 장악형: 최소 110% 크기
+            'engulfing_ratio_min': 0.85,         # 장악형: 최소 85% 크기 (기존 110%에서 완화)
             
             'piercing_body_min': 0.6,            # 관통형: 전날 음봉 몸통 최소 60%
-            'piercing_penetration_min': 0.5,     # 관통형: 최소 50% 관통
+            'piercing_penetration_min': 0.35,    # 관통형: 최소 35% 관통 (기존 50%에서 완화)
             
             'morning_star_doji_max': 0.3,        # 아침샛별: 중간일 몸통 최대 30%
             'morning_star_bullish_min': 0.6,     # 아침샛별: 마지막일 양봉 몸통 최소 60%
             
-            'downtrend_strength_min': 0.3,       # 하락추세 최소 강도
-            'min_confidence': 0.6,               # 최소 신뢰도
+            'downtrend_strength_min': 0.015,     # 하락추세 최소 강도 1.5% (기존 0.5%에서 강화)
+            'min_confidence': 0.65,              # 최소 신뢰도 65% (기존 60%에서 강화)
         }
 
     def analyze_stock_patterns(self, stock_code: str, ohlcv_data: pd.DataFrame,
@@ -488,56 +488,66 @@ class CandlePatternDetector:
                 return patterns
                 
             yesterday = df.iloc[1]      # 어제 (3일차 - 강한 양봉)
-            middle_day = df.iloc[2]     # 그 전날 (2일차 - 도지/팽이)
-            first_day = df.iloc[3]      # 3일 전 (1일차 - 음봉)
+            middle_day = df.iloc[2]     # 중간일 (두 번째 캔들 - 작은 몸통)
+            day_before = df.iloc[3] if len(df) > 3 else df.iloc[2]  # 그 전전날 (첫 번째 캔들 - 음봉)
             
-            # 1일차: 음봉
-            first_is_bearish = first_day['close'] < first_day['open']
+            # 🔧 직접 계산 (전처리 데이터 의존성 제거)
             
-            # 2일차: 도지 또는 작은 몸통 (팽이)
+            # 1. 첫 번째 캔들이 음봉 (완화)
+            day_before_bearish = day_before['close'] < day_before['open']
+            if not day_before_bearish:
+                return patterns
+                
+            # 2. 세 번째 캔들이 양봉 (완화)
+            yesterday_bullish = yesterday['close'] > yesterday['open']
+            if not yesterday_bullish:
+                return patterns
+                
+            # 🆕 3. 매우 완화된 중간일 조건 (작은 몸통)
             middle_body = abs(middle_day['close'] - middle_day['open'])
             middle_range = middle_day['high'] - middle_day['low']
-            middle_body_ratio = middle_body / middle_range if middle_range > 0 else 0
-            is_doji_or_spinning = middle_body_ratio <= 0.3  # 몸통이 30% 이하
+            middle_body_ratio = middle_body / middle_range if middle_range > 0 else 1.0
+            small_body_condition = middle_body_ratio <= 0.6  # 40% → 60%로 대폭 완화
             
-            # 3일차: 강한 양봉
-            yesterday_is_bullish = yesterday['close'] > yesterday['open']
-            yesterday_body = abs(yesterday['close'] - yesterday['open'])
-            yesterday_range = yesterday['high'] - yesterday['low']
-            yesterday_body_ratio = yesterday_body / yesterday_range if yesterday_range > 0 else 0
-            is_strong_bullish = yesterday_body_ratio >= 0.6  # 몸통이 60% 이상
+            # 🆕 4. 갭 조건 거의 제거 (한국 시장 특성 반영)
+            gap_condition = True  # 갭 조건 거의 제거
             
-            if (first_is_bearish and is_doji_or_spinning and 
-                yesterday_is_bullish and is_strong_bullish):
+            if small_body_condition and gap_condition:
+                # 🔧 하락 추세 조건 대폭 완화
+                simple_downtrend = self._check_simple_downtrend(df, 3, 5)
                 
-                # 갭 확인 (2일차가 1일차보다 낮게 시작, 3일차가 2일차보다 높게 마감)
-                gap1 = middle_day['high'] < first_day['low']  # 하방 갭
-                gap2 = yesterday['close'] > middle_day['high']  # 상방 돌파
-                
-                if gap1 or gap2:  # 갭 중 하나라도 있으면
-                    # 3일차 양봉이 1일차 몸통 중간 이상 관통하는지 확인
-                    first_body_mid = (first_day['open'] + first_day['close']) / 2
-                    penetration_strength = yesterday['close'] > first_body_mid
-                    
-                    if penetration_strength:
-                        confidence = 0.8 + (yesterday_body_ratio * 0.15)
-                        strength = int(85 + (yesterday_body_ratio * 15))
+                # 🔧 하락 추세 0.5% 이상이면 OK (기존 10%)
+                if simple_downtrend >= 0.005:
+                    # 🔧 양봉 강도 확인 (대폭 완화)
+                    yesterday_body = abs(yesterday['close'] - yesterday['open'])
+                    yesterday_range = yesterday['high'] - yesterday['low']
+                    bullish_strength = yesterday_body / yesterday_range if yesterday_range > 0 else 0
+                    if bullish_strength >= 0.15:  # 30% → 15%로 대폭 완화
+                        confidence = 0.7 + (bullish_strength * 0.15) + (simple_downtrend * 0.1)
+                        strength = int(70 + (bullish_strength * 20) + (simple_downtrend * 10))
                         
                         pattern = CandlePatternInfo(
                             pattern_type=PatternType.MORNING_STAR,
                             confidence=min(confidence, 0.95),
-                            strength=min(strength, 100),
+                            strength=min(strength, 95),
+                            description=f"아침샛별 - 중간몸통:{middle_body_ratio:.1%}, 양봉강도:{bullish_strength:.1%}",
                             detected_at=1,
-                            trade_signal=TradeSignal.STRONG_BUY,
-                            target_price_ratio=1.04,  # 4% 목표 (가장 강한 패턴)
-                            stop_loss_ratio=0.975,    # 2.5% 손절
-                            expected_duration_hours=24  # 1일 보유
+                            target_price_ratio=1.06,  # 6% 목표
+                            stop_loss_ratio=0.95,     # 5% 손절
+                            metadata={
+                                'middle_body_ratio': middle_body_ratio,
+                                'bullish_strength': bullish_strength,
+                                'gap_condition': gap_condition,
+                                'simple_downtrend': simple_downtrend,
+                                'support_price': middle_day['low']
+                            }
                         )
-                        patterns.append(pattern)
-                        logger.debug(f"⭐ {stock_code} 아침샛별 패턴 감지 (신뢰도: {confidence:.2f})")
                         
+                        patterns.append(pattern)
+                        logger.info(f"⭐ {stock_code} 아침샛별 패턴 발견! (완화된 조건)")
+                    
         except Exception as e:
-            logger.debug(f"아침샛별 패턴 감지 오류 ({stock_code}): {e}")
+            logger.error(f"아침샛별 패턴 감지 오류 ({stock_code}): {e}")
             
         return patterns
 
@@ -1088,22 +1098,22 @@ class CandlePatternDetector:
             upper_shadow_ratio = upper_shadow / total_range
             body_ratio = body_size / total_range
             
-            # 🆕 극도로 완화된 망치형 조건 (한국 시장 특성 반영)
+            # 🆕 현실적인 망치형 조건 (기존 relaxed에서 강화)
             conditions = {
-                'long_lower_shadow': lower_shadow_ratio >= 0.15,  # 20% → 15%로 더 완화
-                'small_body': body_ratio <= 0.75,               # 65% → 75%로 더 완화
-                'short_upper_shadow': upper_shadow_ratio <= 0.50 # 40% → 50%로 더 완화
+                'long_lower_shadow': lower_shadow_ratio >= 0.45,  # 15% → 45%로 강화
+                'small_body': body_ratio <= 0.40,               # 75% → 40%로 강화
+                'short_upper_shadow': upper_shadow_ratio <= 0.15 # 50% → 15%로 강화
             }
             
             if all(conditions.values()):
-                # 🔧 하락 추세 조건 대폭 완화 (1% 이상이면 충분)
+                # 🔧 하락 추세 조건 강화 (1.5% 이상)
                 simple_downtrend = self._check_simple_downtrend(df, 1, 3)
                 
-                # 🔧 종가 위치 확인 (완화된 조건)
+                # 🔧 종가 위치 확인 (강화된 조건)
                 close_position = (yesterday['close'] - yesterday['low']) / total_range
                 
-                # 🔧 매우 완화된 조건: 하락추세 0.5% 이상 OR 종가위치 25% 이상
-                if simple_downtrend >= 0.005 or close_position >= 0.25:
+                # 🔧 강화된 조건: 하락추세 1.5% 이상 AND 종가위치 30% 이상
+                if simple_downtrend >= 0.015 and close_position >= 0.30:
                     confidence = 0.6 + (lower_shadow_ratio * 0.3) + (simple_downtrend * 0.1)
                     strength = int(60 + (lower_shadow_ratio * 25) + (simple_downtrend * 15))
                     
@@ -1158,20 +1168,20 @@ class CandlePatternDetector:
             yesterday_body_size = abs(yesterday['close'] - yesterday['open'])
             day_before_body_size = abs(day_before['open'] - day_before['close'])
             
-            # 🔧 크기 비교 (기존 0.8배 → 0.5배로 대폭 완화)
+            # 🔧 크기 비교 (0.5배 → 0.85배로 강화)
             size_ratio = yesterday_body_size / day_before_body_size if day_before_body_size > 0 else 1.0
-            size_condition = size_ratio >= 0.5  # 50% 크기만 되어도 OK
+            size_condition = size_ratio >= 0.85  # 85% 크기 필요
             
-            # 🔧 포함 조건 (거의 포함하지 않아도 OK)
-            engulfs_open = yesterday['open'] <= day_before['open'] * 1.02   # 2% 여유
-            engulfs_close = yesterday['close'] >= day_before['close'] * 0.98  # 2% 여유
+            # 🔧 포함 조건 (1% 여유로 강화)
+            engulfs_open = yesterday['open'] <= day_before['open'] * 1.01   # 1% 여유
+            engulfs_close = yesterday['close'] >= day_before['close'] * 0.99  # 1% 여유
             
             if size_condition and engulfs_open and engulfs_close:
-                # 🔧 하락 추세 조건 대폭 완화
+                # 🔧 하락 추세 조건 강화
                 simple_downtrend = self._check_simple_downtrend(df, 2, 3)
                 
-                # 🔧 하락 추세 0.5% 이상이면 OK (기존 5%)
-                if simple_downtrend >= 0.005:
+                # 🔧 하락 추세 1.5% 이상 필요 (기존 0.5%)
+                if simple_downtrend >= 0.015:
                     confidence = 0.65 + (size_ratio * 0.15) + (simple_downtrend * 0.1)
                     strength = int(65 + (size_ratio * 20) + (simple_downtrend * 15))
                     
@@ -1225,22 +1235,22 @@ class CandlePatternDetector:
             # 🆕 3. 매우 완화된 관통 조건
             day_before_body = day_before['open'] - day_before['close']  # 음봉 몸통
             
-            # 🔧 관통 정도 (기존 30% → 15%로 대폭 완화)
+            # 🔧 관통 정도 (15% → 35%로 강화)
             if day_before_body > 0:
                 penetration_ratio = (yesterday['close'] - day_before['close']) / day_before_body
-                penetration_condition = penetration_ratio >= 0.15  # 15% 이상 관통
+                penetration_condition = penetration_ratio >= 0.35  # 35% 이상 관통
             else:
                 penetration_condition = False
             
-            # 🔧 시가 조건 (갭다운 조건 완화)
-            gap_down = yesterday['open'] <= day_before['close'] * 1.01  # 1% 갭업까지도 허용
+            # 🔧 시가 조건 (갭다운 조건 강화)
+            gap_down = yesterday['open'] <= day_before['close']  # 갭다운 또는 동일 레벨
             
             if penetration_condition and gap_down:
-                # 🔧 하락 추세 조건 대폭 완화
+                # 🔧 하락 추세 조건 강화
                 simple_downtrend = self._check_simple_downtrend(df, 2, 3)
                 
-                # 🔧 하락 추세 0.5% 이상이면 OK (기존 5%)
-                if simple_downtrend >= 0.005:
+                # 🔧 하락 추세 1.5% 이상 필요 (기존 0.5%)
+                if simple_downtrend >= 0.015:
                     confidence = 0.65 + (penetration_ratio * 0.2) + (simple_downtrend * 0.1)
                     strength = int(65 + (penetration_ratio * 25) + (simple_downtrend * 10))
                     

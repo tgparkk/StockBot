@@ -85,13 +85,53 @@ class BuyOpportunityEvaluator:
                 buy_ready_candidates.append(candidate)
 
             if not buy_ready_candidates:
-                logger.info("📊 매수 준비된 종목이 없습니다")
+                logger.debug("📊 매수 준비된 종목이 없습니다")
 
                 # 🔍 BUY_READY 상태인데 is_ready_for_entry()가 False인 종목 체크
                 buy_ready_status_only = [
                     candidate for candidate in all_stocks
                     if candidate.status == CandleStatus.BUY_READY
                 ]
+
+                # 🆕 매수 후보가 없는 이유 상세 분석
+                logger.info("🔍 매수 후보 없음 - 상세 분석:")
+                
+                # 전체 종목 상태 분석
+                status_counts = {}
+                signal_counts = {}
+                for candidate in all_stocks:
+                    status = candidate.status.value
+                    signal = candidate.trade_signal.value
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    signal_counts[signal] = signal_counts.get(signal, 0) + 1
+                
+                logger.info(f"   📊 전체 종목 상태: {status_counts}")
+                logger.info(f"   📊 전체 신호 분포: {signal_counts}")
+                
+                # 매수 신호가 있는데 is_ready_for_entry()가 False인 종목들 분석
+                buy_signal_not_ready = []
+                for candidate in all_stocks:
+                    if (candidate.trade_signal in [TradeSignal.STRONG_BUY, TradeSignal.BUY] and 
+                        not candidate.is_ready_for_entry()):
+                        buy_signal_not_ready.append(candidate)
+                
+                if buy_signal_not_ready:
+                    logger.info(f"   🚫 매수신호 있지만 진입불가: {len(buy_signal_not_ready)}개")
+                    for candidate in buy_signal_not_ready[:3]:  # 최대 3개만 로깅
+                        logger.info(f"      - {candidate.stock_code}: 상태={candidate.status.value}, "
+                                   f"신호={candidate.trade_signal.value}({candidate.signal_strength}), "
+                                   f"entry_conditions_passed={candidate.entry_conditions.overall_passed if candidate.entry_conditions else 'None'}")
+                        if hasattr(candidate, 'entry_conditions') and candidate.entry_conditions and candidate.entry_conditions.fail_reasons:
+                            logger.info(f"        실패이유: {', '.join(candidate.entry_conditions.fail_reasons)}")
+                
+                # 이미 보유 중인 종목으로 인한 제외
+                if already_owned_stocks:
+                    logger.info(f"   🏠 이미 보유/주문중: {len(already_owned_stocks)}개 - {', '.join(list(already_owned_stocks)[:3])}")
+                
+                # PENDING_ORDER 상태인 종목들
+                pending_order_stocks = [c for c in all_stocks if c.status == CandleStatus.PENDING_ORDER]
+                if pending_order_stocks:
+                    logger.info(f"   ⏳ 주문 대기중: {len(pending_order_stocks)}개")
 
                 return
 
@@ -191,7 +231,7 @@ class BuyOpportunityEvaluator:
 
                     # 강한 매수 신호인 경우에만 세부 검증 실행
                     if candidate.trade_signal in [TradeSignal.STRONG_BUY, TradeSignal.BUY]:
-                        logger.debug(f"🎯 {candidate.stock_code} 매수 신호 감지 - 세부 검증 시작")
+                        logger.info(f"🎯 {candidate.stock_code} 매수 신호 감지 - 세부 검증 시작 (신호:{candidate.trade_signal.value}, 강도:{candidate.signal_strength})")
 
                         # 해당 종목의 current_data 가져오기
                         stock_current_data = current_data_dict.get(candidate.stock_code) if current_data_dict else None
@@ -213,15 +253,85 @@ class BuyOpportunityEvaluator:
                             if actual_status:
                                 # 🔍 is_ready_for_entry() 체크
                                 ready_check = actual_status.is_ready_for_entry()
-                                logger.debug(f"🔍 {candidate.stock_code} is_ready_for_entry(): {ready_check}")
+                                logger.info(f"✅ {candidate.stock_code} BUY_READY 전환 성공: {old_status.value} → {actual_status.status.value}, is_ready_for_entry(): {ready_check}")
                             else:
                                 logger.error(f"❌ {candidate.stock_code} stock_manager 업데이트 실패!")
 
                             converted_count += 1
                         else:
+                            logger.info(f"❌ {candidate.stock_code} 세부 진입 조건 검증 실패 - BUY_READY 전환 불가")
+                            # 🆕 실패 이유 상세 로깅
+                            if hasattr(candidate, 'entry_conditions') and candidate.entry_conditions:
+                                fail_reasons = candidate.entry_conditions.fail_reasons
+                                if fail_reasons:
+                                    logger.info(f"   📋 {candidate.stock_code} 실패 이유: {', '.join(fail_reasons)}")
+                                else:
+                                    logger.info(f"   📋 {candidate.stock_code} 실패 이유: 알 수 없음 (빠른 매수 판단 거부)")
                             continue
                     else:
+                        # 🆕 신호 고정 확인 - 패턴 감지 시점의 신호 사용
+                        if (hasattr(candidate, 'metadata') and candidate.metadata and 
+                            candidate.metadata.get('signal_locked', False)):
+                            
+                            original_signal = candidate.metadata.get('pattern_detected_signal', '')
+                            original_strength = candidate.metadata.get('pattern_detected_strength', 0)
+                            detected_time = candidate.metadata.get('pattern_detected_time', '')
+                            
+                            logger.info(f"🔒 {candidate.stock_code} 신호 고정 감지:")
+                            logger.info(f"   - 현재 신호: {candidate.trade_signal.value} (강도: {candidate.signal_strength})")
+                            logger.info(f"   - 원래 신호: {original_signal} (강도: {original_strength})")
+                            logger.info(f"   - 감지 시점: {detected_time}")
+                            
+                            # 원래 신호가 매수 신호였다면 처리 계속
+                            if original_signal in ['strong_buy', 'buy']:
+                                logger.info(f"🚀 {candidate.stock_code} 원래 매수 신호로 세부 검증 진행")
+                                
+                                # 해당 종목의 current_data 가져오기
+                                stock_current_data = current_data_dict.get(candidate.stock_code) if current_data_dict else None
+
+                                # 세부 진입 조건 검증 수행
+                                entry_validation_passed = await self._validate_detailed_entry_conditions(candidate, stock_current_data)
+
+                                if entry_validation_passed:
+                                    # BUY_READY 상태로 전환
+                                    old_status = candidate.status
+                                    candidate.status = CandleStatus.BUY_READY
+                                    candidate.metadata['buy_ready_time'] = datetime.now(self.manager.korea_tz).isoformat()
+
+                                    # 🔧 stock_manager 업데이트 (중요!)
+                                    self.manager.stock_manager.update_candidate(candidate)
+
+                                    # 🔍 상태 변경 확인
+                                    actual_status = self.manager.stock_manager._all_stocks.get(candidate.stock_code)
+                                    if actual_status:
+                                        ready_check = actual_status.is_ready_for_entry()
+                                        logger.info(f"✅ {candidate.stock_code} BUY_READY 전환 성공 (신호고정): {old_status.value} → {actual_status.status.value}, is_ready_for_entry(): {ready_check}")
+                                    else:
+                                        logger.error(f"❌ {candidate.stock_code} stock_manager 업데이트 실패!")
+
+                                    converted_count += 1
+                                    continue
+                                else:
+                                    logger.info(f"❌ {candidate.stock_code} 세부 진입 조건 검증 실패 (신호고정)")
+                                    continue
+                        
                         logger.debug(f"📋 {candidate.stock_code} 매수 신호 아님 ({candidate.trade_signal.value}) - 스킵")
+                        # 🆕 비매수 신호인 경우 상세 이유 로깅
+                        if candidate.stock_code == "012330":  # 특정 종목 디버깅
+                            logger.info(f"🔍 {candidate.stock_code} 매수 신호 아님 상세:")
+                            logger.info(f"   - 현재 신호: {candidate.trade_signal.value}")
+                            logger.info(f"   - 신호 강도: {candidate.signal_strength}")
+                            logger.info(f"   - 상태: {candidate.status.value}")
+                            logger.info(f"   - 패턴 수: {len(candidate.detected_patterns)}")
+                            if candidate.detected_patterns:
+                                for i, pattern in enumerate(candidate.detected_patterns):
+                                    logger.info(f"   - 패턴{i+1}: {pattern.pattern_type.value} (신뢰도:{pattern.confidence:.2f}, 강도:{pattern.strength})")
+                            
+                            # 🆕 신호 고정 정보도 출력
+                            if (hasattr(candidate, 'metadata') and candidate.metadata and 
+                                candidate.metadata.get('signal_locked', False)):
+                                original_signal = candidate.metadata.get('pattern_detected_signal', '')
+                                logger.info(f"   - 🔒 신호 고정됨: 원래 신호 = {original_signal}")
 
                 except Exception as e:
                     logger.error(f"❌ 관찰 종목 진입 평가 오류 ({candidate.stock_code}): {e}")
@@ -241,13 +351,14 @@ class BuyOpportunityEvaluator:
             buy_decision_result = await self.manager.candle_analyzer.quick_buy_decision(candidate, current_data)
             
             if buy_decision_result is None:
-                logger.debug(f"❌ {candidate.stock_code} 빠른 매수 판단 실패 - 결과 없음")
+                logger.info(f"❌ {candidate.stock_code} 빠른 매수 판단 실패 - 결과 없음")
                 return False
 
             # 매수 결정 확인
             buy_decision = buy_decision_result.get('buy_decision', 'reject')
             buy_score = buy_decision_result.get('buy_score', 0)
             current_price = buy_decision_result.get('current_price', 0)
+            reason = buy_decision_result.get('reason', '알 수 없음')
 
             if buy_decision == 'buy':
                 logger.info(f"✅ {candidate.stock_code} 빠른 매수 판단 통과: 점수 {buy_score}/100, 현재가 {current_price:,}원")
@@ -262,13 +373,23 @@ class BuyOpportunityEvaluator:
                 return True
                 
             elif buy_decision == 'wait':
-                reason = buy_decision_result.get('reason', '알 수 없음')
-                logger.debug(f"⏸️ {candidate.stock_code} 빠른 매수 대기: {reason} (점수: {buy_score}/100)")
+                logger.info(f"⏸️ {candidate.stock_code} 빠른 매수 대기: {reason} (점수: {buy_score}/100)")
+                # 🆕 대기 이유를 entry_conditions에 저장
+                from .candle_trade_candidate import EntryConditions
+                candidate.entry_conditions = EntryConditions(
+                    overall_passed=False,
+                    fail_reasons=[f'빠른_매수_대기: {reason}']
+                )
                 return False
                 
             else:  # 'reject'
-                reason = buy_decision_result.get('reason', '알 수 없음')
-                logger.debug(f"❌ {candidate.stock_code} 빠른 매수 거부: {reason}")
+                logger.info(f"❌ {candidate.stock_code} 빠른 매수 거부: {reason} (점수: {buy_score}/100)")
+                # 🆕 거부 이유를 entry_conditions에 저장
+                from .candle_trade_candidate import EntryConditions
+                candidate.entry_conditions = EntryConditions(
+                    overall_passed=False,
+                    fail_reasons=[f'빠른_매수_거부: {reason}']
+                )
                 return False
 
         except Exception as e:
@@ -357,21 +478,20 @@ class BuyOpportunityEvaluator:
     def _perform_additional_safety_checks(self, candidate: CandleTradeCandidate, current_price: float, stock_info: Dict) -> bool:
         """🛡️ 추가 안전성 검증"""
         try:
-            # 1. 급등/급락 상태 체크
-            day_change_pct = float(stock_info.get('prdy_ctrt', 0))
-            # 🔧 config에서 급등락 임계값 가져오기
-            max_day_change = self.manager.config.get('max_day_change_pct', 15.0)
-            if abs(day_change_pct) > max_day_change:
-                logger.debug(f"❌ {candidate.stock_code} 급등락 상태: {day_change_pct:.2f}%")
-                return False
+            # 🔧 급등/급락 체크 제거 - 너무 엄격한 제한으로 정상적인 매수 기회 차단
+            # day_change_pct = float(stock_info.get('prdy_ctrt', 0))
+            # max_day_change = self.manager.config.get('max_day_change_pct', 15.0)
+            # if abs(day_change_pct) > max_day_change:
+            #     logger.debug(f"❌ {candidate.stock_code} 급등락 상태: {day_change_pct:.2f}%")
+            #     return False
 
-            # 2. 거래 정지 상태 체크
+            # 1. 거래 정지 상태 체크
             trading_halt = stock_info.get('mrkt_warn_cls_code', '')
             if trading_halt and trading_halt not in ['00', '']:
                 logger.debug(f"❌ {candidate.stock_code} 거래 제한 상태: {trading_halt}")
                 return False
 
-            # 3. 최근 신호 생성 시간 체크 (너무 오래된 신호 제외)
+            # 2. 최근 신호 생성 시간 체크 (너무 오래된 신호 제외)
             if candidate.signal_updated_at:
                 signal_age = datetime.now(self.manager.korea_tz) - candidate.signal_updated_at
                 # 🔧 config에서 신호 유효시간 가져오기
@@ -380,7 +500,7 @@ class BuyOpportunityEvaluator:
                     logger.debug(f"❌ {candidate.stock_code} 신호가 너무 오래됨: {signal_age}")
                     return False
 
-            # 4. 패턴 신뢰도 재확인
+            # 3. 패턴 신뢰도 재확인
             if candidate.detected_patterns:
                 primary_pattern = candidate.detected_patterns[0]
                 # 🔧 config에서 최소 신뢰도 가져오기
@@ -535,19 +655,8 @@ class BuyOpportunityEvaluator:
                 logger.warning(f"❌ {candidate.stock_code} 유효하지 않은 현재가: {current_price}")
                 return False
 
-            # 🆕 시가 대비 현재가 최종 체크
-            if today_open > 0:
-                price_diff_pct = ((current_price - today_open) / today_open) * 100
-                
-                # 급등 시 매수 포기 (설정 가능)
-                max_allowed_rise = self.manager.config.get('entry_timing', {}).get('max_price_diff_from_open', 1.5)
-                if price_diff_pct > max_allowed_rise:
-                    logger.warning(f"🚫 {candidate.stock_code} 시가 대비 과도한 상승으로 매수 포기: "
-                                 f"시가 {today_open:,}원 → 현재가 {current_price:,}원 "
-                                 f"({price_diff_pct:+.2f}% > {max_allowed_rise}%)")
-                    return False
-                
-                logger.debug(f"✅ {candidate.stock_code} 시가 대비 상승률 적정: {price_diff_pct:+.2f}%")
+            # 🔧 시가 대비 상승률 체크는 TradeExecutor의 _calculate_intraday_market_price에서 처리
+            # 중복 체크 제거하여 일관성 확보
 
             # 수량 계산
             quantity = int(investment_amount / current_price)

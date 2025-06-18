@@ -116,6 +116,14 @@ class TradeExecutor:
 
             # 매수가격 조정 (틱 단위 맞춤)
             buy_price = self._calculate_buy_price(target_price)
+            
+            # 🚫 시가 대비 상승률 초과로 매수 포기 신호 처리
+            if buy_price <= 0:
+                return TradeResult(
+                    success=False, stock_code=stock_code, order_type='BUY',
+                    quantity=0, price=0, total_amount=0,
+                    error_message="시가 대비 과도한 상승으로 매수 포기"
+                )
 
             # 매수 수량 계산
             if 'quantity' in signal and signal['quantity'] > 0:
@@ -342,64 +350,134 @@ class TradeExecutor:
             return 0
 
     def _calculate_buy_price(self, current_price: int) -> int:
-        """시가 고려 매수 지정가 계산 - 과도한 고가 매수 방지"""
+        """시간대별 현실적인 매수 지정가 계산 - 10시 이후 장중 대응"""
         try:
+            # 🆕 현재 시간 확인
+            from datetime import datetime
+            current_time = datetime.now().time()
+            
             # 🆕 시가 정보 조회 시도
             today_open = self._get_today_open_price_safe(current_price)
             
-            # 기본 매수가 계산 (현재가 + 0.2% 프리미엄)
-            basic_buy_price = int(current_price * (1 + self.buy_premium))
-            
-            # 🆕 시가 기준 매수가 계산 (시가 + 0.5% 프리미엄)
-            open_based_price = int(today_open * 1.005) if today_open > 0 else basic_buy_price
-            
-            # 🎯 두 가격 중 더 적절한 가격 선택
-            if today_open > 0:
-                # 시가 대비 현재가 상승률 계산
-                price_rise_pct = ((current_price - today_open) / today_open) * 100
-                
-                if price_rise_pct > 1.0:  # 시가 대비 1% 이상 상승
-                    # 급등 상황: 시가 기준 가격과 현재가 기준 가격 중 낮은 것 선택
-                    target_price = min(open_based_price, basic_buy_price)
-                    logger.debug(f"💰 급등 상황 매수가: 시가{today_open:,}원 → 현재가{current_price:,}원 "
-                               f"(+{price_rise_pct:.2f}%) → 주문가{target_price:,}원 (제한적용)")
-                else:
-                    # 정상 상황: 기본 로직 사용
-                    target_price = basic_buy_price
-                    logger.debug(f"💰 정상 상황 매수가: 현재가{current_price:,}원 → 주문가{target_price:,}원")
+            # 🆕 시간대별 매수 전략 결정
+            if current_time < datetime.strptime("10:00", "%H:%M").time():
+                # 🕘 장초반 (9:00-10:00): 시가 중심 보수적 전략
+                return self._calculate_early_market_price(current_price, today_open)
             else:
-                # 시가 정보 없음: 기본 로직 사용
-                target_price = basic_buy_price
-                logger.debug(f"💰 시가정보없음 매수가: 현재가{current_price:,}원 → 주문가{target_price:,}원")
-
-            # 틱 단위 조정
-            final_price = self._adjust_to_tick_size(target_price)
-
-            # 🆕 최대 제한 강화 (시가 기준 3% 또는 현재가 기준 2% 중 낮은 것)
-            if today_open > 0:
-                max_price_from_open = int(today_open * 1.03)  # 시가 기준 3%
-                max_price_from_current = int(current_price * 1.02)  # 현재가 기준 2%
-                max_buy_price = min(max_price_from_open, max_price_from_current)
-            else:
-                max_buy_price = int(current_price * 1.02)  # 현재가 기준 2%로 축소
-
-            final_price = min(final_price, max_buy_price)
-
-            # 🆕 상세 로깅
-            if today_open > 0:
-                open_diff_pct = ((final_price - today_open) / today_open) * 100
-                current_diff_pct = ((final_price - current_price) / current_price) * 100
-                logger.debug(f"💰 최종 매수가: {final_price:,}원 "
-                           f"(시가대비 {open_diff_pct:+.2f}%, 현재가대비 {current_diff_pct:+.2f}%)")
-            else:
-                current_diff_pct = ((final_price - current_price) / current_price) * 100
-                logger.debug(f"💰 최종 매수가: {final_price:,}원 (현재가대비 {current_diff_pct:+.2f}%)")
-
-            return final_price
+                # 🕙 장중 (10:00-15:30): 현재가 중심 적극적 전략
+                return self._calculate_intraday_market_price(current_price, today_open)
 
         except Exception as e:
             logger.error(f"매수가 계산 오류: {e}")
             return int(current_price * 1.002)  # 오류시 최소 프리미엄
+    
+    def _calculate_early_market_price(self, current_price: int, today_open: int) -> int:
+        """🕘 장초반 (9:00-10:00) 매수가 계산 - 시가 중심 보수적"""
+        try:
+            # 기본 매수가 계산 (현재가 + 0.2% 프리미엄)
+            basic_buy_price = int(current_price * (1 + self.buy_premium))
+            
+            # 시가 기준 매수가 계산 (시가 + 0.5% 프리미엄)
+            open_based_price = int(today_open * 1.005) if today_open > 0 else basic_buy_price
+            
+            # 시가 기준 전략 (장초반)
+            if today_open > 0:
+                price_rise_pct = ((current_price - today_open) / today_open) * 100
+                
+                if price_rise_pct > 2.0:  # 시가 대비 2% 이상 급등
+                    # 급등시에도 최소한 현재가 근처에서 주문
+                    target_price = int(current_price * 1.001)  # 현재가 + 0.1%
+                    logger.debug(f"💰 장초반 급등 대응: 시가{today_open:,}원 → 현재가{current_price:,}원 "
+                               f"(+{price_rise_pct:.2f}%) → 주문가{target_price:,}원")
+                else:
+                    # 정상 상황: 시가 기준과 현재가 기준 중 적절한 것 선택
+                    target_price = min(open_based_price, basic_buy_price)
+                    logger.debug(f"💰 장초반 정상: 시가{today_open:,}원 → 현재가{current_price:,}원 → 주문가{target_price:,}원")
+            else:
+                target_price = basic_buy_price
+                logger.debug(f"💰 장초반 시가없음: 현재가{current_price:,}원 → 주문가{target_price:,}원")
+
+            # 틱 단위 조정
+            final_price = self._adjust_to_tick_size(target_price)
+            
+            # 최대 제한 (현재가 기준 1.5%)
+            max_buy_price = int(current_price * 1.015)
+            final_price = min(final_price, max_buy_price)
+
+            return final_price
+
+        except Exception as e:
+            logger.error(f"장초반 매수가 계산 오류: {e}")
+            return int(current_price * 1.002)
+    
+    def _calculate_intraday_market_price(self, current_price: int, today_open: int) -> int:
+        """🕙 장중 (10:00-15:30) 매수가 계산 - 현재가 중심 적극적, 시간대별 시가 기준 통합"""
+        try:
+            # 🚀 장중에는 현재가 기준으로 적극적 매수
+            
+            # 시간대별 프리미엄 차등 적용
+            from datetime import datetime
+            current_time = datetime.now().time()
+            
+            if current_time < datetime.strptime("11:00", "%H:%M").time():
+                # 장 전반 (10:00-11:00): 중간 기준
+                premium = 0.003
+                max_allowed_rise = 4.0
+                phase = "장전반"
+            elif current_time < datetime.strptime("14:00", "%H:%M").time():
+                # 장 중반 (11:00-14:00): 관대한 기준
+                premium = 0.004
+                max_allowed_rise = 8.0
+                phase = "장중반"
+            else:
+                # 장 후반 (14:00-15:30): 매우 관대한 기준
+                premium = 0.005
+                max_allowed_rise = 10.0
+                phase = "장후반"
+            
+            # 🎯 시가 대비 상승률 체크 및 가격 조정
+            if today_open > 0:
+                price_rise_pct = ((current_price - today_open) / today_open) * 100
+                
+                # 🚫 시간대별 최대 허용 상승률 체크
+                if price_rise_pct > max_allowed_rise:
+                    logger.warning(f"🚫 시가 대비 과도한 상승으로 매수 포기: "
+                                 f"시가 {today_open:,}원 → 현재가 {current_price:,}원 "
+                                 f"({price_rise_pct:+.2f}% > {max_allowed_rise:.1f}% [{phase}])")
+                    return 0  # 매수 포기 신호
+                
+                # 상승률에 따른 프리미엄 조정
+                if price_rise_pct > max_allowed_rise * 0.7:  # 70% 이상시 프리미엄 축소
+                    adjusted_premium = max(0.001, premium * 0.5)  # 프리미엄 절반으로
+                    target_price = int(current_price * (1 + adjusted_premium))
+                    logger.debug(f"💰 {phase} 상승률 조정: 시가{today_open:,}원 → 현재가{current_price:,}원 "
+                               f"(+{price_rise_pct:.2f}%) → 주문가{target_price:,}원 (프리미엄 {adjusted_premium*100:.1f}%)")
+                else:
+                    # 정상 프리미엄 적용
+                    target_price = int(current_price * (1 + premium))
+                    logger.debug(f"💰 {phase} 정상: 시가{today_open:,}원 → 현재가{current_price:,}원 "
+                               f"(+{price_rise_pct:.2f}%) → 주문가{target_price:,}원 (프리미엄 {premium*100:.1f}%)")
+            else:
+                # 시가 정보 없음: 기본 프리미엄 적용
+                target_price = int(current_price * (1 + premium))
+                logger.debug(f"💰 {phase} 시가없음: 현재가{current_price:,}원 → 주문가{target_price:,}원 (프리미엄 {premium*100:.1f}%)")
+
+            # 틱 단위 조정
+            final_price = self._adjust_to_tick_size(target_price)
+            
+            # 🚀 장중에는 더 관대한 최대 제한 (현재가 기준 1.0%)
+            max_buy_price = int(current_price * 1.01)
+            final_price = min(final_price, max_buy_price)
+
+            # 최종 로깅
+            current_diff_pct = ((final_price - current_price) / current_price) * 100
+            logger.debug(f"💰 {phase} 최종 매수가: {final_price:,}원 (현재가대비 {current_diff_pct:+.2f}%)")
+
+            return final_price
+
+        except Exception as e:
+            logger.error(f"장중 매수가 계산 오류: {e}")
+            return int(current_price * 1.002)
 
     def _get_today_open_price_safe(self, current_price: int) -> int:
         """🆕 안전한 당일 시가 조회"""

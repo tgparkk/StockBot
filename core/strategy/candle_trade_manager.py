@@ -123,7 +123,7 @@ class CandleTradeManager:
             logger.info("🕯️ 캔들 기반 매매 시스템 시작")
 
             # 기존 보유 종목 웹소켓 모니터링 설정
-            #await self.setup_existing_holdings_monitoring()
+            await self.setup_existing_holdings_monitoring()
 
             # 거래일 초기화
             await self._initialize_trading_day()
@@ -444,11 +444,11 @@ class CandleTradeManager:
             # 5. 매수 체결 시간 설정
             self._setup_buy_execution_time(candidate)
 
-            # 6. stock_manager에 추가
-            success = self.stock_manager.add_candidate(candidate)
+            # 6. stock_manager에 추가 (기존 보유 종목은 "existing_holding" 전략 소스)
+            success = self.stock_manager.add_candidate(candidate, strategy_source="existing_holding")
 
             if success:
-                logger.info(f"✅ {stock_code} 기존 보유 종목 CandleTradeCandidate 생성 완료")
+                logger.info(f"✅ {stock_code} 기존 보유 종목 CandleTradeCandidate 생성 완료 (전략:existing_holding)")
                 return True
             else:
                 logger.warning(f"⚠️ {stock_code} stock_manager 추가 실패")
@@ -631,7 +631,7 @@ class CandleTradeManager:
                 
                 # 장후에는 2시간마다 한 번씩
                 time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
-                return time_elapsed >= 7200  # 2시간
+                return time_elapsed >= 60  # 2시간
             
             return False
 
@@ -1433,12 +1433,12 @@ class CandleTradeManager:
         try:
             # 진입가 정보 확인
             if not candidate.performance.entry_price:
-                logger.debug(f"⚠️ {candidate.stock_code} 진입가 정보 없음")
+                logger.warning(f"⚠️ {candidate.stock_code} 진입가 정보 없음")
                 return False, "진입가 정보 없음", TradeSignal.HOLD
 
             # 진입 시간 확인
             if not candidate.performance.entry_time:
-                logger.debug(f"⚠️ {candidate.stock_code} 진입 시간 정보 없음")
+                logger.warning(f"⚠️ {candidate.stock_code} 진입 시간 정보 없음")
                 return False, "진입 시간 정보 없음", TradeSignal.HOLD
 
             # 🎯 1. 수익률 계산
@@ -1582,7 +1582,7 @@ class CandleTradeManager:
             if self._last_scan_time:
                 last_scan = (datetime.now() - self._last_scan_time).total_seconds()
                 scanner_status = f"구독{len(self.subscribed_stocks)}개 " if hasattr(self, 'subscribed_stocks') else ""
-                logger.info(f"📊 상태: 관찰{stats['total_stocks']}개 "
+                logger.debug(f"📊 상태: 관찰{stats['total_stocks']}개 "
                            f"포지션{stats['active_positions']}개 "
                            f"{scanner_status}"
                            f"마지막스캔{last_scan:.0f}초전")
