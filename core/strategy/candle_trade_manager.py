@@ -1728,18 +1728,6 @@ class CandleTradeManager:
                 return f"range_{i}"
         return f"range_{len(thresholds)}"
 
-    def _should_update_exit_signal(self, candidate: CandleTradeCandidate, analysis_result: Dict) -> bool:
-        """매도 신호 업데이트 필요 여부 판단"""
-        try:
-            new_signal = analysis_result['new_signal']
-
-            # 매도 신호로 변경되었을 때만 업데이트
-            return new_signal in [TradeSignal.SELL, TradeSignal.STRONG_SELL] and candidate.trade_signal != new_signal
-
-        except Exception as e:
-            logger.debug(f"매도 신호 업데이트 판단 오류: {e}")
-            return False
-
     # ========== 포지션 관리 ==========
 
     async def _initialize_trading_day(self):
