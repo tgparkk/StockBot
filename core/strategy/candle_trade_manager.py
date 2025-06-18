@@ -91,6 +91,17 @@ class CandleTradeManager:
             korea_tz=self.korea_tz
         )
 
+        # 🆕 실시간 패턴 감지기 초기화
+        from .realtime_pattern_detector import RealtimePatternDetector
+        self.realtime_pattern_detector = RealtimePatternDetector()
+
+        # 🆕 패턴 매니저 초기화
+        from .pattern_manager import PatternManager
+        self.pattern_manager = PatternManager(
+            premarket_detector=self.pattern_detector,
+            realtime_detector=self.realtime_pattern_detector
+        )
+
         # 🆕 시장 스캐너 초기화
         self.market_scanner = MarketScanner(candle_trade_manager=self)
 
@@ -155,8 +166,8 @@ class CandleTradeManager:
                         logger.info("✅ 정기 패턴 스캔 완료")
 
                     # 🌍 2. 시장 상황 분석 (5분마다)
-                    if self.market_analyzer.should_update():
-                        self.market_analyzer.analyze_market_condition()
+                    #if self.market_analyzer.should_update():
+                    #    self.market_analyzer.analyze_market_condition()
 
                     # 🔄 3. 기존 종목 신호 재평가 (30초 간격 - 실시간 모니터링)
                     await self._periodic_signal_evaluation()
@@ -631,15 +642,8 @@ class CandleTradeManager:
         try:
             logger.debug(f"🔄 {stock_code} 보유 종목 패턴 재분석 시작")
 
-            # 🆕 종목 선정과 동일한 패턴 분석 수행
-            from .market_scanner import MarketScanner
-            
-            # MarketScanner 인스턴스 생성 (기존 설정 재사용)
-            market_scanner = MarketScanner(
-                manager=self,
-                pattern_detector=self.pattern_detector,
-                pattern_manager=self.pattern_manager
-            )
+            # 🆕 종목 선정과 동일한 패턴 분석 수행 - 기존 인스턴스 재사용
+            market_scanner = self.market_scanner
             
             # 🎯 핵심: analyze_stock_for_patterns 함수 재사용
             candidate_result = await market_scanner.analyze_stock_for_patterns(stock_code, "KOSPI")
@@ -801,13 +805,13 @@ class CandleTradeManager:
             # 🎯 3. 장후에는 다음날 준비를 위한 스캔 허용 (15:30 이후)
             elif current_hour >= 15 and current_minute > 30:
                 if not self._last_pattern_scan_time:
-                    return False
+                    return True
                 
                 # 장후에는 2시간마다 한 번씩
                 time_elapsed = (current_time - self._last_pattern_scan_time).total_seconds()
                 return time_elapsed >= 60  # 2시간
             
-            return False
+            return True
 
         except Exception as e:
             logger.error(f"패턴 스캔 판단 오류: {e}")

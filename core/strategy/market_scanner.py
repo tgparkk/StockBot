@@ -41,8 +41,8 @@ class MarketScanner:
         self.subscribed_stocks = candle_trade_manager.subscribed_stocks
         self.korea_tz = candle_trade_manager.korea_tz
 
-        # 🆕 PatternManager 초기화 (시간대별 전략 자동 전환)
-        self.pattern_manager = PatternManager()
+        # 🆕 PatternManager 사용 (CandleTradeManager에서 이미 초기화됨)
+        self.pattern_manager = candle_trade_manager.pattern_manager
 
         self._last_scan_time: Optional[datetime] = None
         self._scan_interval = 30  # 30초
@@ -67,7 +67,7 @@ class MarketScanner:
             
             # 15:31-07:59: 장전 전략 (다음날 준비)
             else:
-                return "premarket"
+                return "both" # 장후 시간은 실시간 전략 사용
                 
         except Exception as e:
             logger.error(f"전략 소스 결정 오류: {e}")
@@ -371,7 +371,6 @@ class MarketScanner:
             if current_strategy_source == "realtime":
                 try:
                     from ..api.kis_market_api import get_inquire_time_itemchartprice
-                    from datetime import datetime, timedelta
 
                     # 🔧 현실적 제한: 최대 30분봉만 조회 가능
                     now = datetime.now()
@@ -416,13 +415,22 @@ class MarketScanner:
             logger.debug(f"🔍 {stock_code} 패턴 분석 완료: {pattern_analysis.get('mode')} 모드, "
                         f"{len(pattern_result)}개 패턴, 감지기: {pattern_analysis.get('detector_used')}")
 
-            # 6. 후보 생성
+            # 6. 후보 생성 (기본 필수 필드만)
             candidate = CandleTradeCandidate(
                 stock_code=stock_code,
                 stock_name=stock_name,
-                current_price=int(current_price),
-                market_type=market_name  # 시장 타입 추가
+                current_price=float(current_price),
+                market_type=market_name
             )
+            
+            # 🔧 패턴 정보는 생성 후 할당 (field(default_factory=list) 때문)
+            candidate.detected_patterns = pattern_result if isinstance(pattern_result, list) else []
+            candidate.primary_pattern = strongest_pattern
+            candidate.pattern_score = strongest_pattern.strength
+            candidate.trade_signal = pattern_analysis.get('trade_signal', TradeSignal.HOLD)
+            candidate.signal_strength = pattern_analysis.get('signal_strength', 0)
+            candidate.signal_updated_at = datetime.now()
+            candidate.entry_conditions = EntryConditions()
 
             # 🆕 조회한 일봉 데이터를 새로운 candidate에 캐싱
             if ohlcv_data is not None:
@@ -445,9 +453,7 @@ class MarketScanner:
                 
                 logger.debug(f"📊 {stock_code} 분봉 데이터 캐싱 완료: {len(minute_data)}개")
 
-            # 패턴 정보 추가
-            for pattern in pattern_result:
-                candidate.add_pattern(pattern)
+            # 🔧 패턴 정보는 위에서 이미 할당했으므로 중복 추가 생략
 
             # 🆕 PatternManager 결과에서 매매 신호 가져오기
             trade_signal = pattern_analysis.get('trade_signal', TradeSignal.HOLD)
@@ -699,7 +705,6 @@ class MarketScanner:
             if ohlcv_data is None:
                 try:
                     from ..api.kis_market_api import get_inquire_daily_itemchartprice
-                    from datetime import datetime, timedelta
                     
                     # 시작일 (30거래일 전 approximate)
                     start_date = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
