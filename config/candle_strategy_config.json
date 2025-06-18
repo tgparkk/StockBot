@@ -53,28 +53,28 @@
     },
     "pattern_targets": {
         "hammer": {
-            "target": 1.8,
+            "target": 1.5,
             "stop": 1.5,
             "max_hours": 48,
             "min_minutes": 1440,
             "description": "망치형: 5일 데이터, 하락추세+긴 아래꼬리+종가 상단부, 1-2일 보유"
         },
         "bullish_engulfing": {
-            "target": 2.3,
+            "target": 2.0,
             "stop": 2.0,
             "max_hours": 24,
             "min_minutes": 720,
             "description": "상승장악형: 4일 데이터, 전날 음봉+당일 완전포함 양봉, 당일-1일 보유"
         },
         "piercing_line": {
-            "target": 1.8,
+            "target": 1.5,
             "stop": 1.5,
             "max_hours": 24,
             "min_minutes": 720,
             "description": "관통형: 3일 데이터, 전날 강한음봉+당일 갭하락후 반등, 당일-1일 보유"
         },
         "morning_star": {
-            "target": 2.5,
+            "target": 2.0,
             "stop": 2.5,
             "max_hours": 24,
             "min_minutes": 480,
