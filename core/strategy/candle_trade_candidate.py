@@ -73,6 +73,7 @@ class EntryConditions:
     daily_volume_check: bool = False   # 일 거래대금 조건
     overall_passed: bool = False       # 전체 통과 여부
     fail_reasons: List[str] = field(default_factory=list)  # 실패 이유
+    pass_reasons: List[str] = field(default_factory=list)  # 성공 이유 (추가)
     technical_indicators: Dict[str, Any] = field(default_factory=dict)  # 기술적 지표 값들
 
 
@@ -130,11 +131,6 @@ class CandleTradeCandidate:
     current_price: float
     market_type: str                    # "KOSPI", "KOSDAQ"
 
-    # ========== 🆕 일봉 데이터 캐싱 ==========
-    ohlcv_data: Optional[pd.DataFrame] = None       # 일봉 데이터 캐시
-    ohlcv_last_updated: Optional[datetime] = None   # 일봉 데이터 마지막 업데이트 시간
-    ohlcv_update_date: Optional[str] = None         # 일봉 데이터 업데이트 일자 (YYYYMMDD)
-
     # ========== 캔들 패턴 정보 ==========
     detected_patterns: List[CandlePatternInfo] = field(default_factory=list)
     primary_pattern: Optional[CandlePatternInfo] = None
@@ -185,32 +181,20 @@ class CandleTradeCandidate:
     # ========== 🆕 일봉 데이터 캐싱 메서드 ==========
 
     def cache_ohlcv_data(self, ohlcv_data: pd.DataFrame):
-        """일봉 데이터 캐싱"""
-        self.ohlcv_data = ohlcv_data.copy() if ohlcv_data is not None else None
-        self.ohlcv_last_updated = datetime.now()
-        self.ohlcv_update_date = datetime.now().strftime('%Y%m%d')
+        """OHLCV 데이터 캐싱"""
+        self._cached_ohlcv_data = ohlcv_data
         self.last_updated = datetime.now()
 
-    def is_ohlcv_data_valid(self) -> bool:
-        """캐시된 일봉 데이터의 유효성 확인"""
-        if self.ohlcv_data is None or self.ohlcv_update_date is None:
-            return False
-
-        # 오늘 날짜와 비교
-        today = datetime.now().strftime('%Y%m%d')
-        return self.ohlcv_update_date == today
-
     def get_ohlcv_data(self) -> Optional[pd.DataFrame]:
-        """캐시된 일봉 데이터 조회"""
-        if self.is_ohlcv_data_valid():
-            return self.ohlcv_data
-        return None
+        """캐싱된 OHLCV 데이터 조회"""
+        return getattr(self, '_cached_ohlcv_data', None)
 
     def invalidate_ohlcv_cache(self):
         """일봉 데이터 캐시 무효화"""
-        self.ohlcv_data = None
-        self.ohlcv_last_updated = None
-        self.ohlcv_update_date = None
+        if hasattr(self, '_cached_ohlcv_data'):
+            delattr(self, '_cached_ohlcv_data')
+        if hasattr(self, '_cached_minute_data'):
+            delattr(self, '_cached_minute_data')
 
     def add_pattern(self, pattern_info: CandlePatternInfo):
         """패턴 정보 추가"""
@@ -416,3 +400,41 @@ class CandleTradeCandidate:
         elif order_type.lower() == 'sell':
             return self.pending_sell_order_no
         return None
+
+    # 🆕 분봉 데이터 캐싱 메서드 추가
+    def cache_minute_data(self, minute_data: pd.DataFrame):
+        """분봉 데이터 캐싱"""
+        self._cached_minute_data = minute_data
+        self.last_updated = datetime.now()
+        
+        # 메타데이터에도 기록
+        if not hasattr(self, 'metadata') or self.metadata is None:
+            self.metadata = {}
+        self.metadata['minute_data_cached'] = True
+        self.metadata['minute_data_count'] = len(minute_data)
+        self.metadata['minute_data_updated'] = datetime.now().isoformat()
+
+    def get_minute_data(self) -> Optional[pd.DataFrame]:
+        """캐싱된 분봉 데이터 조회"""
+        return getattr(self, '_cached_minute_data', None)
+
+    def has_cached_ohlcv_data(self) -> bool:
+        """일봉 데이터 캐시 존재 여부"""
+        return hasattr(self, '_cached_ohlcv_data') and self._cached_ohlcv_data is not None
+
+    def has_cached_minute_data(self) -> bool:
+        """분봉 데이터 캐시 존재 여부"""
+        return hasattr(self, '_cached_minute_data') and self._cached_minute_data is not None
+
+    def get_cache_info(self) -> Dict[str, Any]:
+        """캐시 정보 조회"""
+        ohlcv_data = self.get_ohlcv_data()
+        minute_data = self.get_minute_data()
+        
+        return {
+            'has_ohlcv_cache': self.has_cached_ohlcv_data(),
+            'has_minute_cache': self.has_cached_minute_data(),
+            'ohlcv_rows': len(ohlcv_data) if ohlcv_data is not None else 0,
+            'minute_rows': len(minute_data) if minute_data is not None else 0,
+            'last_updated': self.last_updated.isoformat() if self.last_updated else None
+        }

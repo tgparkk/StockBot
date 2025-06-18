@@ -347,7 +347,7 @@ class CandleAnalyzer:
 
 
     async def quick_buy_decision(self, candidate: CandleTradeCandidate, current_data: Optional[Any] = None) -> Optional[Dict]:
-        """🚀 매수 전용 빠른 판단 함수 - 장전 패턴분석 결과 + 현재가격 기반"""
+        """🚀 매수 실행 가능 여부 빠른 판단 - 확정된 신호 기반, 현재 가격에서 매수 가능한지만 체크"""
         try:
             stock_code = candidate.stock_code
 
@@ -366,7 +366,7 @@ class CandleAnalyzer:
             # 현재가 업데이트
             candidate.update_price(current_price)
 
-            logger.debug(f"🔍 {stock_code} 매수 판단: 현재가 {current_price:,}원")
+            logger.debug(f"🔍 {stock_code} 매수 실행 가능성 판단: 현재가 {current_price:,}원")
 
             # 2️⃣ 빠른 기본 조건 체크 (실패시 즉시 리턴)
             basic_check = self._check_basic_buy_conditions(candidate, current_price, current_data)
@@ -391,10 +391,10 @@ class CandleAnalyzer:
                     'timing_info': entry_timing
                 }
 
-            # 4️⃣ 기존 패턴 유효성 재확인 (간단히)
+            # 4️⃣ 기존 패턴 존재 확인 (재검증 아님)
             pattern_validity = self._validate_existing_patterns(candidate, current_price)
             if not pattern_validity['valid']:
-                logger.debug(f"📊 {stock_code} 패턴 유효성 상실: {pattern_validity['reason']}")
+                logger.debug(f"📊 {stock_code} 패턴 정보 없음: {pattern_validity['reason']}")
                 return {
                     'buy_decision': 'reject',
                     'reason': pattern_validity['reason'],
@@ -402,7 +402,7 @@ class CandleAnalyzer:
                     'analysis_type': 'quick_buy_decision'
                 }
 
-            # 5️⃣ 최종 매수 결정
+            # 5️⃣ 최종 매수 결정 (확정된 신호 + 현재 조건 기반)
             buy_score = self._calculate_quick_buy_score(candidate, current_price, entry_timing, pattern_validity)
             
             # 임계값 체크
@@ -410,7 +410,7 @@ class CandleAnalyzer:
             
             if buy_score >= min_buy_score:
                 decision = 'buy'
-                logger.info(f"✅ {stock_code} 매수 결정: 점수 {buy_score}/100 (임계값: {min_buy_score})")
+                logger.info(f"✅ {stock_code} 매수 실행 가능: 점수 {buy_score}/100 (임계값: {min_buy_score})")
             else:
                 decision = 'wait'
                 logger.debug(f"⏸️ {stock_code} 매수 대기: 점수 {buy_score}/100 (임계값: {min_buy_score})")
@@ -427,11 +427,11 @@ class CandleAnalyzer:
             }
 
         except Exception as e:
-            logger.error(f"❌ 빠른 매수 판단 오류 ({candidate.stock_code}): {e}")
+            logger.error(f"❌ 매수 실행 가능성 판단 오류 ({candidate.stock_code}): {e}")
             return None
 
     def _check_basic_buy_conditions(self, candidate: CandleTradeCandidate, current_price: float, current_data: Any) -> Dict:
-        """🔍 기본 매수 조건 빠른 체크"""
+        """🔍 기본 매수 조건 빠른 체크 - 신호 재검증 제거"""
         try:
             # 1. 가격대 체크
             if not (self.config['min_price'] <= current_price <= self.config['max_price']):
@@ -441,19 +441,15 @@ class CandleAnalyzer:
             if not self._is_trading_time():
                 return {'passed': False, 'fail_reason': '장 시간 외'}
 
-            # 3. 기존 패턴 존재 여부
-            if not candidate.detected_patterns or len(candidate.detected_patterns) == 0:
-                return {'passed': False, 'fail_reason': '감지된 패턴 없음'}
-
-            # 4. 최소 거래량 체크
+            # 3. 최소 거래량 체크
             volume = int(current_data.iloc[0].get('acml_vol', 0))
             min_volume = self.config.get('min_volume', 10000)
             if volume < min_volume:
                 return {'passed': False, 'fail_reason': f'거래량 부족 ({volume:,}주 < {min_volume:,}주)'}
 
-            # 5. 기본 신호 체크
-            if candidate.trade_signal not in [TradeSignal.BUY, TradeSignal.STRONG_BUY]:
-                return {'passed': False, 'fail_reason': f'매수 신호 아님 ({candidate.trade_signal.value})'}
+            # 🔧 신호 재검증 제거 - 이미 확정된 신호는 그대로 사용
+            # 기존: candidate.trade_signal 재체크 → 제거
+            # 이유: 신호가 확정되면 그 신호를 바탕으로 매매만 하면 됨
 
             return {'passed': True, 'fail_reason': None}
 
@@ -462,7 +458,7 @@ class CandleAnalyzer:
             return {'passed': False, 'fail_reason': f'체크 오류: {str(e)}'}
 
     def _check_entry_timing_conditions(self, candidate: CandleTradeCandidate, current_price: float, current_data: Any) -> Dict:
-        """⏰ 진입 타이밍 조건 체크 (시가 근처 매수) - 강화 버전"""
+        """⏰ 진입 타이밍 조건 체크 - 현실적인 시가 기준 적용"""
         try:
             # 오늘 시가 가져오기
             today_open = float(current_data.iloc[0].get('stck_oprc', 0))
@@ -472,31 +468,48 @@ class CandleAnalyzer:
             # 시가 대비 현재가 위치 계산
             price_diff_pct = ((current_price - today_open) / today_open) * 100
 
-            # 🎯 더 엄격한 시가 근처 매수 조건
-            max_price_diff_pct = self.config.get('entry_timing', {}).get('max_price_diff_from_open', 1.5)  # 기본 1.5%로 축소
-            excellent_threshold = self.config.get('entry_timing', {}).get('excellent_threshold', 0.5)  # 0.5% 이내는 최우수
-            good_threshold = self.config.get('entry_timing', {}).get('good_threshold', 1.0)  # 1.0% 이내는 양호
+            # 🆕 현실적인 시간대별 차등 기준 적용
+            from datetime import datetime
+            current_time = datetime.now().time()
             
-            # 🆕 하락시에는 더 관대하게, 상승시에는 더 엄격하게
-            if price_diff_pct > 0:  # 상승한 경우
-                # 상승시에는 더 엄격 (최대 1.0%)
-                max_allowed_pct = min(max_price_diff_pct, 1.0)
-                warning_threshold = 0.8  # 0.8% 이상 상승시 경고
-            else:  # 하락한 경우  
-                # 하락시에는 더 관대 (최대 2.0%)
-                max_allowed_pct = max(max_price_diff_pct, 2.0)
-                warning_threshold = 1.5  # 1.5% 이상 하락시 경고
+            # 시간대별 허용 범위 설정
+            if current_time < datetime.strptime("09:30", "%H:%M").time():
+                # 장 초반 (9:00-9:30): 엄격한 기준
+                max_allowed_pct = 2.0
+                timing_phase = "장초반"
+            elif current_time < datetime.strptime("11:00", "%H:%M").time():
+                # 장 전반 (9:30-11:00): 중간 기준
+                max_allowed_pct = 4.0
+                timing_phase = "장전반"
+            elif current_time < datetime.strptime("14:00", "%H:%M").time():
+                # 장 중반 (11:00-14:00): 관대한 기준
+                max_allowed_pct = 6.0
+                timing_phase = "장중반"
+            else:
+                # 장 후반 (14:00-15:30): 매우 관대한 기준
+                max_allowed_pct = 8.0
+                timing_phase = "장후반"
 
-            # 📊 타이밍 품질 평가
+            # 🆕 상승/하락 방향별 추가 조정
+            if price_diff_pct > 0:  # 상승한 경우
+                # 상승시에는 기본 기준 적용
+                final_max_pct = max_allowed_pct
+                direction_note = "상승"
+            else:  # 하락한 경우  
+                # 하락시에는 더 관대하게 (+50% 허용)
+                final_max_pct = max_allowed_pct * 1.5
+                direction_note = "하락"
+
+            # 📊 타이밍 품질 평가 (더 관대한 기준)
             abs_diff = abs(price_diff_pct)
             
-            if abs_diff <= excellent_threshold:
+            if abs_diff <= 1.0:
                 timing_quality = 'excellent'
                 timing_score = 100
-            elif abs_diff <= good_threshold:
+            elif abs_diff <= 3.0:
                 timing_quality = 'good'  
                 timing_score = 80
-            elif abs_diff <= max_allowed_pct:
+            elif abs_diff <= final_max_pct:
                 timing_quality = 'acceptable'
                 timing_score = 60
             else:
@@ -504,14 +517,16 @@ class CandleAnalyzer:
                 timing_score = 20
 
             # 🚨 매수 가능 여부 최종 판단
-            if abs_diff <= max_allowed_pct:
-                reason = f'시가 근처 매수 가능 (시가대비 {price_diff_pct:+.2f}%)'
+            if abs_diff <= final_max_pct:
+                reason = f'{timing_phase} {direction_note} 진입 가능 (시가대비 {price_diff_pct:+.2f}%)'
                 
-                # 🆕 경고 메시지 추가
-                if price_diff_pct > warning_threshold:
-                    reason += f' [주의: 시가 대비 {price_diff_pct:.2f}% 상승]'
-                elif price_diff_pct < -warning_threshold:
-                    reason += f' [하락 진입: 시가 대비 {price_diff_pct:.2f}% 하락]'
+                # 🆕 품질별 메시지 추가
+                if timing_quality == 'excellent':
+                    reason += ' [최우수 타이밍]'
+                elif timing_quality == 'good':
+                    reason += ' [양호한 타이밍]'
+                elif abs_diff > final_max_pct * 0.8:
+                    reason += f' [주의: 허용한도 {final_max_pct:.1f}% 근접]'
                 
                 return {
                     'good_timing': True,
@@ -520,18 +535,20 @@ class CandleAnalyzer:
                     'timing_score': timing_score,
                     'price_diff_pct': price_diff_pct,
                     'today_open': today_open,
-                    'suggested_buy_price': min(today_open * 1.005, current_price * 1.002),  # 🆕 추천 매수가
-                    'max_allowed_diff': max_allowed_pct
+                    'timing_phase': timing_phase,
+                    'max_allowed_diff': final_max_pct,
+                    'suggested_buy_price': min(today_open * 1.01, current_price * 1.005)  # 🆕 더 관대한 추천가
                 }
             else:
                 return {
                     'good_timing': False,
-                    'reason': f'시가에서 너무 멀어짐 (시가대비 {price_diff_pct:+.2f}% > 한도 ±{max_allowed_pct:.1f}%)',
+                    'reason': f'{timing_phase} 허용범위 초과 (시가대비 {price_diff_pct:+.2f}% > 한도 ±{final_max_pct:.1f}%)',
                     'timing_quality': 'poor',
                     'timing_score': 0,
                     'price_diff_pct': price_diff_pct,
                     'today_open': today_open,
-                    'max_allowed_diff': max_allowed_pct
+                    'timing_phase': timing_phase,
+                    'max_allowed_diff': final_max_pct
                 }
 
         except Exception as e:
@@ -539,45 +556,32 @@ class CandleAnalyzer:
             return {'good_timing': False, 'reason': f'타이밍 체크 오류: {str(e)}', 'today_open': 0}
 
     def _validate_existing_patterns(self, candidate: CandleTradeCandidate, current_price: float) -> Dict:
-        """📊 기존 패턴 유효성 간단 재확인"""
+        """📊 기존 패턴 존재 여부만 간단 확인 - 재검증 제거"""
         try:
             if not candidate.detected_patterns:
                 return {'valid': False, 'reason': '패턴 정보 없음'}
 
             primary_pattern = candidate.detected_patterns[0]
             
-            # 1. 패턴 신뢰도 재확인
-            min_confidence = self.config.get('trading_thresholds', {}).get('min_pattern_confidence', 0.65)
-            if primary_pattern.confidence < min_confidence:
-                return {'valid': False, 'reason': f'패턴 신뢰도 부족 ({primary_pattern.confidence:.2f} < {min_confidence})'}
-
-            # 2. 패턴 강도 재확인  
-            min_strength = self.config.get('trading_thresholds', {}).get('min_pattern_strength', 70)
-            if primary_pattern.strength < min_strength:
-                return {'valid': False, 'reason': f'패턴 강도 부족 ({primary_pattern.strength} < {min_strength})'}
-
-            # 3. 패턴 생성 시간 체크 (너무 오래된 패턴 제외)
-            max_pattern_age_hours = self.config.get('pattern_validity', {}).get('max_age_hours', 24)
-            if candidate.created_at:
-                pattern_age = (datetime.now() - candidate.created_at).total_seconds() / 3600
-                if pattern_age > max_pattern_age_hours:
-                    return {'valid': False, 'reason': f'패턴이 너무 오래됨 ({pattern_age:.1f}h > {max_pattern_age_hours}h)'}
+            # 🔧 패턴 재검증 제거 - 이미 확정된 패턴은 그대로 사용
+            # 기존: 신뢰도, 강도, 생성시간 재체크 → 제거
+            # 이유: 패턴이 감지되어 신호가 확정되었다면 그 결과를 신뢰
 
             return {
                 'valid': True,
-                'reason': '패턴 유효성 확인',
+                'reason': '기존 패턴 사용',
                 'pattern_type': primary_pattern.pattern_type.value,
                 'confidence': primary_pattern.confidence,
                 'strength': primary_pattern.strength
             }
 
         except Exception as e:
-            logger.error(f"패턴 유효성 검증 오류: {e}")
-            return {'valid': False, 'reason': f'검증 오류: {str(e)}'}
+            logger.error(f"패턴 존재 확인 오류: {e}")
+            return {'valid': False, 'reason': f'확인 오류: {str(e)}'}
 
     def _calculate_quick_buy_score(self, candidate: CandleTradeCandidate, current_price: float, 
                                  entry_timing: Dict, pattern_validity: Dict) -> int:
-        """🧮 빠른 매수 점수 계산"""
+        """🧮 빠른 매수 점수 계산 - 현실적인 타이밍 기준"""
         try:
             score = 0
 
@@ -587,10 +591,17 @@ class CandleAnalyzer:
                 score += int(primary_pattern.confidence * 20)  # 0.7 신뢰도 = 14점
                 score += int(primary_pattern.strength * 0.2)   # 80 강도 = 16점
 
-            # 2. 진입 타이밍 점수 (30점)
+            # 2. 진입 타이밍 점수 (30점) - 더 관대한 점수 배분
             timing_quality = entry_timing.get('timing_quality', 'poor')
-            timing_scores = {'excellent': 30, 'good': 20, 'fair': 10, 'poor': 0}
-            score += timing_scores.get(timing_quality, 0)
+            timing_scores = {
+                'excellent': 30,    # 최우수 (1% 이내)
+                'good': 25,        # 양호 (3% 이내) - 상향 조정
+                'acceptable': 20,   # 허용 가능 (시간대별 한도 이내) - 상향 조정
+                'fair': 15,        # 보통 - 추가
+                'poor': 5          # 나쁨 - 최소 점수 부여
+            }
+            timing_score = timing_scores.get(timing_quality, 5)
+            score += timing_score
 
             # 3. 신호 강도 점수 (20점)  
             signal_strength = candidate.signal_strength
@@ -600,13 +611,28 @@ class CandleAnalyzer:
             entry_priority = candidate.entry_priority
             score += int(entry_priority * 0.1)  # 80 우선순위 = 8점
 
+            # 🆕 5. 시간대별 보너스 점수 (추가 5점)
+            timing_phase = entry_timing.get('timing_phase', '')
+            phase_bonus = {
+                '장초반': 5,    # 장 초반 보너스
+                '장전반': 3,    # 장 전반 보너스  
+                '장중반': 2,    # 장 중반 보너스
+                '장후반': 1     # 장 후반 보너스
+            }
+            score += phase_bonus.get(timing_phase, 0)
+
             # 정규화 (0~100)
             final_score = min(100, max(0, score))
 
-            logger.debug(f"📊 {candidate.stock_code} 매수 점수: {final_score}/100 "
-                        f"(패턴:{primary_pattern.confidence:.2f}×20+{primary_pattern.strength}×0.2 "
-                        f"+ 타이밍:{timing_scores.get(timing_quality, 0)} "
-                        f"+ 신호:{int(signal_strength * 0.2)} + 우선순위:{int(entry_priority * 0.1)})")
+            # 🆕 상세 로깅
+            if candidate.detected_patterns:
+                primary_pattern = candidate.detected_patterns[0]
+                logger.debug(f"📊 {candidate.stock_code} 매수 점수: {final_score}/100 "
+                            f"(패턴:{int(primary_pattern.confidence * 20)}+{int(primary_pattern.strength * 0.2)} "
+                            f"+ 타이밍:{timing_score}({timing_quality}) "
+                            f"+ 신호:{int(signal_strength * 0.2)} "
+                            f"+ 우선순위:{int(entry_priority * 0.1)} "
+                            f"+ 시간대:{phase_bonus.get(timing_phase, 0)}({timing_phase}))")
 
             return final_score
 
@@ -651,49 +677,59 @@ class CandleAnalyzer:
 
 
     async def _get_minute_candle_data(self, stock_code: str, period_minutes: int = 5, count: int = 20) -> Optional[Any]:
-        """분봉 데이터 조회 (KIS API 활용)"""
+        """분봉 데이터 조회 (KIS API 활용) - 최대 30분봉만 제공"""
         try:
-            # 🆕 KIS API는 당일 분봉만 제공하고 간격 설정이 제한적임
-            # 현재는 기본 당일 분봉 데이터만 조회 (추후 개선 예정)
             from ..api.kis_market_api import get_inquire_time_itemchartprice
+            from datetime import datetime, timedelta
 
-            logger.debug(f"📊 {stock_code} 당일 분봉 데이터 조회 시작 (최대 {count}개)")
+            # 🔧 현실적 제한: 최대 30분봉만 조회 가능 (KIS API 30건 제한)
+            now = datetime.now()
+            thirty_minutes_ago = now - timedelta(minutes=30)
+            
+            # 시간 형식 변환 (HHMMSS)
+            input_hour = thirty_minutes_ago.strftime("%H%M%S")
+            
+            logger.debug(f"📊 {stock_code} 분봉 데이터 조회: 최근 30분 (제한된 범위)")
 
-            # KIS API 호출 - 당일 분봉 데이터
+            # KIS API 호출 - 최대 30분 전부터 현재까지
             minute_data = get_inquire_time_itemchartprice(
                 output_dv="2",              # 분봉 데이터 배열 (output2)
                 div_code="J",               # 조건시장분류코드 (J: 주식)
                 itm_no=stock_code,          # 입력종목코드
-                input_hour=None,            # 입력시간1 (None시 현재시간)
-                past_data_yn="Y",           # 과거데이터포함여부
+                input_hour=input_hour,      # 30분 전 시간 설정
+                past_data_yn="Y",           # 과거데이터포함여부 (Y: 포함)
                 etc_cls_code=""             # 기타구분코드 (공백)
             )
 
             if minute_data is not None and not minute_data.empty:
-                # count 개수만큼 제한
-                limited_data = minute_data.head(count)
-                logger.debug(f"✅ {stock_code} 당일 분봉 데이터 조회 성공: {len(limited_data)}개")
-
-                # 🔍 데이터 구조 확인 (디버깅용)
-                if len(limited_data) > 0:
-                    first_row = limited_data.iloc[0]
-                    # KIS API의 실제 컬럼명 사용
-                    time_info = first_row.get('stck_cntg_hour', first_row.get('stck_bsop_date', 'N/A'))
-                    close_price = first_row.get('stck_clpr', 'N/A')
-                    volume = first_row.get('cntg_vol', first_row.get('acml_vol', 'N/A'))
-
-                    logger.debug(f"📊 첫 번째 분봉 데이터 샘플: 시간={time_info} "
-                               f"종가={close_price}원 거래량={volume}")
-
-                return limited_data
+                # 데이터 품질 확인
+                data_count = len(minute_data)
+                if data_count > 0:
+                    first_time = minute_data.iloc[0].get('stck_cntg_hour', 'N/A')
+                    last_time = minute_data.iloc[-1].get('stck_cntg_hour', 'N/A')
+                    logger.debug(f"✅ {stock_code} 분봉 데이터 조회 성공: {data_count}건 (최대 30분)")
+                    logger.debug(f"   📅 시간 범위: {first_time} ~ {last_time}")
+                    
+                    # 최신 데이터 우선 정렬 (최신순)
+                    minute_data = minute_data.sort_values('stck_cntg_hour', ascending=False).reset_index(drop=True)
+                    
+                    # count 제한 적용 (기본 20개)
+                    if data_count > count:
+                        limited_data = minute_data.head(count)
+                        logger.debug(f"   📊 데이터 제한 적용: {data_count}건 → {count}건 (최신순)")
+                        return limited_data
+                    
+                    return minute_data
+                else:
+                    logger.debug(f"⚠️ {stock_code} 분봉 데이터 조회 결과 없음")
+                    return None
             else:
-                logger.debug(f"⚠️ {stock_code} 당일 분봉 데이터 조회 결과 없음")
+                logger.debug(f"⚠️ {stock_code} 분봉 데이터 조회 결과 없음")
                 return None
 
         except Exception as e:
             logger.debug(f"❌ {stock_code} 분봉 데이터 조회 오류: {e}")
-            # 🔧 분봉 데이터 조회 실패시에도 장중 분석은 계속 진행
-            # (일봉 기반 분석으로 폴백 가능)
+            # 분봉 데이터 조회 실패시에도 장중 분석은 계속 진행
             return None
 
 
@@ -1445,16 +1481,16 @@ class CandleAnalyzer:
                                 f"목표:{target_pct}%, 손절:{stop_pct}%, 시간:{max_hours}h")
                     return target_pct, stop_pct, max_hours, True
                 else:
-                    return 3.0, 3.0, 24, True
+                    return 2.0, 2.0, 24, True
 
             # 4. 기본값: 캔들 전략이지만 패턴 정보 없음 (🎯 큰 수익/손실 허용)
             logger.debug(f"📊 {position.stock_code} 캔들 전략이나 패턴 정보 없음 - 기본 캔들 설정 적용")
-            return 3.0, 3.0, 6, True
+            return 2.0, 2.0, 6, True
 
         except Exception as e:
             logger.error(f"패턴별 설정 결정 오류 ({position.stock_code}): {e}")
             # 오류시 안전하게 기본값 반환 (🎯 큰 수익/손실 허용)
-            return 3.0, 3.0, 24, False
+            return 2.0, 2.0, 24, False
 
     def _should_time_exit_pattern_based(self, position: CandleTradeCandidate, max_hours: int) -> bool:
         """🆕 단순화된 시간 기반 매도 판단 - 24시간 내에는 시간 매도 금지"""

@@ -3,7 +3,7 @@
 """
 import heapq
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Dict, List, Optional, Tuple, Set
 from utils.logger import setup_logger
 
@@ -16,7 +16,7 @@ logger = setup_logger(__name__)
 
 
 class CandleStockManager:
-    """캔들 전략 종목 통합 관리자"""
+    """캔들 전략 종목 통합 관리자 - 시간대별 전략 자동 전환"""
 
     def __init__(self, max_watch_stocks: int = 100, max_positions: int = 15):
         self.max_watch_stocks = max_watch_stocks
@@ -25,7 +25,9 @@ class CandleStockManager:
         # ========== 🎯 단일 데이터 소스 (메인 종목 저장소) ==========
         self._all_stocks: Dict[str, CandleTradeCandidate] = {}
 
-
+        # ========== 🆕 시간대별 전략 관리 ==========
+        self._current_strategy_mode = "auto"  # "premarket", "realtime", "auto"
+        self._strategy_transition_log = deque(maxlen=50)  # 전략 전환 이력
 
         # ========== 성능 추적 ==========
         self._recent_updates: deque = deque(maxlen=1000)  # 최근 업데이트 이력
@@ -36,25 +38,112 @@ class CandleStockManager:
             'win_rate': 0.0,
             'avg_holding_hours': 0.0,
             'best_performer': None,
-            'worst_performer': None
+            'worst_performer': None,
+            # 🆕 시간대별 통계
+            'premarket_scanned': 0,
+            'realtime_scanned': 0,
+            'premarket_success_rate': 0.0,
+            'realtime_success_rate': 0.0,
         }
 
         # ========== 설정값 ==========
         self.config = {
             'auto_cleanup_hours': 24,      # 오래된 종목 자동 정리 시간
             'max_pattern_age_hours': 6,    # 패턴 유효 시간
+            # 🆕 시간대별 전략 설정
+            'premarket_start_time': '08:00',     # 장전 전략 시작
+            'premarket_end_time': '09:59',       # 장전 전략 종료  
+            'realtime_start_time': '10:00',      # 실시간 전략 시작
+            'realtime_end_time': '15:30',        # 실시간 전략 종료
+            'strategy_transition_enabled': True,  # 자동 전환 활성화
         }
 
         self._last_cleanup = datetime.now()
 
-    # ========== 종목 추가/제거 ==========
+    # ========== 🆕 시간대별 전략 관리 ==========
 
-    def add_candidate(self, candidate: CandleTradeCandidate) -> bool:
-        """새로운 후보 종목 추가"""
+    def get_current_strategy_mode(self) -> str:
+        """현재 시간대에 적합한 전략 모드 반환"""
+        try:
+            if self._current_strategy_mode != "auto":
+                return self._current_strategy_mode
+
+            current_time = datetime.now().time()
+            
+            # 시간대별 자동 결정
+            premarket_start = time.fromisoformat(self.config['premarket_start_time'])
+            premarket_end = time.fromisoformat(self.config['premarket_end_time'])
+            realtime_start = time.fromisoformat(self.config['realtime_start_time'])
+            realtime_end = time.fromisoformat(self.config['realtime_end_time'])
+
+            if premarket_start <= current_time <= premarket_end:
+                return "premarket"
+            elif realtime_start <= current_time <= realtime_end:
+                return "realtime"
+            else:
+                return "premarket"  # 장후에는 다음날 준비용으로 장전 모드
+
+        except Exception as e:
+            logger.error(f"전략 모드 결정 오류: {e}")
+            return "premarket"  # 기본값
+
+    def set_strategy_mode(self, mode: str) -> bool:
+        """전략 모드 수동 설정"""
+        try:
+            valid_modes = ["auto", "premarket", "realtime"]
+            if mode not in valid_modes:
+                logger.warning(f"잘못된 전략 모드: {mode}")
+                return False
+
+            old_mode = self._current_strategy_mode
+            self._current_strategy_mode = mode
+
+            # 전환 이력 기록
+            self._strategy_transition_log.append({
+                'timestamp': datetime.now(),
+                'old_mode': old_mode,
+                'new_mode': mode,
+                'trigger': 'manual'
+            })
+
+            logger.info(f"🔄 전략 모드 변경: {old_mode} → {mode}")
+            return True
+
+        except Exception as e:
+            logger.error(f"전략 모드 설정 오류: {e}")
+            return False
+
+    def is_premarket_strategy_active(self) -> bool:
+        """장전 전략 활성 여부"""
+        return self.get_current_strategy_mode() == "premarket"
+
+    def is_realtime_strategy_active(self) -> bool:
+        """실시간 전략 활성 여부"""
+        return self.get_current_strategy_mode() == "realtime"
+
+    # ========== 종목 추가/제거 (시간대별 최적화) ==========
+
+    def add_candidate(self, candidate: CandleTradeCandidate, strategy_source: str = "auto") -> bool:
+        """🆕 새로운 후보 종목 추가 - 시간대별 전략 적용"""
         try:
             stock_code = candidate.stock_code
+            current_mode = self.get_current_strategy_mode()
 
-            # 🔧 중복 체크 강화 (상태별 처리)
+            # 🆕 전략 소스 자동 결정
+            if strategy_source == "auto":
+                strategy_source = current_mode
+
+            # 🆕 종목에 전략 정보 메타데이터 추가
+            if not hasattr(candidate, 'metadata') or candidate.metadata is None:
+                candidate.metadata = {}
+            
+            candidate.metadata.update({
+                'strategy_source': strategy_source,
+                'detected_time': datetime.now().isoformat(),
+                'strategy_mode': current_mode
+            })
+
+            # 기존 중복 체크 로직
             if stock_code in self._all_stocks:
                 existing = self._all_stocks[stock_code]
 
@@ -63,16 +152,27 @@ class CandleStockManager:
                     logger.warning(f"⚠️ {stock_code} 중요 상태 보호 ({existing.status.value}) - 새 후보 추가 거부")
                     return False
 
-                # 다른 상태는 업데이트 허용
-                logger.debug(f"🔄 {stock_code} 기존 종목 업데이트 ({existing.status.value})")
-                return self.update_candidate(candidate)
+                # 🆕 전략 소스별 업데이트 정책
+                existing_source = existing.metadata.get('strategy_source', 'unknown') if existing.metadata else 'unknown'
+                
+                # 실시간 전략이 장전 전략을 덮어쓸 수 있음 (더 정확한 정보)
+                if strategy_source == "realtime" and existing_source == "premarket":
+                    logger.info(f"🔄 {stock_code} 실시간 전략으로 업데이트 (장전→실시간)")
+                    return self.update_candidate(candidate)
+                # 같은 소스끼리는 업데이트 허용
+                elif strategy_source == existing_source:
+                    logger.debug(f"🔄 {stock_code} 동일 전략 업데이트 ({strategy_source})")
+                    return self.update_candidate(candidate)
+                else:
+                    logger.debug(f"🚫 {stock_code} 전략 충돌로 업데이트 거부 ({existing_source}→{strategy_source})")
+                    return False
 
             # 최대 관찰 종목 수 체크 및 스마트 교체
             if len(self._all_stocks) >= self.max_watch_stocks:
-                # 🎯 새 종목이 기존 종목보다 우수한지 확인
-                new_candidate_score = self._calculate_candidate_quality_score(candidate)
+                # 🆕 시간대별 우선순위를 고려한 교체
+                new_candidate_score = self._calculate_candidate_quality_score(candidate, strategy_source)
                 
-                # 기존 종목 중 가장 낮은 점수 찾기
+                # 기존 종목 중 가장 낮은 점수 찾기 (같은 전략 소스 우선 고려)
                 lowest_existing_score = float('inf')
                 lowest_existing_candidate = None
                 
@@ -80,47 +180,61 @@ class CandleStockManager:
                     if existing_candidate.status in [CandleStatus.ENTERED, CandleStatus.PENDING_ORDER]:
                         continue  # 중요 상태는 제외
                     
-                    existing_score = self._calculate_candidate_quality_score(existing_candidate)
+                    existing_source = existing_candidate.metadata.get('strategy_source', 'unknown') if existing_candidate.metadata else 'unknown'
+                    existing_score = self._calculate_candidate_quality_score(existing_candidate, existing_source)
+                    
+                    # 🆕 전략 소스별 교체 우선순위 적용
+                    if strategy_source == "realtime" and existing_source == "premarket":
+                        existing_score *= 0.8  # 장전 전략 종목의 점수를 낮춤 (교체 우선순위 높임)
+                    
                     if existing_score < lowest_existing_score:
                         lowest_existing_score = existing_score
                         lowest_existing_candidate = existing_candidate
                 
                 # 새 종목이 기존 최저 종목보다 우수하면 교체
                 if (lowest_existing_candidate and 
-                    new_candidate_score > lowest_existing_score + 50):  # 50점 이상 차이나야 교체
+                    new_candidate_score > lowest_existing_score + 30):  # 실시간은 30점 차이만 있어도 교체
                     
                     removed_stock = lowest_existing_candidate.stock_code
+                    removed_source = lowest_existing_candidate.metadata.get('strategy_source', 'unknown') if lowest_existing_candidate.metadata else 'unknown'
+                    
                     if self.remove_stock(removed_stock):
-                        logger.info(f"🔄 스마트 교체: {removed_stock}(점수:{lowest_existing_score:.1f}) → "
-                                   f"{stock_code}(점수:{new_candidate_score:.1f})")
+                        logger.info(f"🔄 시간대별 스마트 교체: {removed_stock}({removed_source}, 점수:{lowest_existing_score:.1f}) → "
+                                   f"{stock_code}({strategy_source}, 점수:{new_candidate_score:.1f})")
                     else:
                         logger.warning(f"관찰 한도 초과 - 새 종목 {stock_code} 추가 실패")
                         return False
                 else:
                     # 새 종목이 우수하지 않으면 추가 거부
-                    logger.info(f"🚫 품질 기준 미달로 추가 거부: {stock_code}(점수:{new_candidate_score:.1f}) "
+                    logger.info(f"🚫 품질 기준 미달로 추가 거부: {stock_code}({strategy_source}, 점수:{new_candidate_score:.1f}) "
                                f"vs 기존최저(점수:{lowest_existing_score:.1f})")
                     return False
 
             # 종목 추가
             self._all_stocks[stock_code] = candidate
 
-            # 통계 업데이트
+            # 🆕 전략별 통계 업데이트
             self._performance_stats['total_scanned'] += 1
+            if strategy_source == "premarket":
+                self._performance_stats['premarket_scanned'] += 1
+            elif strategy_source == "realtime":
+                self._performance_stats['realtime_scanned'] += 1
 
             # 업데이트 이력 기록
             self._recent_updates.append({
                 'action': 'add',
                 'stock_code': stock_code,
                 'timestamp': datetime.now(),
-                'status': candidate.status.value
+                'status': candidate.status.value,
+                'strategy_source': strategy_source,
+                'strategy_mode': current_mode
             })
 
             # 품질 점수 계산 및 로깅
-            quality_score = self._calculate_candidate_quality_score(candidate)
+            quality_score = self._calculate_candidate_quality_score(candidate, strategy_source)
             
             logger.info(f"✅ 새 종목 추가: {stock_code}({candidate.stock_name}) - "
-                       f"품질점수:{quality_score:.1f}, {candidate.get_signal_summary()}")
+                       f"전략:{strategy_source}, 품질점수:{quality_score:.1f}, {candidate.get_signal_summary()}")
             return True
 
         except Exception as e:
@@ -532,38 +646,72 @@ class CandleStockManager:
             logger.error(f"우선순위 점수 계산 오류: {e}")
             return 0.0  # 오류시 가장 낮은 점수 (제거 우선순위 최고)
 
-    def _calculate_candidate_quality_score(self, candidate: CandleTradeCandidate) -> float:
-        """🎯 종목 품질 점수 계산 (높을수록 좋은 종목)"""
+    def _calculate_candidate_quality_score(self, candidate: CandleTradeCandidate, strategy_source: str = "premarket") -> float:
+        """🎯 종목 품질 점수 계산 (높을수록 좋은 종목) - 시간대별 최적화"""
         try:
             score = 0.0
+            
+            # 🆕 기존 보유 종목은 최고 우선순위 (제거되지 않도록)
+            if strategy_source == "existing_holding":
+                return 999.0  # 최고 점수로 절대 제거되지 않음
             
             # 1. 패턴 신뢰도 (가장 중요한 요소)
             if candidate.detected_patterns:
                 max_confidence = max(p.confidence for p in candidate.detected_patterns)
-                score += max_confidence * 150  # 0~150점 (가중치 높음)
+                base_confidence_score = max_confidence * 150  # 0~150점
+                
+                # 🆕 전략별 신뢰도 가중치
+                if strategy_source == "realtime":
+                    # 실시간 전략은 신뢰도 기준을 약간 완화 (진행중인 캔들이므로)
+                    score += base_confidence_score * 1.1  # 10% 보너스
+                else:
+                    score += base_confidence_score
             
             # 2. 패턴 강도
             if candidate.detected_patterns:
                 max_strength = max(p.strength for p in candidate.detected_patterns)
-                score += max_strength * 1.2  # 0~120점
+                base_strength_score = max_strength * 1.2  # 0~120점
+                
+                # 🆕 전략별 강도 가중치
+                if strategy_source == "realtime":
+                    score += base_strength_score * 1.05  # 5% 보너스
+                else:
+                    score += base_strength_score
             
             # 3. 신호 강도
             score += candidate.signal_strength  # 0~100점
             
-            # 4. 패턴 타입별 보너스 (강력한 패턴일수록 높은 점수)
+            # 4. 🆕 전략별 패턴 타입 보너스
             if candidate.detected_patterns:
                 for pattern in candidate.detected_patterns:
-                    pattern_bonuses = {
-                        PatternType.BULLISH_ENGULFING: 50,   # 최고 신뢰도
-                        PatternType.HAMMER: 40,              # 매우 강력
-                        PatternType.INVERTED_HAMMER: 30,     # 강력
-                        PatternType.RISING_THREE_METHODS: 35, # 추세 지속
-                        PatternType.DOJI: 10                 # 중립적
-                    }
+                    if strategy_source == "premarket":
+                        # 장전 전략: 안정적인 패턴 선호
+                        pattern_bonuses = {
+                            PatternType.BULLISH_ENGULFING: 50,   # 최고 신뢰도
+                            PatternType.HAMMER: 45,              # 매우 강력
+                            PatternType.MORNING_STAR: 55,        # 장전에서는 더 높은 점수
+                            PatternType.PIERCING_LINE: 40,       # 관통형
+                            PatternType.INVERTED_HAMMER: 30,     # 강력
+                            PatternType.RISING_THREE_METHODS: 25, # 추세 지속
+                            PatternType.DOJI: 10                 # 중립적
+                        }
+                    else:  # realtime
+                        # 실시간 전략: 빠른 반응 패턴 선호
+                        pattern_bonuses = {
+                            PatternType.BULLISH_ENGULFING: 55,   # 실시간에서 더 높은 점수
+                            PatternType.HAMMER: 40,              # 변동성 패턴
+                            PatternType.MORNING_STAR: 35,        # 장중에서는 상대적으로 낮음
+                            PatternType.PIERCING_LINE: 45,       # 실시간 돌파 패턴
+                            PatternType.INVERTED_HAMMER: 35,     # 실시간 반전
+                            PatternType.RISING_THREE_METHODS: 50, # 실시간 추세 추종
+                            PatternType.DOJI: 25                 # 실시간 반전 신호로 더 중요
+                        }
+                    
                     score += pattern_bonuses.get(pattern.pattern_type, 15)
             
             # 5. 진입 우선순위 (이미 계산된 값 활용)
-            score += candidate.entry_priority * 0.8  # 0~80점
+            priority_weight = 0.8 if strategy_source == "premarket" else 0.9  # 실시간은 우선순위 더 중시
+            score += candidate.entry_priority * priority_weight
             
             # 6. 현재 상태 보너스
             status_bonuses = {
@@ -577,21 +725,45 @@ class CandleStockManager:
             }
             score += status_bonuses.get(candidate.status, 0)
             
-            # 7. 최신성 보너스 (최근 감지된 패턴일수록 높은 점수)
+            # 7. 🆕 전략별 최신성 보너스
             if candidate.created_at:
                 hours_since_creation = (datetime.now() - candidate.created_at).total_seconds() / 3600
-                if hours_since_creation < 1:
-                    score += 25  # 1시간 이내 신규 패턴
-                elif hours_since_creation < 6:
-                    score += 15  # 6시간 이내
-                elif hours_since_creation > 24:
-                    score -= 20  # 24시간 이후 페널티
+                
+                if strategy_source == "premarket":
+                    # 장전: 하루 전 패턴도 유효
+                    if hours_since_creation < 6:
+                        score += 25  # 6시간 이내
+                    elif hours_since_creation < 24:
+                        score += 15  # 24시간 이내
+                    elif hours_since_creation > 48:
+                        score -= 20  # 48시간 이후 페널티
+                else:  # realtime
+                    # 실시간: 매우 최신 패턴 선호
+                    if hours_since_creation < 0.5:  # 30분 이내
+                        score += 40  # 높은 보너스
+                    elif hours_since_creation < 2:  # 2시간 이내
+                        score += 25
+                    elif hours_since_creation < 6:  # 6시간 이내
+                        score += 10
+                    elif hours_since_creation > 12:  # 12시간 이후 페널티
+                        score -= 30
             
-            # 8. 최종 점수 정규화 (0~600 범위)
-            final_score = max(0, min(600, score))
+            # 8. 🆕 전략별 특별 보너스
+            if strategy_source == "realtime":
+                # 실시간 패턴에 대한 추가 보너스
+                if hasattr(candidate, 'metadata') and candidate.metadata:
+                    if candidate.metadata.get('realtime', False):
+                        score += 20  # 실시간 감지 보너스
+                    if candidate.metadata.get('volume_surge', False):
+                        score += 15  # 거래량 급증 보너스
+                    if candidate.metadata.get('forming_candle', False):
+                        score += 10  # 진행중인 캔들 보너스
+            
+            # 9. 최종 점수 정규화 (0~700 범위로 확장)
+            final_score = max(0, min(700, score))
             
             return final_score
             
         except Exception as e:
-            logger.error(f"종목 품질 점수 계산 오류: {e}")
+            logger.error(f"종목 품질 점수 계산 오류 ({strategy_source}): {e}")
             return 0.0
